@@ -41,7 +41,7 @@ import org.apache.kafka.metadata.{LeaderAndIsr, LeaderRecoveryState, MetadataCac
 import org.apache.kafka.server.common.{RequestLocal, TransactionVersion}
 import org.apache.kafka.server.log.remote.TopicPartitionLog
 import org.apache.kafka.server.log.remote.storage.RemoteLogManager
-import org.apache.kafka.storage.internals.log.{AppendOrigin, AsyncOffsetReader, FetchDataInfo, LeaderHwChange, LogAppendInfo, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogReadInfo, LogStartOffsetIncrementReason, OffsetResultHolder, UnifiedLog, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, AsyncOffsetReader, FetchDataInfo, LeaderEpochAwareOffsetLookup, LeaderHwChange, LogAppendInfo, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogReadInfo, LogStartOffsetIncrementReason, OffsetResultHolder, UnifiedLog, VerificationGuard}
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 import org.apache.kafka.server.partition.{AlterPartitionListener, AssignmentState, CommittedPartitionState, OngoingReassignmentState, PartitionListener, PartitionState, PendingExpandIsr, PendingPartitionChange, PendingShrinkIsr, SimpleAssignmentState}
 import org.apache.kafka.server.purgatory.{DelayedDeleteRecords, DelayedOperationPurgatory, TopicPartitionOperationKey}
@@ -189,6 +189,9 @@ class Partition(val topicPartition: TopicPartition,
   // start offset for 'leaderEpoch' above (leader epoch of the current leader for this partition),
   // defined when this broker is leader for partition
   @volatile private[cluster] var leaderEpochStartOffsetOpt: Option[Long] = None
+  // Nereus inject start: leader-epoch-fenced asynchronous ListOffsets lookup
+  private var leaderEpochAwareOffsetLookup: Option[(Int, LeaderEpochAwareOffsetLookup)] = None
+  // Nereus inject end: leader-epoch-fenced asynchronous ListOffsets lookup
   // Replica ID of the leader, defined when this broker is leader or follower for the partition.
   @volatile var leaderReplicaIdOpt: Option[Int] = None
   @volatile private[cluster] var partitionState: PartitionState = new CommittedPartitionState(util.Set.of(), LeaderRecoveryState.RECOVERED)
@@ -572,6 +575,9 @@ class Partition(val topicPartition: TopicPartition,
     partitionState = new CommittedPartitionState(util.Set.of(), LeaderRecoveryState.RECOVERED)
     leaderReplicaIdOpt = None
     leaderEpochStartOffsetOpt = None
+    // Nereus inject start: clear storage lookup with partition state
+    leaderEpochAwareOffsetLookup = None
+    // Nereus inject end: clear storage lookup with partition state
     Partition.removeMetrics(topicPartition)
   }
 
@@ -632,6 +638,9 @@ class Partition(val topicPartition: TopicPartition,
       // We update the epoch start offset and the replicas' state only if the leader epoch
       // has changed.
       if (isNewLeaderEpoch) {
+        // Nereus inject start: never retain a lookup across leader epochs
+        leaderEpochAwareOffsetLookup = None
+        // Nereus inject end: never retain a lookup across leader epochs
         val leaderEpochStartOffset = leaderLog.logEndOffset
         stateChangeLogger.info(s"Leader $topicPartition with topic id $topicId starts at " +
           s"leader epoch ${partitionRegistration.leaderEpoch} from offset $leaderEpochStartOffset " +
@@ -710,6 +719,9 @@ class Partition(val topicPartition: TopicPartition,
       leaderReplicaIdOpt = Option(partitionRegistration.leader)
       leaderEpoch = partitionRegistration.leaderEpoch
       leaderEpochStartOffsetOpt = None
+      // Nereus inject start: follower transitions revoke leader-only storage lookup
+      leaderEpochAwareOffsetLookup = None
+      // Nereus inject end: follower transitions revoke leader-only storage lookup
       partitionEpoch = partitionRegistration.partitionEpoch
 
       updateAssignmentAndIsr(
@@ -1433,7 +1445,43 @@ class Partition(val topicPartition: TopicPartition,
                               isolationLevel: Option[IsolationLevel],
                               currentLeaderEpoch: Optional[Integer],
                               fetchOnlyFromLeader: Boolean,
-                              remoteLogManager: Option[RemoteLogManager] = None): OffsetResultHolder = inReadLock(leaderIsrUpdateLock) {
+                              remoteLogManager: Option[RemoteLogManager] = None): OffsetResultHolder = {
+    fetchOffsetForTimestamp(timestamp, isolationLevel, currentLeaderEpoch, fetchOnlyFromLeader,
+      remoteLogManager, () => ())
+  }
+
+  // Nereus inject start: partition-owned ListOffsets lookup installation and request routing
+  def installLeaderEpochAwareOffsetLookup(expectedLeaderEpoch: Int,
+                                          lookup: LeaderEpochAwareOffsetLookup): Unit = inWriteLock(leaderIsrUpdateLock) {
+    if (!isLeader) {
+      throw new NotLeaderOrFollowerException(s"Cannot install offset lookup for non-leader partition $topicPartition")
+    }
+    if (leaderEpoch != expectedLeaderEpoch) {
+      throw new FencedLeaderEpochException(s"Cannot install offset lookup for partition $topicPartition at stale leader " +
+        s"epoch $expectedLeaderEpoch; current leader epoch is $leaderEpoch")
+    }
+    leaderEpochAwareOffsetLookup = Some(expectedLeaderEpoch ->
+      java.util.Objects.requireNonNull(lookup, "lookup"))
+  }
+
+  def removeLeaderEpochAwareOffsetLookup(expectedLeaderEpoch: Int,
+                                         lookup: LeaderEpochAwareOffsetLookup): Unit = inWriteLock(leaderIsrUpdateLock) {
+    java.util.Objects.requireNonNull(lookup, "lookup")
+    leaderEpochAwareOffsetLookup match {
+      case Some((installedEpoch, installedLookup))
+        if installedEpoch == expectedLeaderEpoch && installedLookup.eq(lookup) =>
+        leaderEpochAwareOffsetLookup = None
+      case _ =>
+    }
+  }
+
+  def fetchOffsetForTimestamp(timestamp: Long,
+                              isolationLevel: Option[IsolationLevel],
+                              currentLeaderEpoch: Optional[Integer],
+                              fetchOnlyFromLeader: Boolean,
+                              remoteLogManager: Option[RemoteLogManager],
+                              completionWakeup: Runnable): OffsetResultHolder = inReadLock(leaderIsrUpdateLock) {
+    java.util.Objects.requireNonNull(completionWakeup, "completionWakeup")
     // decide whether to only fetch from leader
     val localLog = localLogWithEpochOrThrow(currentLeaderEpoch, fetchOnlyFromLeader)
 
@@ -1459,9 +1507,14 @@ class Partition(val topicPartition: TopicPartition,
         s"start offset from the beginning of this epoch ($epochStart)."))
 
     def getOffsetByTimestamp: OffsetResultHolder = {
-      logManager.getLog(topicPartition)
-        .map(log => log.fetchOffsetByTimestamp(timestamp, remoteLogManager.asInstanceOf[Option[AsyncOffsetReader]].toJava))
-        .getOrElse(new OffsetResultHolder(Optional.empty[FileRecords.TimestampAndOffset]()))
+      leaderEpochAwareOffsetLookup match {
+        case Some((installedEpoch, lookup)) if installedEpoch == leaderEpoch =>
+          lookup.fetchOffsetByTimestamp(timestamp, installedEpoch, completionWakeup)
+        case _ =>
+          logManager.getLog(topicPartition)
+            .map(log => log.fetchOffsetByTimestamp(timestamp, remoteLogManager.asInstanceOf[Option[AsyncOffsetReader]].toJava))
+            .getOrElse(new OffsetResultHolder(Optional.empty[FileRecords.TimestampAndOffset]()))
+      }
     }
 
     // If we're in the lagging HW state after a leader election, throw OffsetNotAvailable for "latest" offset
@@ -1479,6 +1532,7 @@ class Partition(val topicPartition: TopicPartition,
         offsetResultHolder
     }
   }
+  // Nereus inject end: partition-owned ListOffsets lookup installation and request routing
 
   def activeProducerState: DescribeProducersResponseData.PartitionResponse = {
     val producerState = new DescribeProducersResponseData.PartitionResponse()

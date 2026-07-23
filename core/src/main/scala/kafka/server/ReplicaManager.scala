@@ -1498,11 +1498,14 @@ class ReplicaManager(val config: KafkaConfig,
             else
               None
 
+            // Nereus inject start: wake delayed ListOffsets after an external async lookup completes
             val resultHolder = fetchOffsetForTimestamp(topicPartition,
               partition.timestamp,
               isolationLevelOpt,
               if (partition.currentLeaderEpoch == ListOffsetsResponse.UNKNOWN_EPOCH) Optional.empty() else Optional.of(partition.currentLeaderEpoch),
-              fetchOnlyFromLeader)
+              fetchOnlyFromLeader,
+              () => delayedRemoteListOffsetsPurgatory.checkAndComplete(new TopicPartitionOperationKey(topicPartition)))
+            // Nereus inject end: wake delayed ListOffsets after an external async lookup completes
 
             val status = {
               if (resultHolder.timestampAndOffsetOpt().isPresent) {
@@ -1601,6 +1604,19 @@ class ReplicaManager(val config: KafkaConfig,
     val partition = getPartitionOrException(topicPartition)
     partition.fetchOffsetForTimestamp(timestamp, isolationLevel, currentLeaderEpoch, fetchOnlyFromLeader, remoteLogManager)
   }
+
+  // Nereus inject start: internal callback-bearing ListOffsets path
+  private def fetchOffsetForTimestamp(topicPartition: TopicPartition,
+                                      timestamp: Long,
+                                      isolationLevel: Option[IsolationLevel],
+                                      currentLeaderEpoch: Optional[Integer],
+                                      fetchOnlyFromLeader: Boolean,
+                                      completionWakeup: Runnable): OffsetResultHolder = {
+    val partition = getPartitionOrException(topicPartition)
+    partition.fetchOffsetForTimestamp(timestamp, isolationLevel, currentLeaderEpoch, fetchOnlyFromLeader,
+      remoteLogManager, completionWakeup)
+  }
+  // Nereus inject end: internal callback-bearing ListOffsets path
 
   /**
    * Initiates an asynchronous remote storage fetch operation for the given remote fetch information.

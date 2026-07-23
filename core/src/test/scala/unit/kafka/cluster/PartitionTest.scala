@@ -61,7 +61,7 @@ import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, Unexpec
 import org.apache.kafka.server.util.{KafkaScheduler, MockTime}
 import org.apache.kafka.storage.internals.checkpoint.OffsetCheckpoints
 import org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache
-import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, EpochEntry, LocalLog, LogAppendInfo, LogConfig, LogDirFailureChannel, LogLoader, LogOffsetMetadata, LogOffsetsListener, LogReadInfo, LogSegments, LogStartOffsetIncrementReason, ProducerStateManager, ProducerStateManagerConfig, UnifiedLog, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, EpochEntry, LeaderEpochAwareOffsetLookup, LocalLog, LogAppendInfo, LogConfig, LogDirFailureChannel, LogLoader, LogOffsetMetadata, LogOffsetsListener, LogReadInfo, LogSegments, LogStartOffsetIncrementReason, OffsetResultHolder, ProducerStateManager, ProducerStateManagerConfig, UnifiedLog, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
@@ -793,6 +793,79 @@ class PartitionTest extends AbstractPartitionTest {
 
     val timestampAndOffset = timestampAndOffsetOpt.get
     assertEquals(leaderEpoch, timestampAndOffset.leaderEpoch.get)
+  }
+
+  @Test
+  def testLeaderEpochAwareOffsetLookupUsesInstalledEpochAndCompletionWakeup(): Unit = {
+    val leaderEpoch = 5
+    val partition = setupPartitionWithMocks(leaderEpoch, isLeader = true)
+    val lookup = mock(classOf[LeaderEpochAwareOffsetLookup])
+    val completionWakeup = mock(classOf[Runnable])
+    val expected = new OffsetResultHolder(new TimestampAndOffset(1000L, 0L, Optional.of(leaderEpoch)))
+    when(lookup.fetchOffsetByTimestamp(1000L, leaderEpoch, completionWakeup)).thenReturn(expected)
+
+    partition.installLeaderEpochAwareOffsetLookup(leaderEpoch, lookup)
+    val actual = partition.fetchOffsetForTimestamp(
+      timestamp = 1000L,
+      isolationLevel = None,
+      currentLeaderEpoch = Optional.of(leaderEpoch),
+      fetchOnlyFromLeader = true,
+      remoteLogManager = None,
+      completionWakeup = completionWakeup)
+
+    assertSame(expected, actual)
+    assertEquals(Optional.of(0L), actual.lastFetchableOffset)
+    verify(lookup).fetchOffsetByTimestamp(1000L, leaderEpoch, completionWakeup)
+  }
+
+  @Test
+  def testLeaderEpochAwareOffsetLookupRejectsStaleInstallAndUsesIdentitySafeRemoval(): Unit = {
+    val leaderEpoch = 5
+    val partition = setupPartitionWithMocks(leaderEpoch, isLeader = true)
+    val first = mock(classOf[LeaderEpochAwareOffsetLookup])
+    val other = mock(classOf[LeaderEpochAwareOffsetLookup])
+    val completionWakeup = mock(classOf[Runnable])
+    val expected = new OffsetResultHolder(Optional.empty[TimestampAndOffset]())
+    when(first.fetchOffsetByTimestamp(1000L, leaderEpoch, completionWakeup)).thenReturn(expected)
+
+    assertThrows(classOf[FencedLeaderEpochException], () =>
+      partition.installLeaderEpochAwareOffsetLookup(leaderEpoch - 1, first))
+    partition.installLeaderEpochAwareOffsetLookup(leaderEpoch, first)
+    partition.removeLeaderEpochAwareOffsetLookup(leaderEpoch, other)
+
+    assertSame(expected, partition.fetchOffsetForTimestamp(
+      1000L, None, Optional.of(leaderEpoch), fetchOnlyFromLeader = true, None, completionWakeup))
+
+    partition.removeLeaderEpochAwareOffsetLookup(leaderEpoch, first)
+    assertNotSame(expected, partition.fetchOffsetForTimestamp(
+      1000L, None, Optional.of(leaderEpoch), fetchOnlyFromLeader = true, None, completionWakeup))
+    verify(first, times(1)).fetchOffsetByTimestamp(1000L, leaderEpoch, completionWakeup)
+  }
+
+  @Test
+  def testLeaderEpochAwareOffsetLookupIsRevokedBeforeNewLeaderEpochPublication(): Unit = {
+    val leaderEpoch = 5
+    val partition = setupPartitionWithMocks(leaderEpoch, isLeader = true)
+    val lookup = mock(classOf[LeaderEpochAwareOffsetLookup])
+    val completionWakeup = mock(classOf[Runnable])
+    partition.installLeaderEpochAwareOffsetLookup(leaderEpoch, lookup)
+
+    val replicas = Array(brokerId, remoteReplicaId)
+    val nextRegistration = new PartitionRegistration.Builder()
+      .setLeader(brokerId)
+      .setLeaderRecoveryState(LeaderRecoveryState.RECOVERED)
+      .setLeaderEpoch(leaderEpoch + 1)
+      .setIsr(replicas)
+      .setPartitionEpoch(2)
+      .setReplicas(replicas)
+      .setDirectories(DirectoryId.unassignedArray(replicas.length))
+      .build()
+
+    assertFalse(partition.makeLeader(nextRegistration, isNew = false, offsetCheckpoints, None))
+    partition.fetchOffsetForTimestamp(
+      1000L, None, Optional.of(leaderEpoch + 1), fetchOnlyFromLeader = true, None, completionWakeup)
+
+    verifyNoInteractions(lookup)
   }
 
   /**

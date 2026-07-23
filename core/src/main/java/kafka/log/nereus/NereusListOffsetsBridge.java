@@ -23,6 +23,7 @@ import org.apache.kafka.common.record.FileRecords;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.requests.ListOffsetsRequest;
 import org.apache.kafka.storage.internals.log.AsyncOffsetReadFutureHolder;
+import org.apache.kafka.storage.internals.log.LeaderEpochAwareOffsetLookup;
 import org.apache.kafka.storage.internals.log.OffsetResultHolder;
 
 import com.nereusstream.kafka.partition.KafkaListOffsetQuery;
@@ -36,7 +37,7 @@ import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 
 /** Adapts asynchronous exact Nereus ListOffsets results to Kafka's existing delayed-offset holder contract. */
-public final class NereusListOffsetsBridge {
+public final class NereusListOffsetsBridge implements LeaderEpochAwareOffsetLookup {
     @FunctionalInterface
     interface Lookup {
         CompletableFuture<Optional<KafkaListOffsetResult>> resolve(KafkaListOffsetsRequest request);
@@ -57,6 +58,7 @@ public final class NereusListOffsetsBridge {
         this.config = Objects.requireNonNull(config, "config");
     }
 
+    @Override
     public OffsetResultHolder fetchOffsetByTimestamp(
             long targetTimestamp,
             int expectedLeaderEpoch,
