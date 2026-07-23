@@ -17,20 +17,21 @@
 
 package kafka.server.nereus;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-
 import com.nereusstream.api.NereusException;
 import com.nereusstream.kafka.recovery.KafkaCheckpointRecoveryRequest;
 import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher;
 import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryRequest;
+
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NereusKafkaPartitionRecoveryLauncherBridgeTest {
     @Test

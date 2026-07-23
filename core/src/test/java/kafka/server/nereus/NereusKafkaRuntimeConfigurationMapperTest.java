@@ -17,22 +17,24 @@
 
 package kafka.server.nereus;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 
 import com.nereusstream.api.StorageProfile;
 import com.nereusstream.objectstore.S3CompatibleObjectStoreProvider;
-import org.apache.kafka.common.config.ConfigException;
-import org.apache.kafka.server.config.NereusKafkaStorageConfig;
+
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NereusKafkaRuntimeConfigurationMapperTest {
     private final NereusKafkaRuntimeConfigurationMapper mapper =

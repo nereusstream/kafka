@@ -17,9 +17,10 @@
 
 package kafka.server.nereus;
 
+import kafka.log.nereus.NereusListOffsetsScanConfig;
+
 import com.nereusstream.kafka.activation.KafkaBrokerCapabilitySpecification;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeConfiguration;
-import kafka.log.nereus.NereusListOffsetsScanConfig;
 
 import java.util.Objects;
 

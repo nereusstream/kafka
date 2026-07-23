@@ -17,6 +17,26 @@
 
 package kafka.server.nereus;
 
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.server.util.KafkaScheduler;
+
+import com.nereusstream.api.ErrorCode;
+import com.nereusstream.api.NereusException;
+import com.nereusstream.kafka.partition.KafkaPartitionLeaderOpenRequest;
+import com.nereusstream.kafka.partition.KafkaPartitionStorageManager;
+import com.nereusstream.kafka.runtime.DrainReason;
+import com.nereusstream.kafka.runtime.KafkaStorageAdmission;
+import com.nereusstream.kafka.runtime.NereusKafkaRuntime;
+
+import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -26,24 +46,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-
-import com.nereusstream.api.ErrorCode;
-import com.nereusstream.api.NereusException;
-import com.nereusstream.kafka.partition.KafkaPartitionLeaderOpenRequest;
-import com.nereusstream.kafka.partition.KafkaPartitionStorageManager;
-import com.nereusstream.kafka.runtime.DrainReason;
-import com.nereusstream.kafka.runtime.KafkaStorageAdmission;
-import com.nereusstream.kafka.runtime.NereusKafkaRuntime;
-import org.apache.kafka.common.utils.Time;
-import org.apache.kafka.server.util.KafkaScheduler;
-import org.junit.jupiter.api.Test;
-
-import java.time.Duration;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 class NereusKafkaDeferredRuntimeTest {
     @Test

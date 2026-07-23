@@ -17,12 +17,6 @@
 
 package kafka.server.nereus;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-
-import com.nereusstream.api.NereusException;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.image.AclsImage;
@@ -39,6 +33,9 @@ import org.apache.kafka.image.TopicsImage;
 import org.apache.kafka.metadata.BrokerRegistration;
 import org.apache.kafka.metadata.KRaftMetadataCache;
 import org.apache.kafka.server.common.KRaftVersion;
+
+import com.nereusstream.api.NereusException;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -48,6 +45,11 @@ import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletionException;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NereusKafkaContextAdaptersTest {
     @TempDir
