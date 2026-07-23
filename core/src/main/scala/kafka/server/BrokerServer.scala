@@ -24,6 +24,9 @@ import kafka.network.SocketServer
 import kafka.raft.KafkaRaftManager
 import kafka.server.metadata._
 import kafka.server.share.{ShareCoordinatorMetadataCacheHelperImpl, SharePartitionManager}
+// Nereus inject start: optional authoritative broker-storage runtime lifecycle
+import kafka.server.storage.{BrokerStorageDrainReason, BrokerStorageRuntime, BrokerStorageRuntimeContext, BrokerStorageRuntimeFactory}
+// Nereus inject end: optional authoritative broker-storage runtime lifecycle
 import kafka.utils.CoreUtils
 import org.apache.kafka.common.config.ConfigException
 import org.apache.kafka.common.internals.Plugin
@@ -64,7 +67,7 @@ import org.apache.kafka.server.RaftControllerNodeProvider
 
 import java.time.Duration
 import java.util
-import java.util.Optional
+import java.util.{Objects, Optional}
 import java.util.concurrent.locks.{Condition, ReentrantLock}
 import java.util.concurrent.{CompletableFuture, ExecutionException, TimeUnit, TimeoutException}
 import scala.collection.Map
@@ -76,8 +79,14 @@ import scala.jdk.OptionConverters.RichOption
  * A Kafka broker that runs in KRaft (Kafka Raft) mode.
  */
 class BrokerServer(
-  val sharedServer: SharedServer
+  val sharedServer: SharedServer,
+  // Nereus inject start: explicit factory injection keeps stock startup artifact-independent
+  val brokerStorageRuntimeFactory: BrokerStorageRuntimeFactory = BrokerStorageRuntimeFactory.Disabled
+  // Nereus inject end: explicit factory injection keeps stock startup artifact-independent
 ) extends KafkaBroker {
+  // Preserve the Java-visible stock constructor; Scala default arguments do not create this overload.
+  def this(sharedServer: SharedServer) = this(sharedServer, BrokerStorageRuntimeFactory.Disabled)
+
   val config: KafkaConfig = sharedServer.brokerConfig
   val time: Time = sharedServer.time
   def metrics: Metrics = sharedServer.metrics
@@ -153,6 +162,13 @@ class BrokerServer(
 
   var brokerMetadataPublisher: BrokerMetadataPublisher = _
 
+  // Nereus inject start: optional runtime is created before log/partition IO and closed after logs
+  private var brokerStorageRuntime: BrokerStorageRuntime = _
+  private var brokerStorageRuntimeReady: CompletableFuture[Void] = _
+  private var brokerStorageDrainReason: BrokerStorageDrainReason = BrokerStorageDrainReason.BrokerShutdown
+  private var brokerStorageRuntimeClosed = false
+  // Nereus inject end: optional runtime is created before log/partition IO and closed after logs
+
   var brokerRegistrationTracker: BrokerRegistrationTracker = _
 
   val brokerFeatures: BrokerFeatures = BrokerFeatures.createDefault(config.unstableFeatureVersionsEnabled)
@@ -209,6 +225,21 @@ class BrokerServer(
       logDirFailureChannel = new LogDirFailureChannel(config.logDirs.size)
 
       metadataCache = new KRaftMetadataCache(config.nodeId, () => raftManager.client.kraftVersion())
+
+      // Nereus inject start: disabled default is inert; enabled without an installed factory fails before log IO
+      brokerStorageRuntime = Objects.requireNonNull(
+        brokerStorageRuntimeFactory.create(BrokerStorageRuntimeContext(
+          config,
+          clusterId,
+          () => Option(lifecycleManager).map(_.brokerEpoch).getOrElse(-1L),
+          metadataCache,
+          time,
+          metrics,
+          kafkaScheduler)),
+        "broker storage runtime")
+      brokerStorageRuntimeClosed = false
+      brokerStorageDrainReason = BrokerStorageDrainReason.BrokerShutdown
+      // Nereus inject end: disabled default is inert; enabled without an installed factory fails before log IO
 
       // Create log manager, but don't start it because we need to delay any potential unclean shutdown log recovery
       // until we catch up on the metadata log and have up-to-date topic and broker configs.
@@ -422,6 +453,11 @@ class BrokerServer(
         logManager.readBrokerEpochFromCleanShutdownFiles()
       )
 
+      // Nereus inject start: start asynchronously so activation may observe the initial metadata publication
+      brokerStorageRuntimeReady = Objects.requireNonNull(
+        brokerStorageRuntime.start(), "broker storage runtime start future").toCompletableFuture
+      // Nereus inject end: start asynchronously so activation may observe the initial metadata publication
+
       // The FetchSessionCache is divided into config.numIoThreads shards, each responsible
       // for Math.max(1, shardNum * sessionIdRange) <= sessionId < (shardNum + 1) * sessionIdRange
       val sessionIdRange = Int.MaxValue / NumFetchSessionCacheShards
@@ -528,7 +564,10 @@ class BrokerServer(
           authorizerPlugin.toJava
         ),
         sharedServer.initialBrokerMetadataLoadFaultHandler,
-        sharedServer.metadataPublishingFaultHandler
+        sharedServer.metadataPublishingFaultHandler,
+        // Nereus inject start: optional exact post-ReplicaManager partition lifecycle
+        brokerStorageRuntime.asyncTopicDeltaLifecycle
+        // Nereus inject end: optional exact post-ReplicaManager partition lifecycle
       )
       // If the BrokerLifecycleManager's initial catch-up future fails, it means we timed out
       // or are shutting down before we could catch up. Therefore, also fail the firstPublishFuture.
@@ -565,6 +604,12 @@ class BrokerServer(
       FutureUtils.waitWithLogging(logger.underlying, logIdent,
         "the initial broker metadata update to be published",
         brokerMetadataPublisher.firstPublishFuture , startupDeadline, time)
+
+      // Nereus inject start: request processing and broker unfencing require local storage readiness
+      FutureUtils.waitWithLogging(logger.underlying, logIdent,
+        "the broker storage runtime to become ready",
+        brokerStorageRuntimeReady, startupDeadline, time)
+      // Nereus inject end: request processing and broker unfencing require local storage readiness
 
       // Now that we have loaded some metadata, we can log a reasonably up-to-date broker
       // configuration.  Keep in mind that KafkaConfig.originals is a mutable field that gets set
@@ -619,6 +664,7 @@ class BrokerServer(
       maybeChangeStatus(STARTING, STARTED)
     } catch {
       case e: Throwable =>
+        brokerStorageDrainReason = BrokerStorageDrainReason.StartupFailure
         maybeChangeStatus(STARTING, STARTED)
         fatal("Fatal error during broker startup. Prepare to shutdown", e)
         shutdown()
@@ -796,6 +842,15 @@ class BrokerServer(
       if (socketServer != null) {
         CoreUtils.swallow(socketServer.stopProcessingRequests(), this)
       }
+      // Nereus inject start: close storage admission before publishers and request handlers drain
+      if (brokerStorageRuntime != null) {
+        val drainTimeout = remainingBrokerStorageDrainTimeout(deadline)
+        CoreUtils.swallow(
+          brokerStorageRuntime.beginDrain(brokerStorageDrainReason).toCompletableFuture.
+            get(drainTimeout.toMillis, TimeUnit.MILLISECONDS),
+          this)
+      }
+      // Nereus inject end: close storage admission before publishers and request handlers drain
       metadataPublishers.forEach(p => sharedServer.loader.removeAndClosePublisher(p).get())
       metadataPublishers.clear()
       if (dataPlaneRequestHandlerPool != null)
@@ -838,6 +893,16 @@ class BrokerServer(
       if (assignmentsManager != null)
         CoreUtils.swallow(assignmentsManager.close(), this)
 
+      // Nereus inject start: accepted storage work/sessions drain before ReplicaManager closes partition logs
+      if (brokerStorageRuntime != null) {
+        val drainTimeout = remainingBrokerStorageDrainTimeout(deadline)
+        CoreUtils.swallow(
+          brokerStorageRuntime.awaitDrained(drainTimeout).toCompletableFuture.
+            get(drainTimeout.toMillis, TimeUnit.MILLISECONDS),
+          this)
+      }
+      // Nereus inject end: accepted storage work/sessions drain before ReplicaManager closes partition logs
+
       if (replicaManager != null)
         CoreUtils.swallow(replicaManager.shutdown(), this)
 
@@ -854,6 +919,10 @@ class BrokerServer(
         val brokerEpoch = if (lifecycleManager != null) lifecycleManager.brokerEpoch else -1
         CoreUtils.swallow(logManager.shutdown(brokerEpoch), this)
       }
+
+      // Nereus inject start: owned providers close only after partition logs and sessions are closed
+      closeBrokerStorageRuntime()
+      // Nereus inject end: owned providers close only after partition logs and sessions are closed
 
       // Close remote log manager to give a chance to any of its underlying clients
       // (especially in RemoteStorageManager and RemoteLogMetadataManager) to close gracefully.
@@ -883,9 +952,26 @@ class BrokerServer(
         fatal("Fatal error during broker shutdown.", e)
         throw e
     } finally {
+      // Best-effort leak prevention when an earlier stock shutdown stage throws.
+      closeBrokerStorageRuntime()
       maybeChangeStatus(SHUTTING_DOWN, SHUTDOWN)
     }
   }
+
+  // Nereus inject start: bound storage drain by both configured and caller shutdown deadlines
+  private def remainingBrokerStorageDrainTimeout(deadlineMs: Long): Duration = {
+    val configured = config.nereusKafkaStorageConfig.rollout().shutdownDrainTimeout().toMillis
+    val remaining = Math.max(1L, deadlineMs - time.milliseconds())
+    Duration.ofMillis(Math.min(configured, remaining))
+  }
+
+  private def closeBrokerStorageRuntime(): Unit = {
+    if (brokerStorageRuntime != null && !brokerStorageRuntimeClosed) {
+      brokerStorageRuntimeClosed = true
+      Utils.closeQuietly(brokerStorageRuntime, "broker storage runtime")
+    }
+  }
+  // Nereus inject end: bound storage drain by both configured and caller shutdown deadlines
 
   override def isShutdown(): Boolean = {
     status == SHUTDOWN || status == SHUTTING_DOWN

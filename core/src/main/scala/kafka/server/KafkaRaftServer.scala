@@ -19,6 +19,9 @@ package kafka.server
 import java.io.File
 import java.util.concurrent.CompletableFuture
 import kafka.utils.{CoreUtils, Logging, Mx4jLoader}
+// Nereus inject start: explicit optional broker-storage runtime factory
+import kafka.server.storage.BrokerStorageRuntimeFactory
+// Nereus inject end: explicit optional broker-storage runtime factory
 import org.apache.kafka.common.config.{ConfigDef, ConfigResource}
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.common.utils.{AppInfoParser, Time}
@@ -47,6 +50,9 @@ import scala.jdk.CollectionConverters._
 class KafkaRaftServer(
   config: KafkaConfig,
   time: Time,
+  // Nereus inject start: custom launcher injects the enabled runtime without reflection
+  brokerStorageRuntimeFactory: BrokerStorageRuntimeFactory = BrokerStorageRuntimeFactory.Disabled,
+  // Nereus inject end: custom launcher injects the enabled runtime without reflection
 ) extends Server with Logging {
 
   this.logIdent = s"[KafkaRaftServer nodeId=${config.nodeId}] "
@@ -72,7 +78,7 @@ class KafkaRaftServer(
   )
 
   private val broker: Option[BrokerServer] = if (config.processRoles.contains(ProcessRole.BrokerRole)) {
-    Some(new BrokerServer(sharedServer))
+    Some(new BrokerServer(sharedServer, brokerStorageRuntimeFactory))
   } else {
     None
   }
