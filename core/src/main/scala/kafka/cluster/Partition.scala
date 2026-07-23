@@ -21,7 +21,6 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.Optional
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
 import kafka.log._
-import kafka.log.nereus.NereusKafkaRecoveredState
 import kafka.server._
 import kafka.server.share.DelayedShareFetch
 import kafka.utils.CoreUtils.{inReadLock, inWriteLock}
@@ -42,7 +41,7 @@ import org.apache.kafka.metadata.{LeaderAndIsr, LeaderRecoveryState, MetadataCac
 import org.apache.kafka.server.common.{RequestLocal, TransactionVersion}
 import org.apache.kafka.server.log.remote.TopicPartitionLog
 import org.apache.kafka.server.log.remote.storage.RemoteLogManager
-import org.apache.kafka.storage.internals.log.{AppendOrigin, AsyncOffsetReader, FetchDataInfo, LeaderEpochAwareOffsetLookup, LeaderHwChange, LogAppendInfo, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogReadInfo, LogStartOffsetIncrementReason, OffsetResultHolder, UnifiedLog, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, AsyncOffsetReader, FetchDataInfo, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LeaderHwChange, LogAppendInfo, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogReadInfo, LogStartOffsetIncrementReason, OffsetResultHolder, UnifiedLog, VerificationGuard}
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 import org.apache.kafka.server.partition.{AlterPartitionListener, AssignmentState, CommittedPartitionState, OngoingReassignmentState, PartitionListener, PartitionState, PendingExpandIsr, PendingPartitionChange, PendingShrinkIsr, SimpleAssignmentState}
 import org.apache.kafka.server.purgatory.{DelayedDeleteRecords, DelayedOperationPurgatory, TopicPartitionOperationKey}
@@ -193,7 +192,7 @@ class Partition(val topicPartition: TopicPartition,
   // Nereus inject start: leader-epoch-fenced asynchronous ListOffsets lookup
   private var leaderEpochAwareOffsetLookup: Option[(Int, LeaderEpochAwareOffsetLookup)] = None
   private var leaderEpochAwareOffsetLookupPending: Option[Int] = None
-  private var nereusRecoveredState: Option[(Int, NereusKafkaRecoveredState)] = None
+  private var nereusRecoveredState: Option[(Int, LeaderEpochAwareRecoveryState)] = None
   // Nereus inject end: leader-epoch-fenced asynchronous ListOffsets lookup
   // Replica ID of the leader, defined when this broker is leader or follower for the partition.
   @volatile var leaderReplicaIdOpt: Option[Int] = None
@@ -1474,7 +1473,7 @@ class Partition(val topicPartition: TopicPartition,
   }
 
   def installNereusRecoveredState(expectedLeaderEpoch: Int,
-                                  state: NereusKafkaRecoveredState): Unit = inWriteLock(leaderIsrUpdateLock) {
+                                  state: LeaderEpochAwareRecoveryState): Unit = inWriteLock(leaderIsrUpdateLock) {
     java.util.Objects.requireNonNull(state, "state")
     if (!isLeader) {
       throw new NotLeaderOrFollowerException(
@@ -1485,9 +1484,8 @@ class Partition(val topicPartition: TopicPartition,
         s"Cannot install recovered Nereus state for partition $topicPartition at stale leader epoch " +
           s"$expectedLeaderEpoch; current leader epoch is $leaderEpoch")
     }
-    if (state.identity.observedTopicName != topic
-      || state.identity.partition != partitionId
-      || !topicId.exists(_.toString == state.identity.topicId)
+    if (state.topicPartition != topicPartition
+      || !topicId.contains(state.topicId)
       || !state.frozen) {
       throw new KafkaStorageException(
         s"Recovered Nereus state does not match the exact Kafka partition $topicPartition")
@@ -1495,7 +1493,7 @@ class Partition(val topicPartition: TopicPartition,
     nereusRecoveredState = Some(expectedLeaderEpoch -> state)
   }
 
-  def currentNereusRecoveredState(expectedLeaderEpoch: Int): Optional[NereusKafkaRecoveredState] = {
+  def currentNereusRecoveredState(expectedLeaderEpoch: Int): Optional[LeaderEpochAwareRecoveryState] = {
     inReadLock(leaderIsrUpdateLock) {
       nereusRecoveredState
         .filter(_._1 == expectedLeaderEpoch)

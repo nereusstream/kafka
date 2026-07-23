@@ -61,7 +61,7 @@ import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, Unexpec
 import org.apache.kafka.server.util.{KafkaScheduler, MockTime}
 import org.apache.kafka.storage.internals.checkpoint.OffsetCheckpoints
 import org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache
-import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, EpochEntry, LeaderEpochAwareOffsetLookup, LocalLog, LogAppendInfo, LogConfig, LogDirFailureChannel, LogLoader, LogOffsetMetadata, LogOffsetsListener, LogReadInfo, LogSegments, LogStartOffsetIncrementReason, OffsetResultHolder, ProducerStateManager, ProducerStateManagerConfig, UnifiedLog, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, EpochEntry, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LocalLog, LogAppendInfo, LogConfig, LogDirFailureChannel, LogLoader, LogOffsetMetadata, LogOffsetsListener, LogReadInfo, LogSegments, LogStartOffsetIncrementReason, OffsetResultHolder, ProducerStateManager, ProducerStateManagerConfig, UnifiedLog, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
@@ -875,6 +875,31 @@ class PartitionTest extends AbstractPartitionTest {
       None,
       Optional.of(leaderEpoch),
       fetchOnlyFromLeader = true).timestampAndOffsetOpt().isPresent)
+  }
+
+  @Test
+  def testLeaderEpochAwareRecoveryStateUsesStockBoundaryAndExactCancellation(): Unit = {
+    val leaderEpoch = 5
+    val partition = setupPartitionWithMocks(leaderEpoch, isLeader = true)
+    partition.createLogIfNotExists(
+      isNew = false,
+      isFutureReplica = false,
+      offsetCheckpoints,
+      topicId)
+    val recovered = mock(classOf[LeaderEpochAwareRecoveryState])
+    when(recovered.topicPartition).thenReturn(topicPartition)
+    when(recovered.topicId).thenReturn(topicId.get)
+    when(recovered.leaderEpoch).thenReturn(leaderEpoch)
+    when(recovered.frozen).thenReturn(true)
+
+    partition.beginLeaderEpochAwareOffsetLookup(leaderEpoch)
+    partition.installNereusRecoveredState(leaderEpoch, recovered)
+
+    assertSame(recovered, partition.currentNereusRecoveredState(leaderEpoch).orElseThrow())
+    partition.cancelLeaderEpochAwareOffsetLookup(leaderEpoch - 1)
+    assertSame(recovered, partition.currentNereusRecoveredState(leaderEpoch).orElseThrow())
+    partition.cancelLeaderEpochAwareOffsetLookup(leaderEpoch)
+    assertTrue(partition.currentNereusRecoveredState(leaderEpoch).isEmpty)
   }
 
   @Test

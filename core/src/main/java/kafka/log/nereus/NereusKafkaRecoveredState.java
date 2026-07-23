@@ -17,9 +17,12 @@
 
 package kafka.log.nereus;
 
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
+import org.apache.kafka.storage.internals.log.LeaderEpochAwareRecoveryState;
 
 import com.nereusstream.api.ErrorCode;
 import com.nereusstream.api.NereusException;
@@ -42,7 +45,7 @@ import java.util.OptionalLong;
  * publisher can expose it. M3 deliberately rejects producer, transaction, control and NKC1-derived state; M4 replaces
  * those fail-closed boundaries with stock producer/transaction recovery.
  */
-public final class NereusKafkaRecoveredState {
+public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecoveryState {
     private final KafkaPartitionIdentity identity;
     private final int leaderEpoch;
     private final long logStartOffset;
@@ -177,6 +180,18 @@ public final class NereusKafkaRecoveredState {
         return identity;
     }
 
+    @Override
+    public TopicPartition topicPartition() {
+        return new TopicPartition(
+                identity.observedTopicName(), identity.partition());
+    }
+
+    @Override
+    public Uuid topicId() {
+        return Uuid.fromString(identity.topicId());
+    }
+
+    @Override
     public int leaderEpoch() {
         return leaderEpoch;
     }
@@ -228,6 +243,7 @@ public final class NereusKafkaRecoveredState {
         return List.copyOf(leaderEpochRanges);
     }
 
+    @Override
     public boolean frozen() {
         return frozen;
     }
