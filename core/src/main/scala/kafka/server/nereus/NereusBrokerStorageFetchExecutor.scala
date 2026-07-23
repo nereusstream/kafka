@@ -58,9 +58,11 @@ final class NereusBrokerStorageFetchExecutor(
   private val guard = new Object
   private val maxOutstanding = Math.addExact(config.executorThreads(), config.executorQueueCapacity())
   private val operations = mutable.Set.empty[KafkaFetchWaveOperation[Seq[(TopicIdPartition, LogReadResult)]]]
+  // Logical admission already bounds runners to maxOutstanding. Keeping that many physical queue slots prevents a burst of
+  // signals for already-admitted waiting operations from being rejected before idle workers can dequeue their control tasks.
   private val readExecutor = new TrackingExecutor(
     config.executorThreads(),
-    config.executorQueueCapacity(),
+    maxOutstanding,
     threadFactory(s"nereus-kafka-fetch-read-$brokerId"))
   private val callbackExecutor = new TrackingExecutor(
     1,

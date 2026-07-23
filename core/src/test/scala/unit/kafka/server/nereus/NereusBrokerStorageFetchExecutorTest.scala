@@ -35,7 +35,7 @@ import org.mockito.Mockito.{mock, when}
 
 import java.time.Duration
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
-import java.util.concurrent.{CompletionException, Executors, TimeUnit}
+import java.util.concurrent.{CompletionException, CopyOnWriteArrayList, Executors, TimeUnit}
 import java.util.{Optional, OptionalLong}
 import scala.collection.Seq
 
@@ -101,13 +101,17 @@ class NereusBrokerStorageFetchExecutorTest {
       fixture.manager,
       scheduler)
     val reads = new AtomicInteger
+    val responseReady = new AtomicBoolean
     try {
       def submit() = executor.submit(
-        fetchParams(maxWaitMs = 100, minBytes = 1),
+        fetchParams(maxWaitMs = 30000, minBytes = 1),
         Seq(fixture.partition -> partitionData(fixture.topicId)),
         _ => {
           reads.incrementAndGet()
-          Seq(fixture.partition -> successResult(MemoryRecords.EMPTY))
+          val records =
+            if (responseReady.get()) MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("ready".getBytes))
+            else MemoryRecords.EMPTY
+          Seq(fixture.partition -> successResult(records))
         }).toCompletableFuture
 
       val first = submit()
@@ -120,11 +124,16 @@ class NereusBrokerStorageFetchExecutorTest {
         org.apache.kafka.common.errors.ThrottlingQuotaExceededException])
       assertEquals(2, reads.get())
 
+      responseReady.set(true)
+      fixture.listeners.forEach(_.onPartitionEvent(new KafkaPartitionEvent(
+        fixture.identity,
+        com.nereusstream.kafka.partition.KafkaPartitionEventType.STABLE_APPEND,
+        KafkaStableSnapshot.nonTransactional(0, 1, 1))))
       executor.close()
       first.get(5, TimeUnit.SECONDS)
       second.get(5, TimeUnit.SECONDS)
       executor.drained.toCompletableFuture.get(5, TimeUnit.SECONDS)
-      assertTrue(reads.get() >= 4)
+      assertEquals(4, reads.get())
     } finally {
       executor.close()
       scheduler.shutdownNow()
@@ -138,15 +147,21 @@ class NereusBrokerStorageFetchExecutorTest {
     val manager = mock(classOf[KafkaPartitionStorageManager])
     val storage = mock(classOf[KafkaPartitionStorage])
     val listener = new AtomicReference[KafkaPartitionEventListener]
+    val listeners = new CopyOnWriteArrayList[KafkaPartitionEventListener]
     val subscriptionClosed = new AtomicBoolean
     when(manager.current(identity)).thenReturn(Optional.of(storage))
     when(storage.subscribe(any(classOf[KafkaPartitionEventListener]))).thenAnswer { invocation =>
-      listener.set(invocation.getArgument(0, classOf[KafkaPartitionEventListener]))
+      val exactListener = invocation.getArgument(0, classOf[KafkaPartitionEventListener])
+      listener.set(exactListener)
+      listeners.add(exactListener)
       new KafkaPartitionEventSubscription {
-        override def close(): Unit = subscriptionClosed.set(true)
+        override def close(): Unit = {
+          listeners.remove(exactListener)
+          subscriptionClosed.set(true)
+        }
       }
     }
-    StorageFixture(topicId, partition, identity, manager, listener, subscriptionClosed)
+    StorageFixture(topicId, partition, identity, manager, listener, listeners, subscriptionClosed)
   }
 
   private def successResult(records: MemoryRecords): LogReadResult =
@@ -199,5 +214,6 @@ class NereusBrokerStorageFetchExecutorTest {
     identity: KafkaPartitionIdentity,
     manager: KafkaPartitionStorageManager,
     listener: AtomicReference[KafkaPartitionEventListener],
+    listeners: CopyOnWriteArrayList[KafkaPartitionEventListener],
     subscriptionClosed: AtomicBoolean)
 }
