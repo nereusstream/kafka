@@ -250,7 +250,9 @@ class BrokerServer(
         time,
         brokerTopicStats,
         logDirFailureChannel,
+        // Nereus inject start: exact runtime-owned partition-log factory
         brokerStorageRuntime.unifiedLogFactory)
+        // Nereus inject end: exact runtime-owned partition-log factory
 
       lifecycleManager = new BrokerLifecycleManager(config,
         time,

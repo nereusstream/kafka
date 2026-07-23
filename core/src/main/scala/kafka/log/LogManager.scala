@@ -80,7 +80,9 @@ class LogManager(logDirs: Seq[File],
                  val initialTaskDelayMs: Long,
                  cleanerFactory: (CleanerConfig, util.List[File], ConcurrentMap[TopicPartition, UnifiedLog], LogDirFailureChannel, Time) => LogCleaner =
                   (cleanerConfig, files, map, logDirFailureChannel, time) => new LogCleaner(cleanerConfig, files, map, logDirFailureChannel, time),
+                 // Nereus inject start: explicit per-broker partition-log construction seam
                  unifiedLogFactory: UnifiedLogFactory = UnifiedLogFactory.Local
+                 // Nereus inject end: explicit per-broker partition-log construction seam
                 ) extends Logging {
   // Changing the package or class name may cause incompatibility with existing code and metrics configuration
   private val metricsPackage = "kafka.log"
@@ -333,6 +335,7 @@ class LogManager(logDirs: Seq[File],
     val logRecoveryPoint = recoveryPoints.getOrDefault(topicPartition, 0L)
     val logStartOffset = logStartOffsets.getOrDefault(topicPartition, 0L)
 
+    // Nereus inject start: delegate existing-log construction to the selected factory
     val log = unifiedLogFactory.open(UnifiedLogOpenContext(
       logDir,
       config,
@@ -351,6 +354,7 @@ class LogManager(logDirs: Seq[File],
       remoteStorageSystemEnable,
       LogOffsetsListener.NO_OP_OFFSETS_LISTENER,
       logDir.getName.endsWith(LogFileUtils.FUTURE_DIR_SUFFIX)))
+    // Nereus inject end: delegate existing-log construction to the selected factory
 
     if (logDir.getName.endsWith(UnifiedLog.DELETE_DIR_SUFFIX)) {
       addLogToBeDeleted(log)
@@ -607,6 +611,7 @@ class LogManager(logDirs: Seq[File],
     defaultConfig: LogConfig,
     topicConfigOverrides: Map[String, LogConfig],
     isStray: UnifiedLog => Boolean): Unit = {
+    // Nereus inject start: authoritative storage never treats cache directories as partition truth
     if (unifiedLogFactory.loadExistingLogs) {
       loadLogs(defaultConfig, topicConfigOverrides, isStray) // this could take a while if shutdown was not clean
     }
@@ -644,6 +649,7 @@ class LogManager(logDirs: Seq[File],
       }
 
     }
+    // Nereus inject end: authoritative storage never treats cache directories as partition truth
   }
 
   /**
@@ -680,9 +686,11 @@ class LogManager(logDirs: Seq[File],
       val jobsForDir = logs.map { log =>
         val runnable: Runnable = () => {
           // flush the log to ensure latest possible recovery point
+          // Nereus inject start: local flush/checkpoints are disabled for authoritative storage
           if (unifiedLogFactory.scheduleLocalMaintenance) {
             log.flush(true)
           }
+          // Nereus inject end: local flush/checkpoints are disabled for authoritative storage
           log.close()
         }
         runnable
@@ -693,6 +701,7 @@ class LogManager(logDirs: Seq[File],
 
     try {
       jobs.foreachEntry { (dir, dirJobs) =>
+        // Nereus inject start: never publish local cache checkpoints as durable state
         if (JLogManager.waitForAllToComplete(dirJobs.toList.asJava,
           e => warn(s"There was an error in one of the threads during LogManager shutdown: ${e.getCause}")) &&
           unifiedLogFactory.scheduleLocalMaintenance) {
@@ -716,6 +725,7 @@ class LogManager(logDirs: Seq[File],
             CoreUtils.swallow(cleanShutdownFileHandler.write(brokerEpoch), this)
           }
         }
+        // Nereus inject end: never publish local cache checkpoints as durable state
       }
     } finally {
       threadPools.foreach(_.shutdown())
@@ -804,7 +814,9 @@ class LogManager(logDirs: Seq[File],
    * to avoid recovering the whole log on startup.
    */
   def checkpointLogRecoveryOffsets(): Unit = {
+    // Nereus inject start: authoritative logs have product-owned checkpoints
     if (!unifiedLogFactory.scheduleLocalMaintenance) return
+    // Nereus inject end: authoritative logs have product-owned checkpoints
     val logsByDirCached = logsByDir
     liveLogDirs.foreach { logDir =>
       val logsToCheckpoint = logsInDir(logsByDirCached, logDir)
@@ -817,7 +829,9 @@ class LogManager(logDirs: Seq[File],
    * to avoid exposing data that have been deleted by DeleteRecordsRequest
    */
   def checkpointLogStartOffsets(): Unit = {
+    // Nereus inject start: authoritative logs have product-owned checkpoints
     if (!unifiedLogFactory.scheduleLocalMaintenance) return
+    // Nereus inject end: authoritative logs have product-owned checkpoints
     val logsByDirCached = logsByDir
     liveLogDirs.foreach { logDir =>
       checkpointLogStartOffsetsInDir(logDir, logsInDir(logsByDirCached, logDir))
@@ -831,7 +845,9 @@ class LogManager(logDirs: Seq[File],
    */
   // Only for testing
   private[log] def checkpointRecoveryOffsetsInDir(logDir: File): Unit = {
+    // Nereus inject start: authoritative logs have product-owned checkpoints
     if (!unifiedLogFactory.scheduleLocalMaintenance) return
+    // Nereus inject end: authoritative logs have product-owned checkpoints
     checkpointRecoveryOffsetsInDir(logDir, logsInDir(logDir))
   }
 
@@ -842,7 +858,9 @@ class LogManager(logDirs: Seq[File],
    * @param logsToCheckpoint the logs to be checkpointed
    */
   private def checkpointRecoveryOffsetsInDir(logDir: File, logsToCheckpoint: Map[TopicPartition, UnifiedLog]): Unit = {
+    // Nereus inject start: authoritative logs have product-owned checkpoints
     if (!unifiedLogFactory.scheduleLocalMaintenance) return
+    // Nereus inject end: authoritative logs have product-owned checkpoints
     try {
       recoveryPointCheckpoints.get(logDir).foreach { checkpoint =>
         val recoveryOffsets: Map[TopicPartition, JLong] = logsToCheckpoint.map { case (tp, log) => tp -> long2Long(log.recoveryPoint) }
@@ -866,7 +884,9 @@ class LogManager(logDirs: Seq[File],
    * @param logsToCheckpoint the logs to be checkpointed
    */
   private def checkpointLogStartOffsetsInDir(logDir: File, logsToCheckpoint: Map[TopicPartition, UnifiedLog]): Unit = {
+    // Nereus inject start: authoritative logs have product-owned checkpoints
     if (!unifiedLogFactory.scheduleLocalMaintenance) return
+    // Nereus inject end: authoritative logs have product-owned checkpoints
     try {
       logStartOffsetCheckpoints.get(logDir).foreach { checkpoint =>
         val logStartOffsets: Map[TopicPartition, JLong] = logsToCheckpoint.collect {
@@ -1072,6 +1092,7 @@ class LogManager(logDirs: Seq[File],
           .get // If Failure, will throw
 
         val config = fetchLogConfig(topicPartition.topic)
+        // Nereus inject start: create the selected authoritative or stock partition log
         val log = unifiedLogFactory.open(UnifiedLogOpenContext(
           logDir,
           config,
@@ -1090,6 +1111,7 @@ class LogManager(logDirs: Seq[File],
           remoteStorageSystemEnable,
           LogOffsetsListener.NO_OP_OFFSETS_LISTENER,
           isFuture))
+        // Nereus inject end: create the selected authoritative or stock partition log
 
         if (isFuture)
           futureLogs.put(topicPartition, log)
@@ -1516,7 +1538,9 @@ class LogManager(logDirs: Seq[File],
   }
 
   def readBrokerEpochFromCleanShutdownFiles(): OptionalLong = {
+    // Nereus inject start: cache clean-shutdown markers are never broker epoch truth
     if (!unifiedLogFactory.scheduleLocalMaintenance) return OptionalLong.empty()
+    // Nereus inject end: cache clean-shutdown markers are never broker epoch truth
     // Verify whether all the log dirs have the same broker epoch in their clean shutdown files. If there is any dir not
     // live, fail the broker epoch check.
     if (liveLogDirs.size < logDirs.size) {
@@ -1558,11 +1582,13 @@ object LogManager {
     val cleanerConfig = new CleanerConfig(config)
     val transactionLogConfig = new TransactionLogConfig(config)
 
+    // Nereus inject start: select stock log directories or the authoritative-storage cache root
     val selectedLogDirectories = unifiedLogFactory.logDirectories(
       config.logDirs.asScala.map(new File(_).getAbsoluteFile).toSeq)
     val selectedInitialOfflineDirectories = unifiedLogFactory.initialOfflineDirectories(
       initialOfflineDirs.map(new File(_).getAbsoluteFile),
       selectedLogDirectories)
+    // Nereus inject end: select stock log directories or the authoritative-storage cache root
 
     new LogManager(logDirs = selectedLogDirectories,
       initialOfflineDirs = selectedInitialOfflineDirectories,

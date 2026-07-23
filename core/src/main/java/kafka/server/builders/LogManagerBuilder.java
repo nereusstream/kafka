@@ -176,7 +176,9 @@ public class LogManagerBuilder {
                               remoteStorageSystemEnable,
                               initialTaskDelayMs,
                               LogCleaner::new,
+                              // Nereus inject start: stock builder retains the exact local factory
                               UnifiedLogFactory.Local()
+                              // Nereus inject end: stock builder retains the exact local factory
                 );
     }
 }
