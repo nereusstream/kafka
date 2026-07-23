@@ -38,7 +38,7 @@ import org.apache.kafka.coordinator.share.ShareCoordinatorConfig
 import org.apache.kafka.coordinator.transaction.{TransactionLogConfig, TransactionStateManagerConfig}
 import org.apache.kafka.network.SocketServerConfigs
 import org.apache.kafka.raft.{KRaftConfigs, MetadataLogConfig, QuorumConfig}
-import org.apache.kafka.server.config.{DelegationTokenManagerConfigs, QuotaConfig, ReplicationConfigs, ServerConfigs, ServerLogConfigs, ServerTopicConfigSynonyms}
+import org.apache.kafka.server.config.{DelegationTokenManagerConfigs, NereusKafkaConfigs, QuotaConfig, ReplicationConfigs, ServerConfigs, ServerLogConfigs, ServerTopicConfigSynonyms}
 import org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
 import org.apache.kafka.server.metrics.MetricConfigs
 import org.apache.kafka.storage.internals.log.CleanerConfig
@@ -1075,6 +1075,18 @@ class KafkaConfigTest {
 
         /** Share coordinator configs */
         case ShareCoordinatorConfig.APPEND_LINGER_MS_CONFIG => assertPropertyInvalid(baseProperties, name, "not_a_number", -2, -0.5)
+
+        /** Optional Nereus native-storage free-form strings */
+        case NereusKafkaConfigs.CLUSTER_CONFIG |
+             NereusKafkaConfigs.OXIA_SERVICE_ADDRESS_CONFIG |
+             NereusKafkaConfigs.OXIA_NAMESPACE_CONFIG |
+             NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG |
+             NereusKafkaConfigs.OBJECT_BUCKET_CONFIG |
+             NereusKafkaConfigs.OBJECT_ENDPOINT_CONFIG |
+             NereusKafkaConfigs.OBJECT_REGION_CONFIG |
+             NereusKafkaConfigs.BOOKKEEPER_METADATA_SERVICE_URI_CONFIG |
+             NereusKafkaConfigs.CACHE_DIR_CONFIG |
+             NereusKafkaConfigs.COMPACTION_SPILL_DIR_CONFIG => // ignore string
 
         case _ => assertPropertyInvalid(baseProperties, name, "not_a_number", "-1")
       }

@@ -73,7 +73,10 @@ public abstract class AbstractKafkaConfig extends AbstractConfig {
         QuotaConfig.CONFIG_DEF,
         BrokerSecurityConfigs.CONFIG_DEF,
         DelegationTokenManagerConfigs.CONFIG_DEF,
-        AddPartitionsToTxnConfig.CONFIG_DEF
+        AddPartitionsToTxnConfig.CONFIG_DEF,
+        // Nereus inject start: inert optional native-storage configuration surface
+        NereusKafkaConfigs.CONFIG_DEF
+        // Nereus inject end: inert optional native-storage configuration surface
     ));
 
     public AbstractKafkaConfig(ConfigDef definition, Map<?, ?> originals, Map<String, ?> configProviderProps, boolean doLog) {

@@ -44,7 +44,9 @@ import org.apache.kafka.security.authorizer.AuthorizerUtils
 import org.apache.kafka.server.ProcessRole
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.config.AbstractKafkaConfig.getMap
-import org.apache.kafka.server.config.{AbstractKafkaConfig, QuotaConfig, ReplicationConfigs, ServerConfigs, ServerLogConfigs}
+// Nereus inject start: immutable optional native-storage configuration snapshot
+import org.apache.kafka.server.config.{AbstractKafkaConfig, NereusKafkaStorageConfig, QuotaConfig, ReplicationConfigs, ServerConfigs, ServerLogConfigs}
+// Nereus inject end: immutable optional native-storage configuration snapshot
 import org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
 import org.apache.kafka.server.metrics.MetricConfigs
 import org.apache.kafka.storage.internals.log.{CleanerConfig, LogConfig}
@@ -499,6 +501,10 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
     advertisedListeners.filterNot(l => controllerListenerNames.contains(l.listener))
   }
 
+  // Nereus inject start: parse without creating runtime resources
+  val nereusKafkaStorageConfig: NereusKafkaStorageConfig = NereusKafkaStorageConfig.from(this)
+  // Nereus inject end: parse without creating runtime resources
+
   validateValues()
 
   private def validateValues(): Unit = {
@@ -660,6 +666,9 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
     require(principalBuilderClass != null, s"${BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG} must be non-null")
     require(classOf[KafkaPrincipalSerde].isAssignableFrom(principalBuilderClass),
       s"${BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG} must implement KafkaPrincipalSerde")
+    // Nereus inject start: enabled-only cross-Kafka validation
+    NereusKafkaConfigValidator.validate(this, nereusKafkaStorageConfig)
+    // Nereus inject end: enabled-only cross-Kafka validation
   }
 
   /**
