@@ -43,6 +43,15 @@ plugins {
   id 'com.diffplug.spotless' version "8.0.0"
 }
 
+// Nereus inject start: isolated development artifact inputs
+def nereusDevelopmentRepository = providers.gradleProperty('nereusDevelopmentRepository')
+def nereusDevelopmentVersion = providers.gradleProperty('nereusDevelopmentVersion')
+def nereusDevelopmentEnabled = nereusDevelopmentRepository.isPresent() && nereusDevelopmentVersion.isPresent()
+if (nereusDevelopmentRepository.isPresent() != nereusDevelopmentVersion.isPresent()) {
+  throw new GradleException('nereusDevelopmentRepository and nereusDevelopmentVersion must be provided together')
+}
+// Nereus inject end: isolated development artifact inputs
+
 ext {
   minClientJavaVersion = 11
   minNonClientJavaVersion = 17
@@ -167,6 +176,17 @@ ext {
 allprojects {
 
   repositories {
+    // Nereus inject start: isolated development repository
+    if (nereusDevelopmentEnabled) {
+      maven {
+        name = 'nereusDevelopment'
+        url = uri(nereusDevelopmentRepository.get())
+        content {
+          includeGroup 'com.nereusstream'
+        }
+      }
+    }
+    // Nereus inject end: isolated development repository
     mavenCentral()
   }
 
@@ -1038,6 +1058,15 @@ project(':server') {
 project(':core') {
   apply plugin: 'scala'
 
+  // Nereus inject start: keep stock builds independent from unpublished development artifacts
+  if (!nereusDevelopmentEnabled) {
+    sourceSets.main.java.exclude 'kafka/log/nereus/**'
+    sourceSets.main.scala.exclude 'kafka/log/nereus/**'
+    sourceSets.test.java.exclude 'kafka/log/nereus/**'
+    sourceSets.test.scala.exclude 'kafka/log/nereus/**'
+  }
+  // Nereus inject end: keep stock builds independent from unpublished development artifacts
+
   // scaladoc generation is configured at the sub-module level with an artifacts
   // block (cf. see streams-scala). If scaladoc generation is invoked explicitly
   // for the `core` module, this ensures the generated jar doesn't include scaladoc
@@ -1104,6 +1133,12 @@ project(':core') {
     implementation libs.scalaLogging
     implementation libs.slf4jApi
     implementation libs.re2j
+
+    // Nereus inject start: exact product-owned adapter boundary
+    if (nereusDevelopmentEnabled) {
+      implementation "com.nereusstream:nereus-kafka-adapter:${nereusDevelopmentVersion.get()}"
+    }
+    // Nereus inject end: exact product-owned adapter boundary
 
     testImplementation project(':clients').sourceSets.test.output
     testImplementation project(':group-coordinator').sourceSets.test.output
