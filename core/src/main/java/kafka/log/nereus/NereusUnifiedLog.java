@@ -19,6 +19,7 @@ package kafka.log.nereus;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.KafkaStorageException;
+import org.apache.kafka.common.errors.OffsetOutOfRangeException;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.common.RequestLocal;
@@ -35,32 +36,47 @@ import org.apache.kafka.storage.internals.log.LogSegment;
 import org.apache.kafka.storage.internals.log.LogSegments;
 import org.apache.kafka.storage.internals.log.ProducerStateManager;
 import org.apache.kafka.storage.internals.log.ProducerStateManagerConfig;
+import org.apache.kafka.storage.internals.log.RequiredAcksAwareAppend;
 import org.apache.kafka.storage.internals.log.UnifiedLog;
 import org.apache.kafka.storage.internals.log.VerificationGuard;
 
+import com.nereusstream.api.AppendOutcome;
 import com.nereusstream.api.ErrorCode;
 import com.nereusstream.api.NereusException;
+import com.nereusstream.kafka.partition.KafkaAppendContext;
 import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.partition.KafkaPartitionState;
 import com.nereusstream.kafka.partition.KafkaPartitionStorage;
+import com.nereusstream.kafka.partition.KafkaStableAppendResult;
 import com.nereusstream.kafka.partition.KafkaStableSnapshot;
+import com.nereusstream.kafka.partition.KafkaStorageReadRequest;
+import com.nereusstream.kafka.partition.KafkaStorageReadResult;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Per-partition stock UnifiedLog shell whose durable state is published only after exact Nereus recovery.
  *
- * <p>This slice deliberately rejects Produce and Fetch even after publication. It establishes the factory and
- * recovery/storage lifecycle boundary without allowing a stock local append fallback; the following data-plane slice
- * replaces those fail-closed methods with stable Nereus IO.
+ * <p>Stock validation and offset assignment stay in UnifiedLog. The final LocalLog append and read are redirected to
+ * the exact recovered Nereus storage; the synthetic local segment remains empty and is never durable truth.
  */
-public final class NereusUnifiedLog extends UnifiedLog {
+public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAwareAppend {
     private final Object nereusGuard = new Object();
     private final KafkaPartitionIdentity identity;
+    private final Duration appendTimeout;
+    private final Duration fetchTimeout;
+    private final int hardMaxFetchBytes;
+    private final ThreadLocal<AppendInvocation> appendInvocation = new ThreadLocal<>();
 
     private NereusKafkaRecoveredState recoveredState;
     private KafkaPartitionStorage storage;
@@ -71,6 +87,9 @@ public final class NereusUnifiedLog extends UnifiedLog {
             int producerIdExpirationCheckIntervalMs,
             Optional<Uuid> topicId,
             KafkaPartitionIdentity identity,
+            Duration appendTimeout,
+            Duration fetchTimeout,
+            int hardMaxFetchBytes,
             LogOffsetsListener logOffsetsListener
     ) throws IOException {
         super(
@@ -84,6 +103,13 @@ public final class NereusUnifiedLog extends UnifiedLog {
                 false,
                 logOffsetsListener);
         this.identity = Objects.requireNonNull(identity, "identity");
+        this.appendTimeout = positive(appendTimeout, "appendTimeout");
+        this.fetchTimeout = positive(fetchTimeout, "fetchTimeout");
+        if (hardMaxFetchBytes <= 0) {
+            throw new IllegalArgumentException("hardMaxFetchBytes must be positive");
+        }
+        this.hardMaxFetchBytes = hardMaxFetchBytes;
+        parts.localLog.bindStableAppend(this::appendStable);
     }
 
     public static NereusUnifiedLog create(
@@ -98,6 +124,9 @@ public final class NereusUnifiedLog extends UnifiedLog {
             LogDirFailureChannel logDirFailureChannel,
             Uuid topicId,
             KafkaPartitionIdentity identity,
+            Duration appendTimeout,
+            Duration fetchTimeout,
+            int hardMaxFetchBytes,
             LogOffsetsListener logOffsetsListener
     ) throws IOException {
         Objects.requireNonNull(topicId, "topicId");
@@ -119,6 +148,9 @@ public final class NereusUnifiedLog extends UnifiedLog {
                 producerIdExpirationCheckIntervalMs,
                 Optional.of(topicId),
                 identity,
+                appendTimeout,
+                fetchTimeout,
+                hardMaxFetchBytes,
                 logOffsetsListener);
     }
 
@@ -203,8 +235,55 @@ public final class NereusUnifiedLog extends UnifiedLog {
             VerificationGuard verificationGuard,
             short transactionVersion
     ) {
+        return appendAsLeader(
+                records,
+                leaderEpoch,
+                origin,
+                requestLocal,
+                verificationGuard,
+                transactionVersion,
+                (short) 1);
+    }
+
+    @Override
+    public LogAppendInfo appendAsLeader(
+            MemoryRecords records,
+            int leaderEpoch,
+            AppendOrigin origin,
+            RequestLocal requestLocal,
+            VerificationGuard verificationGuard,
+            short transactionVersion,
+            short requiredAcks
+    ) {
         requirePublished(leaderEpoch);
-        throw dataPlanePending("Produce");
+        if (origin != AppendOrigin.CLIENT) {
+            throw NereusKafkaExceptionMapper.map(unsupported(
+                    "F9-M3 Nereus append accepts only ordinary client records"));
+        }
+        if (requiredAcks != 0 && requiredAcks != 1 && requiredAcks != -1) {
+            throw new IllegalArgumentException("Kafka requiredAcks must be 0, 1, or -1");
+        }
+        if (appendInvocation.get() != null) {
+            throw new IllegalStateException("Nested Nereus append invocation is not supported");
+        }
+        AppendInvocation invocation = new AppendInvocation(leaderEpoch, requiredAcks);
+        appendInvocation.set(invocation);
+        try {
+            return super.appendAsLeader(
+                    records,
+                    leaderEpoch,
+                    origin,
+                    requestLocal,
+                    verificationGuard,
+                    transactionVersion);
+        } catch (RuntimeException | Error failure) {
+            if (invocation.committedStorage != null) {
+                fenceUnknownAppend(invocation.committedStorage);
+            }
+            throw failure;
+        } finally {
+            appendInvocation.remove();
+        }
     }
 
     @Override
@@ -220,13 +299,208 @@ public final class NereusUnifiedLog extends UnifiedLog {
             FetchIsolation isolation,
             boolean minOneMessage
     ) {
+        Objects.requireNonNull(isolation, "isolation");
+        KafkaPartitionStorage exactStorage;
+        KafkaStableSnapshot snapshot;
         synchronized (nereusGuard) {
-            if (storage == null || recoveredState == null) {
+            if (storage == null
+                    || recoveredState == null
+                    || storage.state() != KafkaPartitionState.LEADER_WRITABLE) {
                 throw new KafkaStorageException(
                         "Nereus partition storage is not recovered and published");
             }
+            exactStorage = storage;
+            snapshot = exactStorage.stableSnapshot();
         }
-        throw dataPlanePending("Fetch");
+        if (startOffset < snapshot.logStartOffset()
+                || startOffset > snapshot.stableEndOffset()) {
+            throw new OffsetOutOfRangeException(
+                    "Nereus Fetch offset " + startOffset + " is outside stable range ["
+                            + snapshot.logStartOffset() + ", "
+                            + snapshot.stableEndOffset() + "]");
+        }
+        long maxOffsetExclusive = switch (isolation) {
+            case LOG_END -> snapshot.stableEndOffset();
+            case HIGH_WATERMARK -> snapshot.highWatermark();
+            case TXN_COMMITTED -> snapshot.lastStableOffset();
+        };
+        if (maxLength <= 0 || startOffset >= maxOffsetExclusive) {
+            requireSamePublishedStorage(exactStorage);
+            return FetchDataInfo.empty(startOffset);
+        }
+
+        KafkaStorageReadRequest request = new KafkaStorageReadRequest(
+                startOffset,
+                maxOffsetExclusive,
+                Math.max(1, maxLength),
+                maxLength,
+                hardMaxFetchBytes,
+                minOneMessage,
+                0,
+                0,
+                fetchTimeout);
+        KafkaStorageReadResult result = awaitRead(exactStorage, request);
+        com.nereusstream.kafka.codec.KafkaFetchAssembly assembly = result.fetchAssembly();
+        requireSamePublishedStorage(exactStorage);
+        validateReadResult(snapshot, maxOffsetExclusive, maxLength, minOneMessage, result);
+        MemoryRecords records = MemoryRecords.readableRecords(assembly.recordsBuffer());
+        long actualFirstOffset = assembly.actualFirstBatchBaseOffset().orElse(startOffset);
+        int relativePosition = Math.toIntExact(assembly.relativeLogicalBytePosition());
+        LogOffsetMetadata fetchOffset = new LogOffsetMetadata(
+                actualFirstOffset,
+                assembly.virtualSegmentBaseOffset(),
+                relativePosition);
+        return new FetchDataInfo(fetchOffset, records, false, Optional.empty());
+    }
+
+    private void appendStable(long lastOffset, MemoryRecords records) {
+        AppendInvocation invocation = appendInvocation.get();
+        if (invocation == null) {
+            throw new KafkaStorageException("Nereus append reached LocalLog without exact request context");
+        }
+        KafkaPartitionStorage exactStorage;
+        long expectedStartOffset;
+        synchronized (nereusGuard) {
+            if (!nereusWritable(invocation.leaderEpoch)) {
+                throw new KafkaStorageException(
+                        "Nereus partition storage is no longer writable for the append");
+            }
+            exactStorage = storage;
+            expectedStartOffset = exactStorage.stableSnapshot().stableEndOffset();
+        }
+        KafkaAppendContext context = new KafkaAppendContext(
+                expectedStartOffset,
+                invocation.leaderEpoch,
+                invocation.requiredAcks,
+                appendTimeout,
+                Map.of(
+                        "topic", identity.observedTopicName(),
+                        "partition", Integer.toString(identity.partition())));
+        CompletableFuture<KafkaStableAppendResult> append;
+        try {
+            append = Objects.requireNonNull(
+                    exactStorage.append(records.buffer().duplicate(), context),
+                    "Nereus partition storage append future");
+        } catch (Throwable failure) {
+            throw NereusKafkaExceptionMapper.map(failure);
+        }
+
+        KafkaStableAppendResult result;
+        try {
+            result = append.get(appendTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            fenceUnknownAppend(exactStorage);
+            throw NereusKafkaExceptionMapper.map(new NereusException(
+                    ErrorCode.CANCELLED,
+                    true,
+                    "Nereus stable append wait was interrupted",
+                    failure,
+                    AppendOutcome.MAY_HAVE_COMMITTED));
+        } catch (TimeoutException failure) {
+            fenceUnknownAppend(exactStorage);
+            throw NereusKafkaExceptionMapper.map(new NereusException(
+                    ErrorCode.TIMEOUT,
+                    true,
+                    "Nereus stable append did not finish before the configured timeout",
+                    failure,
+                    AppendOutcome.MAY_HAVE_COMMITTED));
+        } catch (ExecutionException failure) {
+            throw NereusKafkaExceptionMapper.map(failure);
+        }
+        try {
+            validateAppendResult(exactStorage, context, records, lastOffset, result);
+        } catch (RuntimeException | Error failure) {
+            fenceUnknownAppend(exactStorage);
+            throw failure;
+        }
+        invocation.markStable(exactStorage);
+    }
+
+    private KafkaStorageReadResult awaitRead(
+            KafkaPartitionStorage exactStorage,
+            KafkaStorageReadRequest request
+    ) {
+        CompletableFuture<KafkaStorageReadResult> read;
+        try {
+            read = Objects.requireNonNull(
+                    exactStorage.read(request),
+                    "Nereus partition storage read future");
+        } catch (Throwable failure) {
+            throw NereusKafkaExceptionMapper.map(failure);
+        }
+        try {
+            return read.get(fetchTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw NereusKafkaExceptionMapper.map(new NereusException(
+                    ErrorCode.CANCELLED,
+                    true,
+                    "Nereus Fetch wait was interrupted",
+                    failure));
+        } catch (TimeoutException failure) {
+            throw NereusKafkaExceptionMapper.map(new NereusException(
+                    ErrorCode.TIMEOUT,
+                    true,
+                    "Nereus Fetch did not finish before the configured timeout",
+                    failure));
+        } catch (ExecutionException failure) {
+            throw NereusKafkaExceptionMapper.map(failure);
+        }
+    }
+
+    private static void validateAppendResult(
+            KafkaPartitionStorage exactStorage,
+            KafkaAppendContext context,
+            MemoryRecords records,
+            long lastOffset,
+            KafkaStableAppendResult result
+    ) {
+        Objects.requireNonNull(result, "result");
+        KafkaStableSnapshot snapshot = result.stableSnapshot();
+        boolean encodedMatches = result.requiredAcks() == context.requiredAcks()
+                && result.encodedAppend().range().startOffset() == context.expectedStartOffset()
+                && result.encodedAppend().range().endOffset() == lastOffset + 1
+                && result.encodedAppend().encodedBytes() == records.sizeInBytes();
+        boolean storageMatches = snapshot.stableEndOffset() == lastOffset + 1
+                && snapshot.equals(exactStorage.stableSnapshot())
+                && exactStorage.state() == KafkaPartitionState.LEADER_WRITABLE;
+        if (!encodedMatches || !storageMatches) {
+            throw NereusKafkaExceptionMapper.map(invariant(
+                    "Nereus stable append result does not match the stock validated append"));
+        }
+    }
+
+    private static void validateReadResult(
+            KafkaStableSnapshot requestedSnapshot,
+            long maxOffsetExclusive,
+            int maxLength,
+            boolean minOneMessage,
+            KafkaStorageReadResult result
+    ) {
+        Objects.requireNonNull(result, "result");
+        com.nereusstream.kafka.codec.KafkaFetchAssembly assembly = result.fetchAssembly();
+        KafkaStableSnapshot resultSnapshot = result.stableSnapshot();
+        boolean snapshotMatches = resultSnapshot.logStartOffset() == requestedSnapshot.logStartOffset()
+                && resultSnapshot.stableEndOffset() >= requestedSnapshot.stableEndOffset();
+        boolean boundsMatch = assembly.nextLogicalOffset() <= maxOffsetExclusive
+                && assembly.sourceCoverageEndOffset() <= maxOffsetExclusive
+                && assembly.abortedTransactions().isEmpty();
+        boolean overflowMatches = !assembly.firstEntryOverflow()
+                ? assembly.sizeInBytes() <= maxLength
+                : minOneMessage;
+        if (!snapshotMatches || !boundsMatch || !overflowMatches) {
+            throw NereusKafkaExceptionMapper.map(invariant(
+                    "Nereus Fetch result violates the exact stock read bounds"));
+        }
+    }
+
+    private static void fenceUnknownAppend(KafkaPartitionStorage exactStorage) {
+        try {
+            exactStorage.resign();
+        } catch (Throwable ignored) {
+            // The protocol response is already fenced by the unknown append outcome.
+        }
     }
 
     private void requirePublished(int leaderEpoch) {
@@ -235,6 +509,17 @@ public final class NereusUnifiedLog extends UnifiedLog {
                 throw new KafkaStorageException(
                         "Nereus partition storage is not writable for leader epoch "
                                 + leaderEpoch);
+            }
+        }
+    }
+
+    private void requireSamePublishedStorage(KafkaPartitionStorage exactStorage) {
+        synchronized (nereusGuard) {
+            if (storage != exactStorage
+                    || recoveredState == null
+                    || exactStorage.state() != KafkaPartitionState.LEADER_WRITABLE) {
+                throw new KafkaStorageException(
+                        "Nereus partition storage changed while serving Fetch");
             }
         }
     }
@@ -314,10 +599,12 @@ public final class NereusUnifiedLog extends UnifiedLog {
         return new Parts(localLog, leaderEpochCache, producerStateManager);
     }
 
-    private static KafkaStorageException dataPlanePending(String operation) {
-        return new KafkaStorageException(
-                "Nereus native " + operation
-                        + " data plane is not installed in this implementation slice");
+    private static Duration positive(Duration value, String name) {
+        Objects.requireNonNull(value, name);
+        if (value.isZero() || value.isNegative() || value.toMillis() <= 0) {
+            throw new IllegalArgumentException(name + " must be positive and millisecond-representable");
+        }
+        return value;
     }
 
     private static NereusException fenced(String message) {
@@ -331,9 +618,28 @@ public final class NereusUnifiedLog extends UnifiedLog {
                 message);
     }
 
+    private static NereusException unsupported(String message) {
+        return new NereusException(ErrorCode.UNSUPPORTED_FORMAT, false, message);
+    }
+
     private record Parts(
             NereusLocalLog localLog,
             org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache leaderEpochCache,
             ProducerStateManager producerStateManager
     ) { }
+
+    private static final class AppendInvocation {
+        private final int leaderEpoch;
+        private final short requiredAcks;
+        private KafkaPartitionStorage committedStorage;
+
+        private AppendInvocation(int leaderEpoch, short requiredAcks) {
+            this.leaderEpoch = leaderEpoch;
+            this.requiredAcks = requiredAcks;
+        }
+
+        private void markStable(KafkaPartitionStorage exactStorage) {
+            committedStorage = exactStorage;
+        }
+    }
 }

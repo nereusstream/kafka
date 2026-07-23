@@ -17,6 +17,7 @@
 package kafka.log.nereus;
 
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.util.Scheduler;
 import org.apache.kafka.storage.internals.log.LocalLog;
@@ -26,12 +27,16 @@ import org.apache.kafka.storage.internals.log.LogOffsetMetadata;
 import org.apache.kafka.storage.internals.log.LogSegments;
 
 import java.io.File;
+import java.io.IOException;
+import java.util.Objects;
 
 /**
  * Ephemeral local shell used only to satisfy stock UnifiedLog state machinery. Its segment files are cache artifacts,
  * never partition truth. Durable append/read overrides are owned by {@link NereusUnifiedLog}.
  */
 public final class NereusLocalLog extends LocalLog {
+    private StableAppend stableAppend;
+
     NereusLocalLog(
             File dir,
             LogConfig config,
@@ -53,5 +58,28 @@ public final class NereusLocalLog extends LocalLog {
                 time,
                 topicPartition,
                 logDirFailureChannel);
+    }
+
+    void bindStableAppend(StableAppend exact) {
+        Objects.requireNonNull(exact, "exact");
+        if (stableAppend != null) {
+            throw new IllegalStateException("Nereus LocalLog stable append is already bound");
+        }
+        stableAppend = exact;
+    }
+
+    @Override
+    public void append(long lastOffset, MemoryRecords records) throws IOException {
+        StableAppend exact = stableAppend;
+        if (exact == null) {
+            throw new IOException("Nereus LocalLog stable append is not bound");
+        }
+        exact.append(lastOffset, records);
+        updateLogEndOffset(lastOffset + 1);
+    }
+
+    @FunctionalInterface
+    interface StableAppend {
+        void append(long lastOffset, MemoryRecords records);
     }
 }

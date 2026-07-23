@@ -41,7 +41,7 @@ import org.apache.kafka.metadata.{LeaderAndIsr, LeaderRecoveryState, MetadataCac
 import org.apache.kafka.server.common.{RequestLocal, TransactionVersion}
 import org.apache.kafka.server.log.remote.TopicPartitionLog
 import org.apache.kafka.server.log.remote.storage.RemoteLogManager
-import org.apache.kafka.storage.internals.log.{AppendOrigin, AsyncOffsetReader, FetchDataInfo, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LeaderHwChange, LogAppendInfo, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogReadInfo, LogStartOffsetIncrementReason, OffsetResultHolder, UnifiedLog, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, AsyncOffsetReader, FetchDataInfo, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LeaderHwChange, LogAppendInfo, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogReadInfo, LogStartOffsetIncrementReason, OffsetResultHolder, RequiredAcksAwareAppend, UnifiedLog, VerificationGuard}
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 import org.apache.kafka.server.partition.{AlterPartitionListener, AssignmentState, CommittedPartitionState, OngoingReassignmentState, PartitionListener, PartitionState, PendingExpandIsr, PendingPartitionChange, PendingShrinkIsr, SimpleAssignmentState}
 import org.apache.kafka.server.purgatory.{DelayedDeleteRecords, DelayedOperationPurgatory, TopicPartitionOperationKey}
@@ -1256,7 +1256,31 @@ class Partition(val topicPartition: TopicPartition,
               s"live replica(s) broker.id are : $inSyncReplicaIds")
           }
 
-          val info = leaderLog.appendAsLeader(records, this.leaderEpoch, origin, requestLocal, verificationGuard, transactionVersion)
+          // Nereus inject start: preserve required-acks across the authoritative append seam
+          val info = leaderLog match {
+            case requiredAcksAware: RequiredAcksAwareAppend =>
+              if (requiredAcks != -1 && requiredAcks != 0 && requiredAcks != 1) {
+                throw new InvalidRequiredAcksException(
+                  s"Invalid required acks $requiredAcks for authoritative append to $topicPartition")
+              }
+              requiredAcksAware.appendAsLeader(
+                records,
+                this.leaderEpoch,
+                origin,
+                requestLocal,
+                verificationGuard,
+                transactionVersion,
+                requiredAcks.toShort)
+            case _ =>
+              leaderLog.appendAsLeader(
+                records,
+                this.leaderEpoch,
+                origin,
+                requestLocal,
+                verificationGuard,
+                transactionVersion)
+          }
+          // Nereus inject end: preserve required-acks across the authoritative append seam
 
           // we may need to increment high watermark since ISR could be down to 1
           (info, maybeIncrementLeaderHW(leaderLog))

@@ -21,7 +21,7 @@ import com.yammer.metrics.core.Metric
 import kafka.log.LogManager
 import kafka.server._
 import kafka.utils._
-import org.apache.kafka.common.errors.{ApiException, FencedLeaderEpochException, InconsistentTopicIdException, InvalidTxnStateException, NotLeaderOrFollowerException, OffsetNotAvailableException, OffsetOutOfRangeException, PolicyViolationException, UnknownLeaderEpochException}
+import org.apache.kafka.common.errors.{ApiException, FencedLeaderEpochException, InconsistentTopicIdException, InvalidRequiredAcksException, InvalidTxnStateException, NotLeaderOrFollowerException, OffsetNotAvailableException, OffsetOutOfRangeException, PolicyViolationException, UnknownLeaderEpochException}
 import org.apache.kafka.common.message.{AlterPartitionResponseData, FetchResponseData}
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.record.FileRecords.TimestampAndOffset
@@ -52,7 +52,7 @@ import org.apache.kafka.common.replica.ClientMetadata
 import org.apache.kafka.common.replica.ClientMetadata.DefaultClientMetadata
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, SecurityProtocol}
 import org.apache.kafka.coordinator.transaction.TransactionLogConfig
-import org.apache.kafka.server.common.{ControllerRequestCompletionHandler, NodeToControllerChannelManager, RequestLocal}
+import org.apache.kafka.server.common.{ControllerRequestCompletionHandler, NodeToControllerChannelManager, RequestLocal, TransactionVersion}
 import org.apache.kafka.server.metrics.KafkaYammerMetrics
 import org.apache.kafka.server.partition.{AlterPartitionListener, OngoingReassignmentState, PartitionListener, PendingShrinkIsr, SimpleAssignmentState}
 import org.apache.kafka.server.purgatory.{DelayedDeleteRecords, DelayedOperationPurgatory, TopicPartitionOperationKey}
@@ -61,7 +61,7 @@ import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, Unexpec
 import org.apache.kafka.server.util.{KafkaScheduler, MockTime}
 import org.apache.kafka.storage.internals.checkpoint.OffsetCheckpoints
 import org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache
-import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, EpochEntry, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LocalLog, LogAppendInfo, LogConfig, LogDirFailureChannel, LogLoader, LogOffsetMetadata, LogOffsetsListener, LogReadInfo, LogSegments, LogStartOffsetIncrementReason, OffsetResultHolder, ProducerStateManager, ProducerStateManagerConfig, UnifiedLog, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, EpochEntry, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LocalLog, LogAppendInfo, LogConfig, LogDirFailureChannel, LogLoader, LogOffsetMetadata, LogOffsetsListener, LogReadInfo, LogSegments, LogStartOffsetIncrementReason, OffsetResultHolder, ProducerStateManager, ProducerStateManagerConfig, RequiredAcksAwareAppend, UnifiedLog, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
@@ -926,6 +926,63 @@ class PartitionTest extends AbstractPartitionTest {
       1000L, None, Optional.of(leaderEpoch + 1), fetchOnlyFromLeader = true, None, completionWakeup)
 
     verifyNoInteractions(lookup)
+  }
+
+  @Test
+  def testAuthoritativeAppendPreservesRequiredAcks(): Unit = {
+    val leaderEpoch = 5
+    val partition = setupPartitionWithMocks(leaderEpoch, isLeader = true)
+    val stockConfig = partition.localLogOrException.config
+    val authoritativeLog = mock(
+      classOf[UnifiedLog],
+      withSettings().extraInterfaces(classOf[RequiredAcksAwareAppend])
+    )
+    val requiredAcksAware = authoritativeLog.asInstanceOf[RequiredAcksAwareAppend]
+    val appendInfo = LogAppendInfo.UNKNOWN_LOG_APPEND_INFO
+    when(authoritativeLog.config).thenReturn(stockConfig)
+    when(authoritativeLog.logEndOffsetMetadata).thenReturn(new LogOffsetMetadata(0L))
+    when(authoritativeLog.maybeIncrementHighWatermark(any(classOf[LogOffsetMetadata])))
+      .thenReturn(Optional.empty())
+    when(requiredAcksAware.appendAsLeader(
+      any(classOf[MemoryRecords]),
+      anyInt(),
+      any(classOf[AppendOrigin]),
+      any(classOf[RequestLocal]),
+      any(classOf[VerificationGuard]),
+      ArgumentMatchers.anyShort(),
+      ArgumentMatchers.anyShort()
+    )).thenReturn(appendInfo)
+    partition.setLog(authoritativeLog, isFutureLog = false)
+
+    val records = TestUtils.singletonRecords("required-acks".getBytes)
+    val requestLocal = RequestLocal.noCaching
+    val result = partition.appendRecordsToLeader(
+      records,
+      AppendOrigin.CLIENT,
+      requiredAcks = -1,
+      requestLocal
+    )
+    assertEquals(appendInfo.firstOffset(), result.firstOffset())
+    assertEquals(appendInfo.lastOffset(), result.lastOffset())
+    verify(requiredAcksAware).appendAsLeader(
+      ArgumentMatchers.same(records),
+      ArgumentMatchers.eq(leaderEpoch),
+      ArgumentMatchers.eq(AppendOrigin.CLIENT),
+      ArgumentMatchers.same(requestLocal),
+      ArgumentMatchers.same(VerificationGuard.SENTINEL),
+      ArgumentMatchers.eq(TransactionVersion.TV_UNKNOWN),
+      ArgumentMatchers.eq((-1).toShort)
+    )
+
+    assertThrows(
+      classOf[InvalidRequiredAcksException],
+      () => partition.appendRecordsToLeader(
+        records,
+        AppendOrigin.CLIENT,
+        requiredAcks = 2,
+        requestLocal
+      )
+    )
   }
 
   /**

@@ -17,32 +17,40 @@
 
 package kafka.log.nereus
 
-import com.nereusstream.api.{AppendAuthority, Checksum, ChecksumType}
+import com.nereusstream.api.{AppendAuthority, AppendResult, Checksum, ChecksumType}
 import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState
-import com.nereusstream.kafka.partition.{KafkaPartitionState, KafkaPartitionStorage, KafkaStableSnapshot}
+import com.nereusstream.kafka.codec.{KafkaAppendBatchEncoder, KafkaFetchAssembly, KafkaRecordBatchCodec}
+import com.nereusstream.kafka.partition.{KafkaAppendContext, KafkaPartitionState, KafkaPartitionStorage, KafkaStableAppendResult, KafkaStableSnapshot, KafkaStorageReadRequest, KafkaStorageReadResult}
 import kafka.log.LogManager
 import kafka.server.KafkaConfig
 import kafka.server.storage.BrokerStorageRuntimeContext
 import kafka.utils.TestUtils
 
 import org.apache.kafka.common.{TopicPartition, Uuid}
-import org.apache.kafka.common.errors.KafkaStorageException
+import org.apache.kafka.common.compress.Compression
+import org.apache.kafka.common.errors.{KafkaStorageException, UnsupportedForMessageFormatException}
 import org.apache.kafka.common.metrics.Metrics
+import org.apache.kafka.common.record.{CompressionType, MemoryRecords, SimpleRecord}
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.coordinator.group.GroupCoordinatorConfig
 import org.apache.kafka.coordinator.share.ShareCoordinatorConfig
 import org.apache.kafka.coordinator.transaction.TransactionLogConfig
 import org.apache.kafka.metadata.{KRaftMetadataCache, MockConfigRepository}
 import org.apache.kafka.server.config.{NereusKafkaConfigs, ReplicationConfigs, ServerLogConfigs}
+import org.apache.kafka.server.common.{RequestLocal, TransactionVersion}
 import org.apache.kafka.server.util.{KafkaScheduler, MockTime}
-import org.apache.kafka.storage.internals.log.{CleanerConfig, LogDirFailureChannel}
+import org.apache.kafka.server.storage.log.FetchIsolation
+import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, LogDirFailureChannel, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
-import org.mockito.Mockito.{mock, when}
+import org.mockito.ArgumentMatchers.any
+import org.mockito.Mockito.{mock, verify, when}
 
+import java.nio.ByteBuffer
 import java.nio.file.Files
-import java.util.{Optional, Properties}
+import java.util.concurrent.{CompletableFuture, atomic}
+import java.util.{Optional, OptionalLong, Properties}
 
 class NereusUnifiedLogFactoryTest {
   @Test
@@ -97,16 +105,99 @@ class NereusUnifiedLogFactoryTest {
       assertFalse(nereusLog.nereusWritable(7))
 
       val storage = mock(classOf[KafkaPartitionStorage])
+      val snapshot = new atomic.AtomicReference(KafkaStableSnapshot.nonTransactional(0, 0, 1))
+      val stableBytes = new atomic.AtomicReference(Array.emptyByteArray)
+      val appendAcks = new atomic.AtomicReference[Short]()
+      val corruptNextStableResult = new atomic.AtomicBoolean()
       when(storage.identity()).thenReturn(nereusLog.nereusIdentity())
       when(storage.leaderEpoch()).thenReturn(7)
       when(storage.state()).thenReturn(KafkaPartitionState.LEADER_WRITABLE)
-      when(storage.stableSnapshot()).thenReturn(KafkaStableSnapshot.nonTransactional(0, 0, 1))
+      when(storage.stableSnapshot()).thenAnswer(_ => snapshot.get())
+      when(storage.resign()).thenReturn(CompletableFuture.completedFuture(null))
+      when(storage.append(any(classOf[ByteBuffer]), any(classOf[KafkaAppendContext]))).thenAnswer(invocation => {
+        val records = invocation.getArgument[ByteBuffer](0)
+        val context = invocation.getArgument[KafkaAppendContext](1)
+        val encoded = new KafkaAppendBatchEncoder(new KafkaRecordBatchCodec)
+          .encode(records, context.expectedStartOffset())
+        val owned = new Array[Byte](records.remaining())
+        records.duplicate().get(owned)
+        stableBytes.set(owned)
+        appendAcks.set(context.requiredAcks())
+        val next = KafkaStableSnapshot.nonTransactional(
+          snapshot.get().logStartOffset(),
+          encoded.range().endOffset(),
+          snapshot.get().commitVersion() + 1)
+        snapshot.set(next)
+        val appendResult = mock(classOf[AppendResult])
+        when(appendResult.committedEndOffset()).thenReturn(encoded.range().endOffset())
+        val returnedAcks =
+          if (corruptNextStableResult.compareAndSet(true, false)) (context.requiredAcks() + 1).toShort
+          else context.requiredAcks()
+        CompletableFuture.completedFuture(
+          new KafkaStableAppendResult(appendResult, encoded, next, returnedAcks))
+      })
+      when(storage.read(any(classOf[KafkaStorageReadRequest]))).thenAnswer(invocation => {
+        val request = invocation.getArgument[KafkaStorageReadRequest](0)
+        val bytes = stableBytes.get()
+        val assembly = mock(classOf[KafkaFetchAssembly])
+        when(assembly.recordsBuffer()).thenReturn(ByteBuffer.wrap(bytes).asReadOnlyBuffer())
+        when(assembly.sizeInBytes()).thenReturn(bytes.length)
+        when(assembly.actualFirstBatchBaseOffset()).thenReturn(OptionalLong.of(request.startOffset()))
+        when(assembly.nextLogicalOffset()).thenReturn(snapshot.get().stableEndOffset())
+        when(assembly.sourceCoverageEndOffset()).thenReturn(snapshot.get().stableEndOffset())
+        when(assembly.firstEntryOverflow()).thenReturn(false)
+        when(assembly.virtualSegmentBaseOffset()).thenReturn(0L)
+        when(assembly.relativeLogicalBytePosition()).thenReturn(0L)
+        when(assembly.abortedTransactions()).thenReturn(java.util.List.of())
+        CompletableFuture.completedFuture(new KafkaStorageReadResult(assembly, snapshot.get()))
+      })
       nereusLog.installStorage(7, storage)
       assertTrue(nereusLog.nereusWritable(7))
+      val appendInfo = nereusLog.appendAsLeader(
+        TestUtils.singletonRecords("stable-data".getBytes),
+        7,
+        AppendOrigin.CLIENT,
+        RequestLocal.noCaching,
+        VerificationGuard.SENTINEL,
+        TransactionVersion.TV_UNKNOWN,
+        -1)
+      assertEquals(0L, appendInfo.firstOffset())
+      assertEquals(0L, appendInfo.lastOffset())
+      assertEquals((-1).toShort, appendAcks.get())
+      assertEquals(1L, nereusLog.logEndOffset)
+      assertEquals(0L, nereusLog.size)
+
+      val idempotent = MemoryRecords.withIdempotentRecords(
+        0,
+        Compression.of(CompressionType.NONE).build(),
+        7,
+        1.toShort,
+        0,
+        7,
+        new SimpleRecord(1000, "unsupported".getBytes))
+      assertThrows(classOf[UnsupportedForMessageFormatException], () =>
+        nereusLog.appendAsLeader(idempotent, 7))
+      assertEquals(1L, nereusLog.logEndOffset)
+
+      val fetched = nereusLog.read(0, 1024, FetchIsolation.LOG_END, false)
+      assertEquals(stableBytes.get().length, fetched.records.sizeInBytes)
+      val fetchedBatches = fetched.records.asInstanceOf[MemoryRecords].batches().iterator()
+      assertTrue(fetchedBatches.hasNext)
+      val fetchedBatch = fetchedBatches.next()
+      assertEquals(0L, fetchedBatch.baseOffset())
+      assertEquals(7, fetchedBatch.partitionLeaderEpoch())
+      assertFalse(fetchedBatches.hasNext)
+
+      corruptNextStableResult.set(true)
       assertThrows(classOf[KafkaStorageException], () =>
-        nereusLog.appendAsLeader(TestUtils.singletonRecords("data-plane-pending".getBytes), 7))
+        nereusLog.appendAsLeader(TestUtils.singletonRecords("invalid-stable-result".getBytes), 7))
+      assertEquals(1L, nereusLog.logEndOffset)
+      verify(storage).resign()
+
       nereusLog.removeStorage(7, storage)
       assertFalse(nereusLog.nereusWritable(7))
+      assertThrows(classOf[KafkaStorageException], () =>
+        nereusLog.read(0, 1024, FetchIsolation.LOG_END, false))
 
       assertThrows(classOf[com.nereusstream.api.NereusException], () =>
         logManager.getOrCreateLog(

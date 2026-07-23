@@ -85,6 +85,9 @@ final class NereusUnifiedLogFactory(context: BrokerStorageRuntimeContext) extend
       openContext.logDirFailureChannel,
       topicId,
       identity,
+      context.config.nereusKafkaStorageConfig.append().timeout(),
+      context.config.nereusKafkaStorageConfig.fetch().timeout(),
+      Math.toIntExact(context.config.nereusKafkaStorageConfig.fetch().maxResponseBytes()),
       openContext.logOffsetsListener)
   }
 
