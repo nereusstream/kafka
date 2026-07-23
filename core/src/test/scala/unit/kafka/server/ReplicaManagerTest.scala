@@ -4215,6 +4215,55 @@ class ReplicaManagerTest {
     delta
   }
 
+  @Test
+  def testApplyDeltaPreparesOnlyNewLeaderAfterPartitionStatePublication(): Unit = {
+    val localId = 0
+    val topicPartition = new TopicPartition("prepare-leader", 0)
+    val topicId = Uuid.randomUuid()
+    val replicaManager = setupReplicaManagerWithMockedPurgatories(new MockTimer(time), localId)
+    val prepared = mutable.ArrayBuffer.empty[(Partition, Uuid, Int)]
+    try {
+      val leaderDelta = createLeaderDelta(
+        topicId,
+        topicPartition,
+        localId,
+        util.Arrays.asList(localId, localId + 1),
+        util.Arrays.asList(localId, localId + 1),
+        leaderEpoch = 5)
+      val leaderImage = imageFromTopics(leaderDelta.apply())
+
+      replicaManager.applyDelta(
+        leaderDelta,
+        leaderImage,
+        (partition, publishedTopicId, leaderEpoch) => {
+          assertTrue(partition.isLeader)
+          assertEquals(leaderEpoch, partition.getLeaderEpoch)
+          prepared += ((partition, publishedTopicId, leaderEpoch))
+        })
+
+      assertEquals(1, prepared.size)
+      assertEquals(topicId, prepared.head._2)
+      assertEquals(5, prepared.head._3)
+      assertSame(replicaManager.getPartitionOrException(topicPartition), prepared.head._1)
+
+      val isrDelta = new TopicsDelta(leaderImage.topics())
+      isrDelta.replay(new PartitionChangeRecord()
+        .setTopicId(topicId)
+        .setPartitionId(topicPartition.partition())
+        .setReplicas(util.Arrays.asList(localId, localId + 1))
+        .setIsr(util.Arrays.asList(localId)))
+      replicaManager.applyDelta(
+        isrDelta,
+        imageFromTopics(isrDelta.apply()),
+        (partition, publishedTopicId, leaderEpoch) =>
+          prepared += ((partition, publishedTopicId, leaderEpoch)))
+
+      assertEquals(1, prepared.size)
+    } finally {
+      replicaManager.shutdown(checkpointHW = false)
+    }
+  }
+
   private def createFollowerDelta(
     topicId: Uuid,
     partition: TopicPartition,

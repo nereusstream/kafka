@@ -59,19 +59,20 @@ class NereusListOffsetsLifecycleTest {
     assertSame(opened, duplicate)
     assertFalse(opened.isDone)
     assertFalse(opened.cancel(false))
-    assertEquals(Seq("manager-open-5"), events.toSeq)
+    assertEquals(Seq("partition-begin-5", "manager-open-5"), events.toSeq)
 
     val storage = storageFor(request)
     manager.completeOpen(5, storage)
 
     assertSame(storage, opened.join())
     assertEquals(1, lifecycle.installedPartitions)
-    assertEquals(Seq("manager-open-5", "partition-install-5"), events.toSeq)
+    assertEquals(Seq("partition-begin-5", "manager-open-5", "partition-install-5"), events.toSeq)
 
     lifecycle.resign(partition, request.identity(), 5, timeout).join()
 
     assertEquals(0, lifecycle.installedPartitions)
     assertEquals(Seq(
+      "partition-begin-5",
       "manager-open-5",
       "partition-install-5",
       "partition-remove-5",
@@ -100,7 +101,10 @@ class NereusListOffsetsLifecycleTest {
     assertTrue(newOpen.isDone)
     assertEquals(1, lifecycle.installedPartitions)
     assertEquals(Seq(
+      "partition-begin-5",
       "manager-open-5",
+      "partition-begin-6",
+      "partition-cancel-5",
       "manager-open-6",
       "manager-resign-5",
       "partition-install-6"), events.toSeq)
@@ -122,7 +126,11 @@ class NereusListOffsetsLifecycleTest {
 
     assertThrows(classOf[CompletionException], () => opened.join())
     assertEquals(0, lifecycle.installedPartitions)
-    assertEquals(Seq("manager-open-5", "manager-resign-5"), events.toSeq)
+    assertEquals(Seq(
+      "partition-begin-5",
+      "manager-open-5",
+      "partition-cancel-5",
+      "manager-resign-5"), events.toSeq)
   }
 
   @Test
@@ -153,7 +161,11 @@ class NereusListOffsetsLifecycleTest {
     manager.completeOpen(5, invalid)
 
     assertFailureCode(opened, ErrorCode.METADATA_INVARIANT_VIOLATION)
-    assertEquals(Seq("manager-open-5", "manager-resign-5"), events.toSeq)
+    assertEquals(Seq(
+      "partition-begin-5",
+      "manager-open-5",
+      "partition-cancel-5",
+      "manager-resign-5"), events.toSeq)
   }
 
   @Test
@@ -175,6 +187,7 @@ class NereusListOffsetsLifecycleTest {
     lifecycle.resign(partition, request.identity(), 6, timeout).join()
     assertEquals(0, lifecycle.installedPartitions)
     assertEquals(Seq(
+      "partition-begin-6",
       "manager-open-6",
       "partition-install-6",
       "manager-resign-5",
@@ -225,6 +238,10 @@ class NereusListOffsetsLifecycleTest {
     when(partition.isLeader).thenReturn(true)
     when(partition.getLeaderEpoch).thenAnswer(_ => leaderEpoch.get())
     doAnswer(invocation => {
+      events += s"partition-begin-${invocation.getArgument[Int](0)}"
+      null
+    }).when(partition).beginLeaderEpochAwareOffsetLookup(anyInt())
+    doAnswer(invocation => {
       events += s"partition-install-${invocation.getArgument[Int](0)}"
       null
     }).when(partition).installLeaderEpochAwareOffsetLookup(
@@ -234,6 +251,10 @@ class NereusListOffsetsLifecycleTest {
       null
     }).when(partition).removeLeaderEpochAwareOffsetLookup(
       anyInt(), any(classOf[LeaderEpochAwareOffsetLookup]))
+    doAnswer(invocation => {
+      events += s"partition-cancel-${invocation.getArgument[Int](0)}"
+      null
+    }).when(partition).cancelLeaderEpochAwareOffsetLookup(anyInt())
     partition
   }
 

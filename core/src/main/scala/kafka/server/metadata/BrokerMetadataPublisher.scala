@@ -23,6 +23,7 @@ import kafka.log.LogManager
 import kafka.server.share.SharePartitionManager
 import kafka.server.{KafkaConfig, ReplicaManager}
 import kafka.utils.Logging
+import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.TimeoutException
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.group.GroupCoordinator
@@ -30,7 +31,7 @@ import org.apache.kafka.coordinator.share.ShareCoordinator
 import org.apache.kafka.coordinator.transaction.TransactionLogConfig
 import org.apache.kafka.image.loader.LoaderManifest
 import org.apache.kafka.image.publisher.MetadataPublisher
-import org.apache.kafka.image.{MetadataDelta, MetadataImage, TopicDelta}
+import org.apache.kafka.image.{MetadataDelta, MetadataImage, TopicDelta, TopicsDelta}
 import org.apache.kafka.metadata.KRaftMetadataCache
 import org.apache.kafka.metadata.publisher.{AclPublisher, DelegationTokenPublisher, DynamicClientQuotaPublisher, ScramPublisher}
 import org.apache.kafka.server.common.MetadataVersion.MINIMUM_VERSION
@@ -81,7 +82,10 @@ class BrokerMetadataPublisher(
   delegationTokenPublisher: DelegationTokenPublisher,
   aclPublisher: AclPublisher,
   fatalFaultHandler: FaultHandler,
-  metadataPublishingFaultHandler: FaultHandler
+  metadataPublishingFaultHandler: FaultHandler,
+  // Nereus inject start: optional post-ReplicaManager asynchronous partition lifecycle
+  asyncTopicDeltaLifecycle: Option[AsyncTopicDeltaLifecycle] = None
+  // Nereus inject end: optional post-ReplicaManager asynchronous partition lifecycle
 ) extends MetadataPublisher with Logging {
   logIdent = s"[BrokerMetadataPublisher id=${config.nodeId}] "
 
@@ -143,57 +147,63 @@ class BrokerMetadataPublisher(
 
       // Apply topic deltas.
       Option(delta.topicsDelta()).foreach { topicsDelta =>
-        try {
-          // Notify the replica manager about changes to topics.
-          replicaManager.applyDelta(topicsDelta, newImage)
-        } catch {
-          case t: Throwable => metadataPublishingFaultHandler.handleFault("Error applying topics " +
-            s"delta in $deltaName", t)
+        // Nereus inject start: delay coordinator election until asynchronous storage recovery is ready
+        asyncTopicDeltaLifecycle match {
+          case Some(lifecycle) => handleTopicsDeltaAsync(deltaName, topicsDelta, newImage, lifecycle)
+          case None =>
+            try {
+              // Notify the replica manager about changes to topics.
+              replicaManager.applyDelta(topicsDelta, newImage)
+            } catch {
+              case t: Throwable => metadataPublishingFaultHandler.handleFault("Error applying topics " +
+                s"delta in $deltaName", t)
+            }
+            try {
+              // Update the group coordinator of local changes
+              updateCoordinator(newImage,
+                delta,
+                Topic.GROUP_METADATA_TOPIC_NAME,
+                groupCoordinator.onElection,
+                (partitionIndex, leaderEpochOpt) => groupCoordinator.onResignation(partitionIndex, toOptionalInt(leaderEpochOpt))
+              )
+            } catch {
+              case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating group " +
+                s"coordinator with local changes in $deltaName", t)
+            }
+            try {
+              // Update the transaction coordinator of local changes
+              updateCoordinator(newImage,
+                delta,
+                Topic.TRANSACTION_STATE_TOPIC_NAME,
+                txnCoordinator.onElection,
+                txnCoordinator.onResignation)
+            } catch {
+              case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating txn " +
+                s"coordinator with local changes in $deltaName", t)
+            }
+            try {
+              updateCoordinator(newImage,
+                delta,
+                Topic.SHARE_GROUP_STATE_TOPIC_NAME,
+                shareCoordinator.onElection,
+                (partitionIndex, leaderEpochOpt) => shareCoordinator.onResignation(partitionIndex, toOptionalInt(leaderEpochOpt))
+              )
+            } catch {
+              case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating share " +
+                s"coordinator with local changes in $deltaName", t)
+            }
+            try {
+              // Notify the share coordinator about deleted topics.
+              val deletedTopicIds = topicsDelta.deletedTopicIds()
+              if (!deletedTopicIds.isEmpty) {
+                shareCoordinator.onTopicsDeleted(topicsDelta.deletedTopicIds, RequestLocal.noCaching.bufferSupplier)
+              }
+            } catch {
+              case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating share " +
+                s"coordinator with deleted partitions in $deltaName", t)
+            }
         }
-        try {
-          // Update the group coordinator of local changes
-          updateCoordinator(newImage,
-            delta,
-            Topic.GROUP_METADATA_TOPIC_NAME,
-            groupCoordinator.onElection,
-            (partitionIndex, leaderEpochOpt) => groupCoordinator.onResignation(partitionIndex, toOptionalInt(leaderEpochOpt))
-          )
-        } catch {
-          case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating group " +
-            s"coordinator with local changes in $deltaName", t)
-        }
-        try {
-          // Update the transaction coordinator of local changes
-          updateCoordinator(newImage,
-            delta,
-            Topic.TRANSACTION_STATE_TOPIC_NAME,
-            txnCoordinator.onElection,
-            txnCoordinator.onResignation)
-        } catch {
-          case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating txn " +
-            s"coordinator with local changes in $deltaName", t)
-        }
-        try {
-          updateCoordinator(newImage,
-            delta,
-            Topic.SHARE_GROUP_STATE_TOPIC_NAME,
-            shareCoordinator.onElection,
-            (partitionIndex, leaderEpochOpt) => shareCoordinator.onResignation(partitionIndex, toOptionalInt(leaderEpochOpt))
-          )
-        } catch {
-          case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating share " +
-            s"coordinator with local changes in $deltaName", t)
-        }
-        try {
-          // Notify the share coordinator about deleted topics.
-          val deletedTopicIds = topicsDelta.deletedTopicIds()
-          if (!deletedTopicIds.isEmpty) {
-            shareCoordinator.onTopicsDeleted(topicsDelta.deletedTopicIds, RequestLocal.noCaching.bufferSupplier)
-          }
-        } catch {
-          case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating share " +
-            s"coordinator with deleted partitions in $deltaName", t)
-        }
+        // Nereus inject end: delay coordinator election until asynchronous storage recovery is ready
       }
 
       // Apply configuration deltas.
@@ -266,6 +276,110 @@ class BrokerMetadataPublisher(
       case None => OptionalInt.empty
     }
   }
+
+  // Nereus inject start: asynchronous storage lifecycle callback ordering
+  private def handleTopicsDeltaAsync(
+    deltaName: String,
+    topicsDelta: TopicsDelta,
+    newImage: MetadataImage,
+    lifecycle: AsyncTopicDeltaLifecycle
+  ): Unit = {
+    try {
+      replicaManager.applyDelta(
+        topicsDelta,
+        newImage,
+        (partition, topicId, leaderEpoch) =>
+          lifecycle.onLeaderStatePublished(partition, topicId, leaderEpoch))
+    } catch {
+      case t: Throwable =>
+        metadataPublishingFaultHandler.handleFault(s"Error applying topics delta in $deltaName", t)
+        return
+    }
+
+    val operation = try {
+      lifecycle.applyAfterReplicaManager(
+        topicsDelta,
+        newImage,
+        (topicPartition, leaderEpoch) => onAsyncLeaderReady(deltaName, topicPartition, leaderEpoch),
+        (topicPartition, leaderEpoch) => onAsyncResigned(deltaName, topicPartition, leaderEpoch))
+    } catch {
+      case t: Throwable => CompletableFuture.failedFuture[Void](t)
+    }
+    if (operation == null) {
+      metadataPublishingFaultHandler.handleFault(
+        s"Error applying asynchronous topics lifecycle in $deltaName",
+        new NullPointerException("Async topic-delta lifecycle returned a null future"))
+      return
+    }
+    operation.whenComplete((_, failure) => {
+      if (failure != null) {
+        metadataPublishingFaultHandler.handleFault(
+          s"Error applying asynchronous topics lifecycle in $deltaName",
+          failure)
+      }
+      notifyShareCoordinatorOfDeletedTopics(deltaName, topicsDelta)
+    })
+  }
+
+  private def onAsyncLeaderReady(
+    deltaName: String,
+    topicPartition: TopicPartition,
+    leaderEpoch: Int
+  ): Unit = {
+    try {
+      topicPartition.topic() match {
+        case Topic.GROUP_METADATA_TOPIC_NAME =>
+          groupCoordinator.onElection(topicPartition.partition(), leaderEpoch)
+        case Topic.TRANSACTION_STATE_TOPIC_NAME =>
+          txnCoordinator.onElection(topicPartition.partition(), leaderEpoch)
+        case Topic.SHARE_GROUP_STATE_TOPIC_NAME =>
+          shareCoordinator.onElection(topicPartition.partition(), leaderEpoch)
+        case _ =>
+      }
+    } catch {
+      case t: Throwable => metadataPublishingFaultHandler.handleFault(
+        s"Error electing coordinator for $topicPartition after asynchronous lifecycle in $deltaName",
+        t)
+    }
+  }
+
+  private def onAsyncResigned(
+    deltaName: String,
+    topicPartition: TopicPartition,
+    leaderEpoch: Option[Int]
+  ): Unit = {
+    try {
+      topicPartition.topic() match {
+        case Topic.GROUP_METADATA_TOPIC_NAME =>
+          groupCoordinator.onResignation(topicPartition.partition(), toOptionalInt(leaderEpoch))
+        case Topic.TRANSACTION_STATE_TOPIC_NAME =>
+          txnCoordinator.onResignation(topicPartition.partition(), leaderEpoch)
+        case Topic.SHARE_GROUP_STATE_TOPIC_NAME =>
+          shareCoordinator.onResignation(topicPartition.partition(), toOptionalInt(leaderEpoch))
+        case _ =>
+      }
+    } catch {
+      case t: Throwable => metadataPublishingFaultHandler.handleFault(
+        s"Error resigning coordinator for $topicPartition after asynchronous lifecycle in $deltaName",
+        t)
+    }
+  }
+
+  private def notifyShareCoordinatorOfDeletedTopics(
+    deltaName: String,
+    topicsDelta: TopicsDelta
+  ): Unit = {
+    try {
+      val deletedTopicIds = topicsDelta.deletedTopicIds()
+      if (!deletedTopicIds.isEmpty) {
+        shareCoordinator.onTopicsDeleted(deletedTopicIds, RequestLocal.noCaching.bufferSupplier)
+      }
+    } catch {
+      case t: Throwable => metadataPublishingFaultHandler.handleFault("Error updating share " +
+        s"coordinator with deleted partitions in $deltaName", t)
+    }
+  }
+  // Nereus inject end: asynchronous storage lifecycle callback ordering
 
   /**
    * Update the coordinator of local replica changes: election and resignation.

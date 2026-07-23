@@ -191,6 +191,7 @@ class Partition(val topicPartition: TopicPartition,
   @volatile private[cluster] var leaderEpochStartOffsetOpt: Option[Long] = None
   // Nereus inject start: leader-epoch-fenced asynchronous ListOffsets lookup
   private var leaderEpochAwareOffsetLookup: Option[(Int, LeaderEpochAwareOffsetLookup)] = None
+  private var leaderEpochAwareOffsetLookupPending: Option[Int] = None
   // Nereus inject end: leader-epoch-fenced asynchronous ListOffsets lookup
   // Replica ID of the leader, defined when this broker is leader or follower for the partition.
   @volatile var leaderReplicaIdOpt: Option[Int] = None
@@ -577,6 +578,7 @@ class Partition(val topicPartition: TopicPartition,
     leaderEpochStartOffsetOpt = None
     // Nereus inject start: clear storage lookup with partition state
     leaderEpochAwareOffsetLookup = None
+    leaderEpochAwareOffsetLookupPending = None
     // Nereus inject end: clear storage lookup with partition state
     Partition.removeMetrics(topicPartition)
   }
@@ -640,6 +642,7 @@ class Partition(val topicPartition: TopicPartition,
       if (isNewLeaderEpoch) {
         // Nereus inject start: never retain a lookup across leader epochs
         leaderEpochAwareOffsetLookup = None
+        leaderEpochAwareOffsetLookupPending = None
         // Nereus inject end: never retain a lookup across leader epochs
         val leaderEpochStartOffset = leaderLog.logEndOffset
         stateChangeLogger.info(s"Leader $topicPartition with topic id $topicId starts at " +
@@ -721,6 +724,7 @@ class Partition(val topicPartition: TopicPartition,
       leaderEpochStartOffsetOpt = None
       // Nereus inject start: follower transitions revoke leader-only storage lookup
       leaderEpochAwareOffsetLookup = None
+      leaderEpochAwareOffsetLookupPending = None
       // Nereus inject end: follower transitions revoke leader-only storage lookup
       partitionEpoch = partitionRegistration.partitionEpoch
 
@@ -1451,6 +1455,18 @@ class Partition(val topicPartition: TopicPartition,
   }
 
   // Nereus inject start: partition-owned ListOffsets lookup installation and request routing
+  def beginLeaderEpochAwareOffsetLookup(expectedLeaderEpoch: Int): Unit = inWriteLock(leaderIsrUpdateLock) {
+    if (!isLeader) {
+      throw new NotLeaderOrFollowerException(s"Cannot begin offset lookup recovery for non-leader partition $topicPartition")
+    }
+    if (leaderEpoch != expectedLeaderEpoch) {
+      throw new FencedLeaderEpochException(s"Cannot begin offset lookup recovery for partition $topicPartition at stale " +
+        s"leader epoch $expectedLeaderEpoch; current leader epoch is $leaderEpoch")
+    }
+    leaderEpochAwareOffsetLookup = None
+    leaderEpochAwareOffsetLookupPending = Some(expectedLeaderEpoch)
+  }
+
   def installLeaderEpochAwareOffsetLookup(expectedLeaderEpoch: Int,
                                           lookup: LeaderEpochAwareOffsetLookup): Unit = inWriteLock(leaderIsrUpdateLock) {
     if (!isLeader) {
@@ -1462,6 +1478,13 @@ class Partition(val topicPartition: TopicPartition,
     }
     leaderEpochAwareOffsetLookup = Some(expectedLeaderEpoch ->
       java.util.Objects.requireNonNull(lookup, "lookup"))
+    leaderEpochAwareOffsetLookupPending = None
+  }
+
+  def cancelLeaderEpochAwareOffsetLookup(expectedLeaderEpoch: Int): Unit = inWriteLock(leaderIsrUpdateLock) {
+    if (leaderEpochAwareOffsetLookupPending.contains(expectedLeaderEpoch)) {
+      leaderEpochAwareOffsetLookupPending = None
+    }
   }
 
   def removeLeaderEpochAwareOffsetLookup(expectedLeaderEpoch: Int,
@@ -1484,6 +1507,10 @@ class Partition(val topicPartition: TopicPartition,
     java.util.Objects.requireNonNull(completionWakeup, "completionWakeup")
     // decide whether to only fetch from leader
     val localLog = localLogWithEpochOrThrow(currentLeaderEpoch, fetchOnlyFromLeader)
+    if (leaderEpochAwareOffsetLookupPending.contains(leaderEpoch)) {
+      throw new OffsetNotAvailableException(
+        s"Nereus offset lookup for partition $topicPartition at leader epoch $leaderEpoch is still recovering")
+    }
 
     val lastFetchableOffset = isolationLevel match {
       case Some(IsolationLevel.READ_COMMITTED) => localLog.lastStableOffset

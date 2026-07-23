@@ -23,12 +23,13 @@ import java.util.Collections.{singleton, singletonList, singletonMap}
 import java.util.{OptionalInt, Properties}
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import kafka.log.LogManager
+import kafka.cluster.Partition
 import kafka.server.share.SharePartitionManager
 import kafka.server.{BrokerServer, KafkaConfig, ReplicaManager}
 import kafka.utils.TestUtils
 import org.apache.kafka.clients.admin.AlterConfigOp.OpType.SET
 import org.apache.kafka.clients.admin.{AlterConfigOp, ConfigEntry, NewTopic}
-import org.apache.kafka.common.Uuid
+import org.apache.kafka.common.{TopicPartition, Uuid}
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.config.ConfigResource.Type.BROKER
 import org.apache.kafka.common.internals.Topic
@@ -47,14 +48,14 @@ import org.apache.kafka.server.common.{KRaftVersion, MetadataVersion, ShareVersi
 import org.apache.kafka.server.fault.FaultHandler
 import org.junit.jupiter.api.Assertions.{assertEquals, assertNotNull, assertTrue}
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
-import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.{any, same}
 import org.mockito.Mockito
-import org.mockito.Mockito.{doThrow, mock, verify}
+import org.mockito.Mockito.{doThrow, mock, never, verify}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 
 import java.util
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{CompletableFuture, TimeUnit}
 import scala.jdk.CollectionConverters._
 
 class BrokerMetadataPublisherTest {
@@ -92,6 +93,84 @@ class BrokerMetadataPublisherTest {
       "bar",
       MetadataImageTest.IMAGE1,
       MetadataImageTest.DELTA1).isDefined, "Expected to see delta for changed topic")
+  }
+
+  @Test
+  def testAsyncTopicLifecycleDefersInternalCoordinatorElectionUntilLeaderReady(): Unit = {
+    val config = KafkaConfig.fromProps(TestUtils.createBrokerConfig(0))
+    val replicaManager = mock(classOf[ReplicaManager])
+    val groupCoordinator = mock(classOf[GroupCoordinator])
+    val faultHandler = mock(classOf[FaultHandler])
+    val lifecycleCompletion = new CompletableFuture[Void]
+    val leaderReady = new AtomicReference[(TopicPartition, Int) => Unit]()
+    val lifecycle = new AsyncTopicDeltaLifecycle {
+      override def onLeaderStatePublished(partition: Partition, topicId: Uuid, leaderEpoch: Int): Unit = {}
+
+      override def applyAfterReplicaManager(
+        delta: org.apache.kafka.image.TopicsDelta,
+        newImage: MetadataImage,
+        onLeaderReady: (TopicPartition, Int) => Unit,
+        onResigned: (TopicPartition, Option[Int]) => Unit
+      ): CompletableFuture[Void] = {
+        leaderReady.set(onLeaderReady)
+        lifecycleCompletion
+      }
+    }
+    val publisher = new BrokerMetadataPublisher(
+      config,
+      new KRaftMetadataCache(0, () => KRaftVersion.KRAFT_VERSION_1),
+      mock(classOf[LogManager]),
+      replicaManager,
+      groupCoordinator,
+      mock(classOf[TransactionCoordinator]),
+      mock(classOf[ShareCoordinator]),
+      mock(classOf[SharePartitionManager]),
+      mock(classOf[DynamicConfigPublisher]),
+      mock(classOf[DynamicClientQuotaPublisher]),
+      mock(classOf[DynamicTopicClusterQuotaPublisher]),
+      mock(classOf[ScramPublisher]),
+      mock(classOf[DelegationTokenPublisher]),
+      mock(classOf[AclPublisher]),
+      faultHandler,
+      faultHandler,
+      Some(lifecycle))
+    publisher._firstPublish = false
+
+    val topicId = Uuid.randomUuid()
+    val delta = new MetadataDelta(MetadataImage.EMPTY)
+    delta.replay(new TopicRecord()
+      .setName(Topic.GROUP_METADATA_TOPIC_NAME)
+      .setTopicId(topicId))
+    delta.replay(new PartitionRecord()
+      .setTopicId(topicId)
+      .setPartitionId(0)
+      .setLeader(0)
+      .setLeaderEpoch(5)
+      .setReplicas(util.List.of(0))
+      .setIsr(util.List.of(0)))
+    val image = delta.apply(new MetadataProvenance(10, 1, 1000, true))
+
+    publisher.onMetadataUpdate(
+      delta,
+      image,
+      LogDeltaManifest.newBuilder()
+        .provenance(image.provenance())
+        .leaderAndEpoch(LeaderAndEpoch.UNKNOWN)
+        .numBatches(1)
+        .elapsedNs(100)
+        .numBytes(42)
+        .build())
+
+    verify(replicaManager).applyDelta(
+      same(delta.topicsDelta()),
+      same(image),
+      any[(Partition, Uuid, Int) => Unit])
+    verify(groupCoordinator, never()).onElection(0, 5)
+    assertTrue(publisher.firstPublishFuture.isDone)
+    assertTrue(!lifecycleCompletion.isDone)
+    leaderReady.get().apply(new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, 0), 5)
+    verify(groupCoordinator).onElection(0, 5)
+    lifecycleCompletion.complete(null)
   }
 
   private def newMockDynamicConfigPublisher(

@@ -2382,6 +2382,16 @@ class ReplicaManager(val config: KafkaConfig,
    * @param newImage        The new metadata image.
    */
   def applyDelta(delta: TopicsDelta, newImage: MetadataImage): Unit = {
+    applyDelta(delta, newImage, (_, _, _) => ())
+  }
+
+  // Nereus inject start: synchronous new-leader preparation before asynchronous storage recovery
+  def applyDelta(
+    delta: TopicsDelta,
+    newImage: MetadataImage,
+    onLeaderStatePublished: (Partition, Uuid, Int) => Unit
+  ): Unit = {
+    java.util.Objects.requireNonNull(onLeaderStatePublished, "onLeaderStatePublished")
     // Before taking the lock, compute the local changes
     val localChanges = delta.localChanges(config.nodeId)
     val metadataVersion = newImage.features().metadataVersionOrThrow()
@@ -2417,7 +2427,17 @@ class ReplicaManager(val config: KafkaConfig,
         val leaderChangedPartitions = new mutable.HashSet[Partition]
         val followerChangedPartitions = new mutable.HashSet[Partition]
         if (!localChanges.leaders.isEmpty) {
-          applyLocalLeadersDelta(leaderChangedPartitions, delta, lazyOffsetCheckpoints, localChanges.leaders.asScala, localChanges.directoryIds.asScala)
+          applyLocalLeadersDelta(
+            leaderChangedPartitions,
+            delta,
+            lazyOffsetCheckpoints,
+            localChanges.leaders.asScala,
+            localChanges.directoryIds.asScala,
+            (partition, topicId, leaderEpoch) => {
+              if (localChanges.electedLeaders().containsKey(partition.topicPartition)) {
+                onLeaderStatePublished(partition, topicId, leaderEpoch)
+              }
+            })
         }
         if (!localChanges.followers.isEmpty) {
           applyLocalFollowersDelta(followerChangedPartitions, newImage, delta, lazyOffsetCheckpoints, localChanges.followers.asScala, localChanges.directoryIds.asScala)
@@ -2438,13 +2458,15 @@ class ReplicaManager(val config: KafkaConfig,
       }
     }
   }
+  // Nereus inject end: synchronous new-leader preparation before asynchronous storage recovery
 
   private def applyLocalLeadersDelta(
     changedPartitions: mutable.Set[Partition],
     delta: TopicsDelta,
     offsetCheckpoints: OffsetCheckpoints,
     localLeaders: mutable.Map[TopicPartition, LocalReplicaChanges.PartitionInfo],
-    directoryIds: mutable.Map[TopicIdPartition, Uuid]
+    directoryIds: mutable.Map[TopicIdPartition, Uuid],
+    onLeaderStatePublished: (Partition, Uuid, Int) => Unit
   ): Unit = {
     stateChangeLogger.info(s"Transitioning ${localLeaders.size} partition(s) to " +
       "local leaders.")
@@ -2454,6 +2476,7 @@ class ReplicaManager(val config: KafkaConfig,
         try {
           val partitionAssignedDirectoryId = directoryIds.find(_._1.topicPartition() == tp).map(_._2)
           partition.makeLeader(info.partition, isNew, offsetCheckpoints, Some(info.topicId), partitionAssignedDirectoryId)
+          onLeaderStatePublished(partition, info.topicId, info.partition.leaderEpoch)
 
           changedPartitions.add(partition)
         } catch {

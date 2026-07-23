@@ -843,6 +843,41 @@ class PartitionTest extends AbstractPartitionTest {
   }
 
   @Test
+  def testLeaderEpochAwareOffsetLookupRecoveryFailsClosedUntilExactCancellation(): Unit = {
+    val leaderEpoch = 5
+    val partition = setupPartitionWithMocks(leaderEpoch, isLeader = true)
+
+    assertThrows(classOf[FencedLeaderEpochException], () =>
+      partition.beginLeaderEpochAwareOffsetLookup(leaderEpoch - 1))
+    partition.beginLeaderEpochAwareOffsetLookup(leaderEpoch)
+
+    assertThrows(classOf[OffsetNotAvailableException], () => partition.fetchOffsetForTimestamp(
+      ListOffsetsRequest.LATEST_TIMESTAMP,
+      None,
+      Optional.of(leaderEpoch),
+      fetchOnlyFromLeader = true))
+    assertThrows(classOf[OffsetNotAvailableException], () => partition.fetchOffsetForTimestamp(
+      1000L,
+      None,
+      Optional.of(leaderEpoch),
+      fetchOnlyFromLeader = true))
+
+    partition.cancelLeaderEpochAwareOffsetLookup(leaderEpoch - 1)
+    assertThrows(classOf[OffsetNotAvailableException], () => partition.fetchOffsetForTimestamp(
+      ListOffsetsRequest.LATEST_TIMESTAMP,
+      None,
+      Optional.of(leaderEpoch),
+      fetchOnlyFromLeader = true))
+
+    partition.cancelLeaderEpochAwareOffsetLookup(leaderEpoch)
+    assertTrue(partition.fetchOffsetForTimestamp(
+      ListOffsetsRequest.LATEST_TIMESTAMP,
+      None,
+      Optional.of(leaderEpoch),
+      fetchOnlyFromLeader = true).timestampAndOffsetOpt().isPresent)
+  }
+
+  @Test
   def testLeaderEpochAwareOffsetLookupIsRevokedBeforeNewLeaderEpochPublication(): Unit = {
     val leaderEpoch = 5
     val partition = setupPartitionWithMocks(leaderEpoch, isLeader = true)

@@ -68,6 +68,7 @@ final class NereusListOffsetsLifecycle(
               }
               return current.result
             case com.nereusstream.kafka.partition.KafkaLeaderAuthority.AuthorityRelation.DOMINATES =>
+              partition.beginLeaderEpochAwareOffsetLookup(request.leaderEpoch())
               removeLookup(current)
               current.result.fail(fenced("Nereus leader open was superseded by a newer authority"))
               slots.remove(request.identity())
@@ -76,6 +77,7 @@ final class NereusListOffsetsLifecycle(
                 "Nereus leader open is stale or conflicts with the process-current authority"))
           }
         case None =>
+          partition.beginLeaderEpochAwareOffsetLookup(request.leaderEpoch())
       }
       val created = new Slot(partition, request)
       slots.put(request.identity(), created)
@@ -103,6 +105,16 @@ final class NereusListOffsetsLifecycle(
     timeout: Duration
   ): CompletableFuture[Void] = {
     requireRoutingIdentity(partition, identity)
+    resign(identity, observedLeaderEpoch, timeout)
+  }
+
+  /** Metadata deletion/follower paths may use the partition identity after stock ReplicaManager removed its object. */
+  def resign(
+    identity: KafkaPartitionIdentity,
+    observedLeaderEpoch: Int,
+    timeout: Duration
+  ): CompletableFuture[Void] = {
+    Objects.requireNonNull(identity, "identity")
     requireNonNegative(observedLeaderEpoch, "observedLeaderEpoch")
     requirePositive(timeout, "timeout")
     guard.synchronized {
@@ -125,6 +137,15 @@ final class NereusListOffsetsLifecycle(
     timeout: Duration
   ): CompletableFuture[Void] = {
     requireRoutingIdentity(partition, identity)
+    delete(identity, metadataOffset, timeout)
+  }
+
+  def delete(
+    identity: KafkaPartitionIdentity,
+    metadataOffset: Long,
+    timeout: Duration
+  ): CompletableFuture[Void] = {
+    Objects.requireNonNull(identity, "identity")
     requireNonNegative(metadataOffset, "metadataOffset")
     requirePositive(timeout, "timeout")
     guard.synchronized {
@@ -171,6 +192,7 @@ final class NereusListOffsetsLifecycle(
       val current = slots.get(attempt.request.identity())
       if (failure.nonEmpty) {
         if (current.contains(attempt)) {
+          attempt.partition.cancelLeaderEpochAwareOffsetLookup(attempt.request.leaderEpoch())
           slots.remove(attempt.request.identity())
         }
         if (storage == null) {
@@ -180,6 +202,7 @@ final class NereusListOffsetsLifecycle(
         }
       } else if (storage == null) {
         if (current.contains(attempt)) {
+          attempt.partition.cancelLeaderEpochAwareOffsetLookup(attempt.request.leaderEpoch())
           slots.remove(attempt.request.identity())
         }
         attempt.result.fail(invariant("Nereus partition manager completed with null storage"))
@@ -195,6 +218,7 @@ final class NereusListOffsetsLifecycle(
           attempt.result.succeed(storage)
         } catch {
           case installFailure: Throwable =>
+            attempt.partition.cancelLeaderEpochAwareOffsetLookup(attempt.request.leaderEpoch())
             slots.remove(attempt.request.identity())
             cleanup = Some(installFailure)
         }
@@ -229,10 +253,13 @@ final class NereusListOffsetsLifecycle(
   }
 
   private def removeLookup(slot: Slot): Unit = {
-    slot.installation.foreach { installation =>
-      slot.partition.removeLeaderEpochAwareOffsetLookup(
-        slot.request.leaderEpoch(),
-        installation.lookup)
+    slot.installation match {
+      case Some(installation) =>
+        slot.partition.removeLeaderEpochAwareOffsetLookup(
+          slot.request.leaderEpoch(),
+          installation.lookup)
+      case None =>
+        slot.partition.cancelLeaderEpochAwareOffsetLookup(slot.request.leaderEpoch())
     }
     slot.installation = None
   }
