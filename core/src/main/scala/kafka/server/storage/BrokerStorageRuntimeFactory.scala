@@ -50,6 +50,8 @@ object BrokerStorageRuntimeFactory {
 
     override def unifiedLogFactory: UnifiedLogFactory = UnifiedLogFactory.Local
 
+    override def appendExecutor: Option[BrokerStorageAppendExecutor] = None
+
     override def asyncTopicDeltaLifecycle(replicaManager: ReplicaManager): Option[AsyncTopicDeltaLifecycle] = {
       require(replicaManager != null, "replicaManager must be non-null")
       None

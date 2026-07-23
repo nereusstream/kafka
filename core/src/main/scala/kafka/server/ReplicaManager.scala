@@ -23,6 +23,7 @@ import kafka.server.HostedPartition.Online
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.ReplicaManager.{AtMinIsrPartitionCountMetricName, FailedIsrUpdatesPerSecMetricName, IsrExpandsPerSecMetricName, IsrShrinksPerSecMetricName, LeaderCountMetricName, OfflineReplicaCountMetricName, PartitionCountMetricName, PartitionsWithLateTransactionsCountMetricName, ProducerIdCountMetricName, ReassigningPartitionsMetricName, UnderMinIsrPartitionCountMetricName, UnderReplicatedPartitionsMetricName, createLogReadResult, isListOffsetsTimestampUnsupported}
 import kafka.server.share.DelayedShareFetch
+import kafka.server.storage.BrokerStorageAppendExecutor
 import kafka.utils._
 import org.apache.kafka.common.{IsolationLevel, Node, TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.common.errors._
@@ -74,8 +75,8 @@ import java.lang.{Long => JLong}
 import java.nio.file.{Files, Paths}
 import java.util
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, Future, RejectedExecutionException, TimeUnit}
-import java.util.{Collections, Optional, OptionalInt, OptionalLong}
+import java.util.concurrent.{CompletableFuture, CompletionException, ConcurrentHashMap, ExecutionException, Future, RejectedExecutionException, TimeUnit}
+import java.util.{Collections, Objects, Optional, OptionalInt, OptionalLong}
 import java.util.function.Consumer
 import scala.collection.{Map, Seq, Set, immutable, mutable}
 import scala.jdk.CollectionConverters._
@@ -218,7 +219,8 @@ class ReplicaManager(val config: KafkaConfig,
                      val brokerEpochSupplier: () => Long = () => -1,
                      addPartitionsToTxnManager: Option[AddPartitionsToTxnManager] = None,
                      val directoryEventHandler: DirectoryEventHandler = DirectoryEventHandler.NOOP,
-                     val defaultActionQueue: ActionQueue = new DelayedActionQueue
+                     val defaultActionQueue: ActionQueue = new DelayedActionQueue,
+                     val storageAppendExecutor: Option[BrokerStorageAppendExecutor] = None
                      ) extends Logging {
   // Changing the package or class name may cause incompatibility with existing code and metrics configuration
   private val metricsPackage = "kafka.server"
@@ -692,17 +694,126 @@ class ReplicaManager(val config: KafkaConfig,
       return
     }
 
-    val localProduceResults = appendRecordsToLeader(
-      requiredAcks,
-      internalTopicsAllowed,
-      origin,
-      entriesPerPartition,
-      requestLocal,
-      defaultActionQueue,
-      verificationGuards,
-      transactionVersion
-    )
+    storageAppendExecutor match {
+      case None =>
+        val localProduceResults = appendRecordsToLeader(
+          requiredAcks,
+          internalTopicsAllowed,
+          origin,
+          entriesPerPartition,
+          requestLocal,
+          defaultActionQueue,
+          verificationGuards,
+          transactionVersion
+        )
+        completeAppendRecords(
+          timeout,
+          requiredAcks,
+          entriesPerPartition,
+          localProduceResults,
+          responseCallback,
+          recordValidationStatsCallback)
+      case Some(executor) =>
+        appendRecordsOnStorageExecutor(
+          executor,
+          timeout,
+          requiredAcks,
+          internalTopicsAllowed,
+          origin,
+          entriesPerPartition.toMap,
+          responseCallback,
+          recordValidationStatsCallback,
+          verificationGuards.toMap,
+          transactionVersion)
+    }
+  }
 
+  private def appendRecordsOnStorageExecutor(
+    executor: BrokerStorageAppendExecutor,
+    timeout: Long,
+    requiredAcks: Short,
+    internalTopicsAllowed: Boolean,
+    origin: AppendOrigin,
+    entriesPerPartition: Map[TopicIdPartition, MemoryRecords],
+    responseCallback: Map[TopicIdPartition, PartitionResponse] => Unit,
+    recordValidationStatsCallback: Map[TopicIdPartition, RecordValidationStats] => Unit,
+    verificationGuards: Map[TopicPartition, VerificationGuard],
+    transactionVersion: Short
+  ): Unit = {
+    try {
+      executor.validateRequest(entriesPerPartition.values)
+    } catch {
+      case failure: Throwable =>
+        val failed = entriesPerPartition.keys.map { partition =>
+          partition -> storageExecutorFailure(failure)
+        }.toMap
+        completeAppendRecords(
+          timeout,
+          requiredAcks,
+          entriesPerPartition,
+          failed,
+          responseCallback,
+          recordValidationStatsCallback)
+        return
+    }
+
+    val appendFutures = entriesPerPartition.map { case (partition, records) =>
+      val normalized = new CompletableFuture[LogAppendResult]
+      try {
+        val submitted = Objects.requireNonNull(
+          executor.submit(
+            partition,
+            records,
+            ownedRecords => {
+              try {
+                appendRecordsToLeader(
+                  requiredAcks,
+                  internalTopicsAllowed,
+                  origin,
+                  Map(partition -> ownedRecords),
+                  RequestLocal.noCaching,
+                  defaultActionQueue,
+                  verificationGuards,
+                  transactionVersion
+                )(partition)
+              } finally {
+                // The request handler has already returned, so no later KafkaApis epilogue can drain these actions.
+                defaultActionQueue.tryCompleteActions()
+              }
+            }),
+          "storage append future")
+        submitted.whenComplete { (result, failure) =>
+          if (failure == null && result != null) normalized.complete(result)
+          else if (failure != null) normalized.complete(storageExecutorFailure(failure))
+          else normalized.complete(storageExecutorFailure(
+            new KafkaStorageException(s"Storage append executor returned null for $partition")))
+        }
+      } catch {
+        case failure: Throwable => normalized.complete(storageExecutorFailure(failure))
+      }
+      partition -> normalized
+    }
+
+    CompletableFuture.allOf(appendFutures.values.toSeq: _*).whenComplete { (_, _) =>
+      val results = appendFutures.map { case (partition, future) => partition -> future.join() }
+      completeAppendRecords(
+        timeout,
+        requiredAcks,
+        entriesPerPartition,
+        results,
+        responseCallback,
+        recordValidationStatsCallback)
+    }
+  }
+
+  private def completeAppendRecords(
+    timeout: Long,
+    requiredAcks: Short,
+    entriesPerPartition: Map[TopicIdPartition, MemoryRecords],
+    localProduceResults: Map[TopicIdPartition, LogAppendResult],
+    responseCallback: Map[TopicIdPartition, PartitionResponse] => Unit,
+    recordValidationStatsCallback: Map[TopicIdPartition, RecordValidationStats] => Unit
+  ): Unit = {
     val produceStatus = buildProducePartitionStatus(localProduceResults)
 
     recordValidationStatsCallback(localProduceResults.map { case (k, v) =>
@@ -717,6 +828,18 @@ class ReplicaManager(val config: KafkaConfig,
       produceStatus,
       responseCallback
     )
+  }
+
+  private def storageExecutorFailure(supplied: Throwable): LogAppendResult = {
+    var failure = supplied
+    while ((failure.isInstanceOf[CompletionException] || failure.isInstanceOf[ExecutionException]) &&
+      failure.getCause != null) {
+      failure = failure.getCause
+    }
+    LogAppendResult(
+      LogAppendInfo.UNKNOWN_LOG_APPEND_INFO,
+      Some(failure),
+      hasCustomErrorMessage = false)
   }
 
   /**

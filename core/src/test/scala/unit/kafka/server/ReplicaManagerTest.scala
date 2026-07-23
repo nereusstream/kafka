@@ -26,6 +26,7 @@ import org.apache.kafka.server.log.remote.quota.RLMQuotaMetrics
 import kafka.server.QuotaFactory.{QuotaManagers, UNBOUNDED_QUOTA}
 import kafka.server.epoch.util.MockBlockingSender
 import kafka.server.share.{DelayedShareFetch, SharePartition}
+import kafka.server.storage.BrokerStorageAppendExecutor
 import kafka.utils.TestUtils.waitUntilTrue
 import kafka.utils.TestUtils
 import org.apache.kafka.clients.FetchSessionHandler
@@ -95,7 +96,7 @@ import java.net.InetAddress
 import java.nio.file.{Files, Paths}
 import java.util
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
-import java.util.concurrent.{Callable, CompletableFuture, ConcurrentHashMap, CountDownLatch, Future, TimeUnit}
+import java.util.concurrent.{Callable, CompletableFuture, CompletionStage, ConcurrentHashMap, CountDownLatch, Future, TimeUnit}
 import java.util.function.{BiConsumer, Consumer}
 import java.util.stream.IntStream
 import java.util.{Collections, Optional, OptionalLong, Properties}
@@ -271,6 +272,77 @@ class ReplicaManagerTest {
         entriesPerPartition = Map(new TopicIdPartition(Uuid.randomUuid(), 0, "test1") -> MemoryRecords.withRecords(Compression.NONE,
           new SimpleRecord("first message".getBytes))),
         responseCallback = callback)
+    } finally {
+      rm.shutdown(checkpointHW = false)
+    }
+  }
+
+  @Test
+  def testStorageAppendExecutorDefersAppendAndCallbacksUntilOwnedWorkCompletes(): Unit = {
+    val mockLogMgr = TestUtils.createLogManager(config.logDirs.asScala.map(new File(_)))
+    val submitted = new AtomicReference[Runnable]
+    val validationCalls = new AtomicLong
+    val drainedFuture = CompletableFuture.completedFuture[Void](null)
+    val appendExecutor = new BrokerStorageAppendExecutor {
+      override def validateRequest(entries: Iterable[MemoryRecords]): Unit = {
+        validationCalls.incrementAndGet()
+        assertEquals(1, entries.size)
+      }
+
+      override def submit(
+        partition: TopicIdPartition,
+        records: MemoryRecords,
+        append: MemoryRecords => LogAppendResult
+      ): CompletionStage[LogAppendResult] = {
+        val result = new CompletableFuture[LogAppendResult]
+        assertTrue(submitted.compareAndSet(null, () => {
+          try result.complete(append(records))
+          catch {
+            case failure: Throwable => result.completeExceptionally(failure)
+          }
+        }))
+        result
+      }
+
+      override def drained: CompletionStage[Void] = drainedFuture
+
+      override def close(): Unit = {}
+    }
+    val rm = new ReplicaManager(
+      metrics = metrics,
+      config = config,
+      time = time,
+      scheduler = new MockScheduler(time),
+      logManager = mockLogMgr,
+      quotaManagers = quotaManager,
+      metadataCache = new KRaftMetadataCache(config.brokerId, () => KRaftVersion.KRAFT_VERSION_0),
+      logDirFailureChannel = new LogDirFailureChannel(config.logDirs.size),
+      alterPartitionManager = alterPartitionManager,
+      storageAppendExecutor = Some(appendExecutor))
+    try {
+      val response = new CompletableFuture[Map[TopicIdPartition, PartitionResponse]]
+      val validationStatsCalled = new AtomicBoolean
+      val partition = new TopicIdPartition(topicId, topicPartition)
+      rm.appendRecords(
+        timeout = 1000,
+        requiredAcks = 1,
+        internalTopicsAllowed = false,
+        origin = AppendOrigin.CLIENT,
+        entriesPerPartition = Map(partition ->
+          MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("owned".getBytes))),
+        responseCallback = response.complete,
+        recordValidationStatsCallback = _ => validationStatsCalled.set(true),
+        requestLocal = mock(classOf[RequestLocal]))
+
+      assertEquals(1, validationCalls.get())
+      assertFalse(response.isDone)
+      assertFalse(validationStatsCalled.get())
+
+      submitted.get().run()
+
+      val partitionResponse = response.get(5, TimeUnit.SECONDS)(partition)
+      assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, partitionResponse.error)
+      assertTrue(validationStatsCalled.get())
     } finally {
       rm.shutdown(checkpointHW = false)
     }

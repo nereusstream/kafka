@@ -34,6 +34,9 @@ trait BrokerStorageRuntime extends AutoCloseable {
   /** Returns the per-broker log factory before LogManager construction. This method must be side-effect free. */
   def unifiedLogFactory: UnifiedLogFactory
 
+  /** Returns the optional request-path append handoff owned by this runtime. */
+  def appendExecutor: Option[BrokerStorageAppendExecutor]
+
   /** Creates or returns the lifecycle bound to the exact ReplicaManager owned by this BrokerServer. */
   def asyncTopicDeltaLifecycle(replicaManager: ReplicaManager): Option[AsyncTopicDeltaLifecycle]
 

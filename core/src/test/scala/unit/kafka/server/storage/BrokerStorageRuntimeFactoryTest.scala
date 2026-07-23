@@ -45,6 +45,7 @@ class BrokerStorageRuntimeFactoryTest {
 
     assertTrue(runtime.start().toCompletableFuture.isDone)
     assertFalse(runtime.start().toCompletableFuture.isCompletedExceptionally)
+    assertTrue(runtime.appendExecutor.isEmpty)
     assertTrue(runtime.asyncTopicDeltaLifecycle(mock(classOf[kafka.server.ReplicaManager])).isEmpty)
     assertTrue(runtime.beginDrain(BrokerStorageDrainReason.BrokerShutdown).toCompletableFuture.isDone)
     assertTrue(runtime.awaitDrained(Duration.ofSeconds(1)).toCompletableFuture.isDone)

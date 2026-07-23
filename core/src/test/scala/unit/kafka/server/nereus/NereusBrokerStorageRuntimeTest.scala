@@ -33,7 +33,7 @@ import org.apache.kafka.metadata.KRaftMetadataCache
 import org.apache.kafka.server.config.{NereusKafkaConfigs, ReplicationConfigs, ServerLogConfigs}
 import org.apache.kafka.server.util.KafkaScheduler
 import org.apache.kafka.storage.internals.log.CleanerConfig
-import org.junit.jupiter.api.Assertions.{assertSame, assertThrows, assertTrue}
+import org.junit.jupiter.api.Assertions.{assertFalse, assertSame, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.{mock, never, times, verify, when}
@@ -77,6 +77,7 @@ class NereusBrokerStorageRuntimeTest {
     val enabled = factory.create(context(KafkaConfig.fromProps(enabledProperties(), false)))
     assertTrue(enabled.isInstanceOf[NereusBrokerStorageRuntime])
     assertTrue(enabled.unifiedLogFactory.isInstanceOf[NereusUnifiedLogFactory])
+    assertTrue(enabled.appendExecutor.nonEmpty)
     assertTrue(runtimeCreations.get() == 1)
     assertTrue(scanConfigCreations.get() == 1)
 
@@ -111,7 +112,10 @@ class NereusBrokerStorageRuntimeTest {
     assertSame(drained, runtime.beginDrain(BrokerStorageDrainReason.BrokerShutdown))
     verify(delegate).beginDrain(DrainReason.BROKER_SHUTDOWN)
     assertThrows(classOf[IllegalStateException], () => runtime.asyncTopicDeltaLifecycle(replicaManager))
-    assertSame(drained, runtime.awaitDrained(Duration.ofSeconds(1)))
+    val allDrained = runtime.awaitDrained(Duration.ofSeconds(1)).toCompletableFuture
+    assertFalse(allDrained.isDone)
+    drained.complete(null)
+    allDrained.join()
 
     runtime.close()
     runtime.close()
