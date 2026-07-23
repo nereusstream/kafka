@@ -46,6 +46,7 @@ final class NereusListOffsetsLifecycle(
   private val slots = mutable.HashMap.empty[KafkaPartitionIdentity, Slot]
   private val inspector = new NereusRecordTimestampInspector
   private var closed = false
+  private var managerShutdownOperation: LifecycleVoidResult = _
 
   def openLeader(
     partition: Partition,
@@ -157,11 +158,11 @@ final class NereusListOffsetsLifecycle(
     protectedVoid(storageManager.delete(identity, metadataOffset, timeout))
   }
 
-  /** Stops new opens, revokes all request-path lookups, and then drains the product-owned manager. */
-  def shutdown(): CompletableFuture[Void] = {
+  /** Stops new opens and synchronously revokes every request-path lookup without shutting down the manager. */
+  def beginDrain(): Unit = {
     guard.synchronized {
       if (closed) {
-        return CompletableFuture.completedFuture(null)
+        return
       }
       closed = true
       slots.values.foreach { current =>
@@ -170,7 +171,32 @@ final class NereusListOffsetsLifecycle(
       }
       slots.clear()
     }
-    protectedVoid(storageManager.shutdown())
+  }
+
+  /** Stops lookup admission and drains the product-owned manager exactly once. */
+  def shutdown(): CompletableFuture[Void] = {
+    beginDrain()
+    val operation = guard.synchronized {
+      if (managerShutdownOperation != null) {
+        return managerShutdownOperation
+      }
+      managerShutdownOperation = new LifecycleVoidResult
+      managerShutdownOperation
+    }
+    val managerShutdown = try {
+      storageManager.shutdown()
+    } catch {
+      case failure: Throwable => CompletableFuture.failedFuture[Void](failure)
+    }
+    if (managerShutdown == null) {
+      operation.fail(new NullPointerException("Nereus partition manager returned a null shutdown future"))
+    } else {
+      managerShutdown.whenComplete((_, failure) => {
+        if (failure == null) operation.succeed()
+        else operation.fail(unwrap(failure))
+      })
+    }
+    operation
   }
 
   private[nereus] def installedPartitions: Int = guard.synchronized {

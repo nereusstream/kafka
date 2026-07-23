@@ -218,11 +218,19 @@ class NereusListOffsetsLifecycleTest {
     manager.completeOpen(7, storageFor(secondRequest))
     secondOpen.join()
 
-    lifecycle.shutdown().join()
+    lifecycle.beginDrain()
 
-    assertTrue(events.indexOf("partition-remove-7") < events.indexOf("manager-shutdown"))
+    assertTrue(events.contains("partition-remove-7"))
+    assertFalse(events.contains("manager-shutdown"))
     assertEquals(0, lifecycle.installedPartitions)
     assertFailureCode(lifecycle.openLeader(secondPartition, secondRequest), ErrorCode.STORAGE_CLOSED)
+
+    val firstShutdown = lifecycle.shutdown()
+    val duplicateShutdown = lifecycle.shutdown()
+    assertSame(firstShutdown, duplicateShutdown)
+    firstShutdown.join()
+    assertTrue(events.indexOf("partition-remove-7") < events.indexOf("manager-shutdown"))
+    assertEquals(1, events.count(_ == "manager-shutdown"))
   }
 
   private def partitionAt(

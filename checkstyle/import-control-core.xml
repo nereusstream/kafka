@@ -80,6 +80,13 @@
   <subpackage name="server">
     <allow pkg="kafka" />
     <allow pkg="org.apache.kafka" />
+    <!-- Nereus inject start: exact adapter-backed broker runtime -->
+    <subpackage name="nereus">
+      <allow pkg="com.nereusstream.api" />
+      <allow pkg="com.nereusstream.kafka.partition" />
+      <allow pkg="com.nereusstream.kafka.runtime" />
+    </subpackage>
+    <!-- Nereus inject end: exact adapter-backed broker runtime -->
   </subpackage>
 
   <subpackage name="admin">

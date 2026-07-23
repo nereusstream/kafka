@@ -566,7 +566,7 @@ class BrokerServer(
         sharedServer.initialBrokerMetadataLoadFaultHandler,
         sharedServer.metadataPublishingFaultHandler,
         // Nereus inject start: optional exact post-ReplicaManager partition lifecycle
-        brokerStorageRuntime.asyncTopicDeltaLifecycle
+        brokerStorageRuntime.asyncTopicDeltaLifecycle(replicaManager)
         // Nereus inject end: optional exact post-ReplicaManager partition lifecycle
       )
       // If the BrokerLifecycleManager's initial catch-up future fails, it means we timed out

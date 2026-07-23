@@ -1064,6 +1064,10 @@ project(':core') {
     sourceSets.main.scala.exclude 'kafka/log/nereus/**'
     sourceSets.test.java.exclude 'kafka/log/nereus/**'
     sourceSets.test.scala.exclude '**/kafka/log/nereus/**'
+    sourceSets.main.java.exclude 'kafka/server/nereus/**'
+    sourceSets.main.scala.exclude 'kafka/server/nereus/**'
+    sourceSets.test.java.exclude 'kafka/server/nereus/**'
+    sourceSets.test.scala.exclude '**/kafka/server/nereus/**'
   }
   // Nereus inject end: keep stock builds independent from unpublished development artifacts
 

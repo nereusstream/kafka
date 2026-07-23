@@ -17,6 +17,7 @@
 
 package kafka.server.storage
 
+import kafka.server.ReplicaManager
 import kafka.server.metadata.AsyncTopicDeltaLifecycle
 
 import java.time.Duration
@@ -29,7 +30,8 @@ import java.util.concurrent.CompletionStage
 trait BrokerStorageRuntime extends AutoCloseable {
   def start(): CompletionStage[Void]
 
-  def asyncTopicDeltaLifecycle: Option[AsyncTopicDeltaLifecycle]
+  /** Creates or returns the lifecycle bound to the exact ReplicaManager owned by this BrokerServer. */
+  def asyncTopicDeltaLifecycle(replicaManager: ReplicaManager): Option[AsyncTopicDeltaLifecycle]
 
   def beginDrain(reason: BrokerStorageDrainReason): CompletionStage[Void]
 

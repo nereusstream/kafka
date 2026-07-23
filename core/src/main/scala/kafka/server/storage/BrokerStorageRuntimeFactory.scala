@@ -17,6 +17,7 @@
 
 package kafka.server.storage
 
+import kafka.server.ReplicaManager
 import kafka.server.metadata.AsyncTopicDeltaLifecycle
 
 import org.apache.kafka.common.config.ConfigException
@@ -46,7 +47,10 @@ object BrokerStorageRuntimeFactory {
 
     override def start(): CompletionStage[Void] = completed
 
-    override def asyncTopicDeltaLifecycle: Option[AsyncTopicDeltaLifecycle] = None
+    override def asyncTopicDeltaLifecycle(replicaManager: ReplicaManager): Option[AsyncTopicDeltaLifecycle] = {
+      require(replicaManager != null, "replicaManager must be non-null")
+      None
+    }
 
     override def beginDrain(reason: BrokerStorageDrainReason): CompletionStage[Void] = {
       require(reason != null, "reason must be non-null")
