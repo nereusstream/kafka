@@ -51,6 +51,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class SchedulerTest {
@@ -98,6 +100,20 @@ public class SchedulerTest {
         mockTime.sleep(100);
         assertEquals(101, counter1.get(), "Counter1 should be incremented 101 times");
         assertEquals(1, counter2.get(), "Counter2 should not be incremented once");
+    }
+
+    @Test
+    void testBorrowedScheduledExecutorService() throws InterruptedException {
+        KafkaScheduler neverStarted = new KafkaScheduler(1);
+        assertThrows(IllegalStateException.class, neverStarted::scheduledExecutorService);
+
+        ScheduledExecutorService borrowed = scheduler.scheduledExecutorService();
+        CountDownLatch completed = new CountDownLatch(1);
+        borrowed.schedule(completed::countDown, 0, TimeUnit.MILLISECONDS);
+
+        assertTrue(completed.await(30, TimeUnit.SECONDS));
+        assertFalse(borrowed.isShutdown());
+        assertSame(borrowed, scheduler.scheduledExecutorService());
     }
 
     @Test

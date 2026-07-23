@@ -86,6 +86,7 @@
       <allow pkg="com.nereusstream.core" />
       <allow pkg="com.nereusstream.kafka.activation" />
       <allow pkg="com.nereusstream.kafka.partition" />
+      <allow pkg="com.nereusstream.kafka.recovery" />
       <allow pkg="com.nereusstream.kafka.runtime" />
       <allow pkg="com.nereusstream.metadata.oxia" />
       <allow pkg="com.nereusstream.metadata.oxia.records" />

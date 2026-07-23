@@ -150,6 +150,24 @@ class NereusBrokerStorageRuntimeTest {
     verify(delegate).close()
   }
 
+  @Test
+  def testProductionFactoryDefersProviderIoAndBindsRecoveryToExactReplicaManager(): Unit = {
+    val recoveryCreations = new AtomicInteger
+    val factory = NereusBrokerStorageRuntimeFactory.production(_ => {
+      recoveryCreations.incrementAndGet()
+      mock(classOf[com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher])
+    })
+    val runtime = factory.create(context(KafkaConfig.fromProps(enabledProperties(), false)))
+    val replicaManager = mock(classOf[ReplicaManager])
+
+    assertTrue(recoveryCreations.get() == 0)
+    assertTrue(runtime.asyncTopicDeltaLifecycle(replicaManager).nonEmpty)
+    assertTrue(runtime.asyncTopicDeltaLifecycle(replicaManager).nonEmpty)
+    assertTrue(recoveryCreations.get() == 1)
+
+    runtime.close()
+  }
+
   private def runtimeMock(): NereusKafkaRuntime = {
     val runtime = mock(classOf[NereusKafkaRuntime])
     when(runtime.partitionStorageManager()).thenReturn(mock(classOf[KafkaPartitionStorageManager]))

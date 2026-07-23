@@ -232,15 +232,25 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                         exact.rollout().capabilityHeartbeat(),
                         exact.rollout().capabilityExpiry());
 
-        NereusListOffsetsScanConfig listOffsets = new NereusListOffsetsScanConfig(
+        NereusListOffsetsScanConfig listOffsets = listOffsets(exact);
+        return new NereusKafkaMappedRuntimeConfiguration(
+                objectWal, capability, listOffsets, providerToken);
+    }
+
+    /** Maps request-scan limits without requiring broker identity or constructing provider resources. */
+    public NereusListOffsetsScanConfig listOffsets(NereusKafkaStorageConfig storage) {
+        NereusKafkaStorageConfig exact = Objects.requireNonNull(storage, "storage");
+        long exactMaxObjectBytes = Math.min(
+                exact.append().requestBytes(),
+                exact.fetch().maxEntryBytes());
+        int maxObjectBytes = Math.toIntExact(exactMaxObjectBytes);
+        return new NereusListOffsetsScanConfig(
                 exact.lifecycle().recoveryChunkRecords(),
                 exact.lifecycle().recoveryChunkBytes(),
-                Math.toIntExact(Math.min(maxObjectBytes, 1024L * 1024L)),
+                Math.toIntExact(Math.min(exactMaxObjectBytes, 1024L * 1024L)),
                 maxObjectBytes,
                 exact.fetch().operationMaxRereads(),
                 exact.fetch().timeout());
-        return new NereusKafkaMappedRuntimeConfiguration(
-                objectWal, capability, listOffsets, providerToken);
     }
 
     private static byte[] configurationCompatibilitySha256(NereusKafkaStorageConfig storage) {

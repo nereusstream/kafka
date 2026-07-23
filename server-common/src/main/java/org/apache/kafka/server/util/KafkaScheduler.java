@@ -22,6 +22,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.Delayed;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -190,5 +191,17 @@ public class KafkaScheduler implements Scheduler {
 
     public int pendingTaskSize() {
         return isStarted() ? executor.getQueue().size() : 0;
+    }
+
+    /**
+     * Return the started scheduler as a borrowed Java scheduling boundary.
+     *
+     * <p>The caller must never shut down the returned service. KafkaScheduler remains its lifecycle owner.
+     */
+    public synchronized ScheduledExecutorService scheduledExecutorService() {
+        if (!isStarted()) {
+            throw new IllegalStateException("Kafka scheduler is not running");
+        }
+        return executor;
     }
 }

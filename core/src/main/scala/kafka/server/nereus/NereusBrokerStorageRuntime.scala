@@ -19,6 +19,7 @@ package kafka.server.nereus
 
 import com.nereusstream.api.StorageProfile
 import com.nereusstream.kafka.partition.KafkaPartitionStorageManager
+import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher
 import com.nereusstream.kafka.runtime.{DrainReason, NereusKafkaRuntime}
 import kafka.log.nereus.{NereusListOffsetsLifecycle, NereusListOffsetsScanConfig, NereusTopicDeltaLifecycle}
 import kafka.server.ReplicaManager
@@ -29,12 +30,14 @@ import org.apache.kafka.server.config.NereusKafkaStorageConfig
 import java.time.Duration
 import java.util.Objects
 import java.util.concurrent.CompletionStage
+import java.util.function.Function
 
 /** Binds one product-owned runtime to the exact BrokerServer and ReplicaManager that consume it. */
 final class NereusBrokerStorageRuntime(
   context: BrokerStorageRuntimeContext,
   delegate: NereusKafkaRuntime,
-  scanConfig: NereusListOffsetsScanConfig
+  scanConfig: NereusListOffsetsScanConfig,
+  recoveryLauncherCreator: Function[ReplicaManager, KafkaPartitionRecoveryLauncher] = null
 ) extends BrokerStorageRuntime {
   Objects.requireNonNull(context, "context")
   Objects.requireNonNull(delegate, "delegate")
@@ -64,6 +67,7 @@ final class NereusBrokerStorageRuntime(
         throw new IllegalStateException("Nereus metadata lifecycle cannot be created after drain or close")
       }
       if (metadataLifecycle == null) {
+        bindRecoveryLauncher(replicaManager)
         val partitionLifecycle = new NereusListOffsetsLifecycle(storageManager, scanConfig)
         val topicLifecycle = new NereusTopicDeltaLifecycle(
           context.clusterId,
@@ -123,6 +127,18 @@ final class NereusBrokerStorageRuntime(
     case NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY => StorageProfile.BOOKKEEPER_WAL_ONLY
     case NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT => StorageProfile.BOOKKEEPER_WAL_ASYNC_OBJECT
     case NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_SYNC_OBJECT => StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT
+  }
+
+  private def bindRecoveryLauncher(replicaManager: ReplicaManager): Unit = delegate match {
+    case deferred: NereusKafkaDeferredRuntime =>
+      if (recoveryLauncherCreator == null) {
+        throw new IllegalStateException(
+          "deferred Nereus runtime requires a ReplicaManager recovery-launcher creator")
+      }
+      deferred.bindRecoveryLauncher(Objects.requireNonNull(
+        recoveryLauncherCreator.apply(replicaManager),
+        "Kafka recovery launcher creator returned null"))
+    case _ =>
   }
 
   private final class MetadataLifecycle(

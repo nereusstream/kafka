@@ -18,11 +18,18 @@
 package kafka.server.nereus
 
 import com.nereusstream.kafka.runtime.NereusKafkaRuntime
+import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher
 import kafka.log.nereus.NereusListOffsetsScanConfig
+import kafka.server.ReplicaManager
 import kafka.server.storage.{BrokerStorageRuntime, BrokerStorageRuntimeContext, BrokerStorageRuntimeFactory}
 
+import org.apache.kafka.common.utils.AppInfoParser
+
+import java.nio.file.Path
 import java.util.Objects
+import java.util.UUID
 import java.util.function.Function
+import scala.jdk.CollectionConverters._
 
 /**
  * Explicit adapter-backed factory. Provider construction and ListOffsets limits are injected as typed functions so the
@@ -30,7 +37,8 @@ import java.util.function.Function
  */
 final class NereusBrokerStorageRuntimeFactory(
   runtimeCreator: Function[BrokerStorageRuntimeContext, NereusKafkaRuntime],
-  scanConfigCreator: Function[BrokerStorageRuntimeContext, NereusListOffsetsScanConfig]
+  scanConfigCreator: Function[BrokerStorageRuntimeContext, NereusListOffsetsScanConfig],
+  recoveryLauncherCreator: Function[ReplicaManager, KafkaPartitionRecoveryLauncher] = null
 ) extends BrokerStorageRuntimeFactory {
   Objects.requireNonNull(runtimeCreator, "runtimeCreator")
   Objects.requireNonNull(scanConfigCreator, "scanConfigCreator")
@@ -47,7 +55,11 @@ final class NereusBrokerStorageRuntimeFactory(
       val scanConfig = Objects.requireNonNull(
         scanConfigCreator.apply(context),
         "Nereus ListOffsets scan-config creator returned null")
-      new NereusBrokerStorageRuntime(context, runtime, scanConfig)
+      new NereusBrokerStorageRuntime(
+        context,
+        runtime,
+        scanConfig,
+        recoveryLauncherCreator)
     } catch {
       case failure: Throwable =>
         try {
@@ -57,5 +69,58 @@ final class NereusBrokerStorageRuntimeFactory(
         }
         throw failure
     }
+  }
+}
+
+object NereusBrokerStorageRuntimeFactory {
+  /**
+   * Creates the production Object-WAL factory while keeping provider I/O behind BrokerStorageRuntime.start().
+   * Recovery remains fork-owned and is created only after the exact ReplicaManager is available.
+   */
+  def production(
+    recoveryLauncherCreator: Function[ReplicaManager, KafkaPartitionRecoveryLauncher]
+  ): NereusBrokerStorageRuntimeFactory = {
+    val recoveryCreator = Objects.requireNonNull(recoveryLauncherCreator, "recoveryLauncherCreator")
+    val mapper = new NereusKafkaRuntimeConfigurationMapper
+    val productCreator = new NereusKafkaProductRuntimeCreator
+    new NereusBrokerStorageRuntimeFactory(
+      context => deferredRuntime(context, productCreator),
+      context => mapper.listOffsets(context.config.nereusKafkaStorageConfig),
+      recoveryCreator)
+  }
+
+  private def deferredRuntime(
+    context: BrokerStorageRuntimeContext,
+    creator: NereusKafkaProductRuntimeCreator
+  ): NereusKafkaRuntime = {
+    val storage = context.config.nereusKafkaStorageConfig
+    val runtimeInstanceId = UUID.randomUUID().toString
+    val recoveryBridge = new NereusKafkaPartitionRecoveryLauncherBridge
+    new NereusKafkaDeferredRuntime(
+      () => context.brokerEpochSupplier(),
+      context.scheduler,
+      context.time,
+      storage.rollout().readinessTimeout(),
+      brokerEpoch => creator.create(
+        storage,
+        context.clusterId,
+        context.config.brokerId,
+        brokerEpoch,
+        runtimeInstanceId,
+        AppInfoParser.getVersion,
+        nereusBuild,
+        System.getProperty("java.version"),
+        context.scheduler,
+        context.time,
+        context.metadataCache,
+        context.config.logDirs.asScala.map(Path.of(_)).asJava,
+        recoveryBridge),
+      recoveryBridge)
+  }
+
+  private def nereusBuild: String = {
+    Option(classOf[NereusKafkaRuntime].getPackage.getImplementationVersion)
+      .filter(_.nonEmpty)
+      .getOrElse("development")
   }
 }
