@@ -249,7 +249,8 @@ class BrokerServer(
         kafkaScheduler,
         time,
         brokerTopicStats,
-        logDirFailureChannel)
+        logDirFailureChannel,
+        brokerStorageRuntime.unifiedLogFactory)
 
       lifecycleManager = new BrokerLifecycleManager(config,
         time,

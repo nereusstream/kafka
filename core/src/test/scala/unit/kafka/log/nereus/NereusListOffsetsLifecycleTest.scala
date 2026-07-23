@@ -245,6 +245,7 @@ class NereusListOffsetsLifecycleTest {
     when(partition.topicPartition).thenReturn(new org.apache.kafka.common.TopicPartition("events", 0))
     when(partition.isLeader).thenReturn(true)
     when(partition.getLeaderEpoch).thenAnswer(_ => leaderEpoch.get())
+    when(partition.localLogOrException).thenReturn(mock(classOf[NereusUnifiedLog]))
     doAnswer(invocation => {
       events += s"partition-begin-${invocation.getArgument[Int](0)}"
       null

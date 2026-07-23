@@ -20,6 +20,7 @@ package kafka.server.nereus;
 import kafka.cluster.Partition;
 import kafka.log.nereus.NereusKafkaRecoveredState;
 import kafka.log.nereus.NereusKafkaRecoveryStateCodec;
+import kafka.log.nereus.NereusUnifiedLog;
 import kafka.server.ReplicaManager;
 
 import org.apache.kafka.common.TopicPartition;
@@ -88,15 +89,29 @@ public final class NereusKafkaRecoveryStateFactory
             int leaderEpoch,
             NereusKafkaRecoveredState state
     ) {
+        NereusUnifiedLog log = null;
         try {
             if (!state.identity().equals(identity)
                     || state.leaderEpoch() != leaderEpoch
                     || !state.frozen()) {
                 throw invariant("Kafka recovery publisher received mismatched state");
             }
+            if (!(partition.localLogOrException() instanceof NereusUnifiedLog nereusLog)) {
+                throw invariant(
+                        "Kafka recovery target does not own a Nereus UnifiedLog");
+            }
+            log = nereusLog;
+            log.installRecoveredState(leaderEpoch, state);
             partition.installNereusRecoveredState(leaderEpoch, state);
             return CompletableFuture.completedFuture(null);
         } catch (Throwable failure) {
+            if (log != null) {
+                try {
+                    log.removeStorage(leaderEpoch, null);
+                } catch (Throwable cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
             return CompletableFuture.failedFuture(failure);
         }
     }

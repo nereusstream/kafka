@@ -17,6 +17,7 @@
 
 package kafka.server.storage
 
+import kafka.log.UnifiedLogFactory
 import kafka.server.ReplicaManager
 import kafka.server.metadata.AsyncTopicDeltaLifecycle
 
@@ -29,6 +30,9 @@ import java.util.concurrent.CompletionStage
  */
 trait BrokerStorageRuntime extends AutoCloseable {
   def start(): CompletionStage[Void]
+
+  /** Returns the per-broker log factory before LogManager construction. This method must be side-effect free. */
+  def unifiedLogFactory: UnifiedLogFactory
 
   /** Creates or returns the lifecycle bound to the exact ReplicaManager owned by this BrokerServer. */
   def asyncTopicDeltaLifecycle(replicaManager: ReplicaManager): Option[AsyncTopicDeltaLifecycle]

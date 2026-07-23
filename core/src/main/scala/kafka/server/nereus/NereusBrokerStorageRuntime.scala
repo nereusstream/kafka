@@ -21,7 +21,8 @@ import com.nereusstream.api.StorageProfile
 import com.nereusstream.kafka.partition.KafkaPartitionStorageManager
 import com.nereusstream.kafka.recovery.KafkaRecoveryStateFactory
 import com.nereusstream.kafka.runtime.{DrainReason, NereusKafkaRuntime}
-import kafka.log.nereus.{NereusListOffsetsLifecycle, NereusListOffsetsScanConfig, NereusTopicDeltaLifecycle}
+import kafka.log.UnifiedLogFactory
+import kafka.log.nereus.{NereusListOffsetsLifecycle, NereusListOffsetsScanConfig, NereusTopicDeltaLifecycle, NereusUnifiedLogFactory}
 import kafka.server.ReplicaManager
 import kafka.server.metadata.AsyncTopicDeltaLifecycle
 import kafka.server.storage.{BrokerStorageDrainReason, BrokerStorageRuntime, BrokerStorageRuntimeContext}
@@ -47,6 +48,7 @@ final class NereusBrokerStorageRuntime(
   private val storageManager: KafkaPartitionStorageManager = Objects.requireNonNull(
     delegate.partitionStorageManager(),
     "Nereus runtime partition manager")
+  private val logFactory = new NereusUnifiedLogFactory(context)
   private var metadataLifecycle: MetadataLifecycle = _
   private var draining = false
   private var closed = false
@@ -59,6 +61,8 @@ final class NereusBrokerStorageRuntime(
     }
     Objects.requireNonNull(delegate.start(), "Nereus runtime start future")
   }
+
+  override def unifiedLogFactory: UnifiedLogFactory = logFactory
 
   override def asyncTopicDeltaLifecycle(replicaManager: ReplicaManager): Option[AsyncTopicDeltaLifecycle] = {
     Objects.requireNonNull(replicaManager, "replicaManager")

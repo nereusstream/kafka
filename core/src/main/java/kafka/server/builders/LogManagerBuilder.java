@@ -18,6 +18,7 @@
 package kafka.server.builders;
 
 import kafka.log.LogManager;
+import kafka.log.UnifiedLogFactory;
 
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.metadata.ConfigRepository;
@@ -174,7 +175,8 @@ public class LogManagerBuilder {
                               time,
                               remoteStorageSystemEnable,
                               initialTaskDelayMs,
-                              LogCleaner::new
+                              LogCleaner::new,
+                              UnifiedLogFactory.Local()
                 );
     }
 }

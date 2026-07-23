@@ -41,7 +41,7 @@ import org.apache.kafka.metadata.properties.{MetaProperties, MetaPropertiesEnsem
 import java.util.{Collections, Optional, OptionalLong, Properties}
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 import org.apache.kafka.server.util.{FileLock, Scheduler}
-import org.apache.kafka.storage.internals.log.{CleanerConfig, LogCleaner, LogConfig, LogDirFailureChannel, LogManager => JLogManager, LogOffsetsListener, ProducerStateManagerConfig, RemoteIndexCache, UnifiedLog}
+import org.apache.kafka.storage.internals.log.{CleanerConfig, LogCleaner, LogConfig, LogDirFailureChannel, LogFileUtils, LogManager => JLogManager, LogOffsetsListener, ProducerStateManagerConfig, RemoteIndexCache, UnifiedLog}
 import org.apache.kafka.storage.internals.checkpoint.{CleanShutdownFileHandler, OffsetCheckpointFile}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -79,7 +79,8 @@ class LogManager(logDirs: Seq[File],
                  remoteStorageSystemEnable: Boolean,
                  val initialTaskDelayMs: Long,
                  cleanerFactory: (CleanerConfig, util.List[File], ConcurrentMap[TopicPartition, UnifiedLog], LogDirFailureChannel, Time) => LogCleaner =
-                  (cleanerConfig, files, map, logDirFailureChannel, time) => new LogCleaner(cleanerConfig, files, map, logDirFailureChannel, time)
+                  (cleanerConfig, files, map, logDirFailureChannel, time) => new LogCleaner(cleanerConfig, files, map, logDirFailureChannel, time),
+                 unifiedLogFactory: UnifiedLogFactory = UnifiedLogFactory.Local
                 ) extends Logging {
   // Changing the package or class name may cause incompatibility with existing code and metrics configuration
   private val metricsPackage = "kafka.log"
@@ -332,7 +333,7 @@ class LogManager(logDirs: Seq[File],
     val logRecoveryPoint = recoveryPoints.getOrDefault(topicPartition, 0L)
     val logStartOffset = logStartOffsets.getOrDefault(topicPartition, 0L)
 
-    val log = UnifiedLog.create(
+    val log = unifiedLogFactory.open(UnifiedLogOpenContext(
       logDir,
       config,
       logStartOffset,
@@ -348,7 +349,8 @@ class LogManager(logDirs: Seq[File],
       Optional.empty,
       numRemainingSegments,
       remoteStorageSystemEnable,
-      LogOffsetsListener.NO_OP_OFFSETS_LISTENER)
+      LogOffsetsListener.NO_OP_OFFSETS_LISTENER,
+      logDir.getName.endsWith(LogFileUtils.FUTURE_DIR_SUFFIX)))
 
     if (logDir.getName.endsWith(UnifiedLog.DELETE_DIR_SUFFIX)) {
       addLogToBeDeleted(log)
@@ -605,10 +607,12 @@ class LogManager(logDirs: Seq[File],
     defaultConfig: LogConfig,
     topicConfigOverrides: Map[String, LogConfig],
     isStray: UnifiedLog => Boolean): Unit = {
-    loadLogs(defaultConfig, topicConfigOverrides, isStray) // this could take a while if shutdown was not clean
+    if (unifiedLogFactory.loadExistingLogs) {
+      loadLogs(defaultConfig, topicConfigOverrides, isStray) // this could take a while if shutdown was not clean
+    }
 
     /* Schedule the cleanup task to delete old logs */
-    if (scheduler != null) {
+    if (scheduler != null && unifiedLogFactory.scheduleLocalMaintenance) {
       info("Starting log cleanup with a period of %d ms.".format(retentionCheckMs))
       scheduler.schedule("kafka-log-retention",
                          () => cleanupLogs(),
@@ -631,11 +635,13 @@ class LogManager(logDirs: Seq[File],
                          () => deleteLogs(),
                          initialTaskDelayMs)
     }
-    if (cleanerConfig.enableCleaner) {
-      _cleaner = cleanerFactory(cleanerConfig, liveLogDirs.asJava, currentLogs, logDirFailureChannel, time)
-      _cleaner.startup()
-    } else {
-      warn("The config `log.cleaner.enable` is deprecated and will be removed in Kafka 5.0. Starting from Kafka 5.0, the log cleaner will always be enabled, and this config will be ignored.")
+    if (unifiedLogFactory.scheduleLocalMaintenance) {
+      if (cleanerConfig.enableCleaner) {
+        _cleaner = cleanerFactory(cleanerConfig, liveLogDirs.asJava, currentLogs, logDirFailureChannel, time)
+        _cleaner.startup()
+      } else {
+        warn("The config `log.cleaner.enable` is deprecated and will be removed in Kafka 5.0. Starting from Kafka 5.0, the log cleaner will always be enabled, and this config will be ignored.")
+      }
 
     }
   }
@@ -674,7 +680,9 @@ class LogManager(logDirs: Seq[File],
       val jobsForDir = logs.map { log =>
         val runnable: Runnable = () => {
           // flush the log to ensure latest possible recovery point
-          log.flush(true)
+          if (unifiedLogFactory.scheduleLocalMaintenance) {
+            log.flush(true)
+          }
           log.close()
         }
         runnable
@@ -686,7 +694,8 @@ class LogManager(logDirs: Seq[File],
     try {
       jobs.foreachEntry { (dir, dirJobs) =>
         if (JLogManager.waitForAllToComplete(dirJobs.toList.asJava,
-          e => warn(s"There was an error in one of the threads during LogManager shutdown: ${e.getCause}"))) {
+          e => warn(s"There was an error in one of the threads during LogManager shutdown: ${e.getCause}")) &&
+          unifiedLogFactory.scheduleLocalMaintenance) {
           val logs = logsInDir(localLogsByDir, dir)
 
           // update the last flush point
@@ -795,6 +804,7 @@ class LogManager(logDirs: Seq[File],
    * to avoid recovering the whole log on startup.
    */
   def checkpointLogRecoveryOffsets(): Unit = {
+    if (!unifiedLogFactory.scheduleLocalMaintenance) return
     val logsByDirCached = logsByDir
     liveLogDirs.foreach { logDir =>
       val logsToCheckpoint = logsInDir(logsByDirCached, logDir)
@@ -807,6 +817,7 @@ class LogManager(logDirs: Seq[File],
    * to avoid exposing data that have been deleted by DeleteRecordsRequest
    */
   def checkpointLogStartOffsets(): Unit = {
+    if (!unifiedLogFactory.scheduleLocalMaintenance) return
     val logsByDirCached = logsByDir
     liveLogDirs.foreach { logDir =>
       checkpointLogStartOffsetsInDir(logDir, logsInDir(logsByDirCached, logDir))
@@ -820,6 +831,7 @@ class LogManager(logDirs: Seq[File],
    */
   // Only for testing
   private[log] def checkpointRecoveryOffsetsInDir(logDir: File): Unit = {
+    if (!unifiedLogFactory.scheduleLocalMaintenance) return
     checkpointRecoveryOffsetsInDir(logDir, logsInDir(logDir))
   }
 
@@ -830,6 +842,7 @@ class LogManager(logDirs: Seq[File],
    * @param logsToCheckpoint the logs to be checkpointed
    */
   private def checkpointRecoveryOffsetsInDir(logDir: File, logsToCheckpoint: Map[TopicPartition, UnifiedLog]): Unit = {
+    if (!unifiedLogFactory.scheduleLocalMaintenance) return
     try {
       recoveryPointCheckpoints.get(logDir).foreach { checkpoint =>
         val recoveryOffsets: Map[TopicPartition, JLong] = logsToCheckpoint.map { case (tp, log) => tp -> long2Long(log.recoveryPoint) }
@@ -853,6 +866,7 @@ class LogManager(logDirs: Seq[File],
    * @param logsToCheckpoint the logs to be checkpointed
    */
   private def checkpointLogStartOffsetsInDir(logDir: File, logsToCheckpoint: Map[TopicPartition, UnifiedLog]): Unit = {
+    if (!unifiedLogFactory.scheduleLocalMaintenance) return
     try {
       logStartOffsetCheckpoints.get(logDir).foreach { checkpoint =>
         val logStartOffsets: Map[TopicPartition, JLong] = logsToCheckpoint.collect {
@@ -1058,7 +1072,7 @@ class LogManager(logDirs: Seq[File],
           .get // If Failure, will throw
 
         val config = fetchLogConfig(topicPartition.topic)
-        val log = UnifiedLog.create(
+        val log = unifiedLogFactory.open(UnifiedLogOpenContext(
           logDir,
           config,
           0L,
@@ -1072,9 +1086,10 @@ class LogManager(logDirs: Seq[File],
           logDirFailureChannel,
           true,
           topicId,
-          new ConcurrentHashMap[String, Integer](),
+          UnifiedLogFactory.newSegmentCounter(),
           remoteStorageSystemEnable,
-          LogOffsetsListener.NO_OP_OFFSETS_LISTENER)
+          LogOffsetsListener.NO_OP_OFFSETS_LISTENER,
+          isFuture))
 
         if (isFuture)
           futureLogs.put(topicPartition, log)
@@ -1501,6 +1516,7 @@ class LogManager(logDirs: Seq[File],
   }
 
   def readBrokerEpochFromCleanShutdownFiles(): OptionalLong = {
+    if (!unifiedLogFactory.scheduleLocalMaintenance) return OptionalLong.empty()
     // Verify whether all the log dirs have the same broker epoch in their clean shutdown files. If there is any dir not
     // live, fail the broker epoch check.
     if (liveLogDirs.size < logDirs.size) {
@@ -1532,7 +1548,8 @@ object LogManager {
             kafkaScheduler: Scheduler,
             time: Time,
             brokerTopicStats: BrokerTopicStats,
-            logDirFailureChannel: LogDirFailureChannel): LogManager = {
+            logDirFailureChannel: LogDirFailureChannel,
+            unifiedLogFactory: UnifiedLogFactory = UnifiedLogFactory.Local): LogManager = {
     val defaultProps = config.extractLogConfigMap
 
     LogConfig.validateBrokerLogConfigValues(defaultProps, config.remoteLogManagerConfig.isRemoteStorageSystemEnabled)
@@ -1541,8 +1558,14 @@ object LogManager {
     val cleanerConfig = new CleanerConfig(config)
     val transactionLogConfig = new TransactionLogConfig(config)
 
-    new LogManager(logDirs = config.logDirs.asScala.map(new File(_).getAbsoluteFile),
-      initialOfflineDirs = initialOfflineDirs.map(new File(_).getAbsoluteFile),
+    val selectedLogDirectories = unifiedLogFactory.logDirectories(
+      config.logDirs.asScala.map(new File(_).getAbsoluteFile).toSeq)
+    val selectedInitialOfflineDirectories = unifiedLogFactory.initialOfflineDirectories(
+      initialOfflineDirs.map(new File(_).getAbsoluteFile),
+      selectedLogDirectories)
+
+    new LogManager(logDirs = selectedLogDirectories,
+      initialOfflineDirs = selectedInitialOfflineDirectories,
       configRepository = configRepository,
       initialDefaultConfig = defaultLogConfig,
       cleanerConfig = cleanerConfig,
@@ -1559,6 +1582,7 @@ object LogManager {
       logDirFailureChannel = logDirFailureChannel,
       time = time,
       remoteStorageSystemEnable = config.remoteLogManagerConfig.isRemoteStorageSystemEnabled,
-      initialTaskDelayMs = config.logInitialTaskDelayMs)
+      initialTaskDelayMs = config.logInitialTaskDelayMs,
+      unifiedLogFactory = unifiedLogFactory)
   }
 }

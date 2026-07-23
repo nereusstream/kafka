@@ -19,7 +19,7 @@ package kafka.server.nereus
 
 import com.nereusstream.kafka.partition.KafkaPartitionStorageManager
 import com.nereusstream.kafka.runtime.{DrainReason, NereusKafkaRuntime}
-import kafka.log.nereus.NereusListOffsetsScanConfig
+import kafka.log.nereus.{NereusListOffsetsScanConfig, NereusUnifiedLogFactory}
 import kafka.server.{KafkaConfig, ReplicaManager}
 import kafka.server.storage.{BrokerStorageDrainReason, BrokerStorageRuntimeContext}
 import kafka.utils.TestUtils
@@ -76,6 +76,7 @@ class NereusBrokerStorageRuntimeTest {
 
     val enabled = factory.create(context(KafkaConfig.fromProps(enabledProperties(), false)))
     assertTrue(enabled.isInstanceOf[NereusBrokerStorageRuntime])
+    assertTrue(enabled.unifiedLogFactory.isInstanceOf[NereusUnifiedLogFactory])
     assertTrue(runtimeCreations.get() == 1)
     assertTrue(scanConfigCreations.get() == 1)
 

@@ -219,6 +219,7 @@ final class NereusListOffsetsLifecycle(
       if (failure.nonEmpty) {
         if (current.contains(attempt)) {
           attempt.partition.cancelLeaderEpochAwareOffsetLookup(attempt.request.leaderEpoch())
+          clearLogPublication(attempt, Option(storage))
           slots.remove(attempt.request.identity())
         }
         if (storage == null) {
@@ -229,6 +230,7 @@ final class NereusListOffsetsLifecycle(
       } else if (storage == null) {
         if (current.contains(attempt)) {
           attempt.partition.cancelLeaderEpochAwareOffsetLookup(attempt.request.leaderEpoch())
+          clearLogPublication(attempt, None)
           slots.remove(attempt.request.identity())
         }
         attempt.result.fail(invariant("Nereus partition manager completed with null storage"))
@@ -237,14 +239,20 @@ final class NereusListOffsetsLifecycle(
       } else {
         try {
           validateStorage(attempt.request, storage)
+          val log = attempt.partition.localLogOrException match {
+            case nereusLog: NereusUnifiedLog => nereusLog
+            case _ => throw invariant("Nereus lifecycle target does not own a Nereus UnifiedLog")
+          }
+          log.installStorage(attempt.request.leaderEpoch(), storage)
           val resolver = new KafkaListOffsetsResolver(storage, inspector)
           val lookup = new NereusListOffsetsBridge(resolver, scanConfig)
           attempt.partition.installLeaderEpochAwareOffsetLookup(attempt.request.leaderEpoch(), lookup)
-          attempt.installation = Some(new Installation(storage, lookup))
+          attempt.installation = Some(new Installation(storage, lookup, log))
           attempt.result.succeed(storage)
         } catch {
           case installFailure: Throwable =>
             attempt.partition.cancelLeaderEpochAwareOffsetLookup(attempt.request.leaderEpoch())
+            clearLogPublication(attempt, Some(storage))
             slots.remove(attempt.request.identity())
             cleanup = Some(installFailure)
         }
@@ -281,13 +289,30 @@ final class NereusListOffsetsLifecycle(
   private def removeLookup(slot: Slot): Unit = {
     slot.installation match {
       case Some(installation) =>
+        installation.log.removeStorage(slot.request.leaderEpoch(), installation.storage)
         slot.partition.removeLeaderEpochAwareOffsetLookup(
           slot.request.leaderEpoch(),
           installation.lookup)
       case None =>
+        clearLogPublication(slot, None)
         slot.partition.cancelLeaderEpochAwareOffsetLookup(slot.request.leaderEpoch())
     }
     slot.installation = None
+  }
+
+  private def clearLogPublication(
+    slot: Slot,
+    expectedStorage: Option[KafkaPartitionStorage]
+  ): Unit = {
+    try {
+      slot.partition.localLogOrException match {
+        case log: NereusUnifiedLog =>
+          log.removeStorage(slot.request.leaderEpoch(), expectedStorage.orNull)
+        case _ =>
+      }
+    } catch {
+      case _: NotLeaderOrFollowerException =>
+    }
   }
 
   private def requireOpenIdentity(
@@ -380,7 +405,8 @@ final class NereusListOffsetsLifecycle(
 
   private final class Installation(
     val storage: KafkaPartitionStorage,
-    val lookup: LeaderEpochAwareOffsetLookup
+    val lookup: LeaderEpochAwareOffsetLookup,
+    val log: NereusUnifiedLog
   )
 
   private final class LifecycleOpenResult extends CompletableFuture[KafkaPartitionStorage] {

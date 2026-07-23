@@ -19,6 +19,7 @@ package kafka.server.nereus;
 
 import kafka.cluster.Partition;
 import kafka.log.nereus.NereusKafkaRecoveredState;
+import kafka.log.nereus.NereusUnifiedLog;
 import kafka.server.ReplicaManager;
 
 import org.apache.kafka.common.TopicPartition;
@@ -59,7 +60,7 @@ class NereusKafkaRecoveryStateFactoryTest {
                     "events");
 
     @Test
-    void createsFreshStateAndPublishesOnlyToTheExactLeaderPartition() {
+    void createsFreshStateAndPublishesOnlyToTheExactLeaderPartition() throws Exception {
         ReplicaManager replicaManager = Mockito.mock(ReplicaManager.class);
         Partition partition = Mockito.mock(Partition.class);
         TopicPartition topicPartition = new TopicPartition("events", 0);
@@ -70,6 +71,8 @@ class NereusKafkaRecoveryStateFactoryTest {
         when(partition.topicId()).thenReturn(Option.apply(TOPIC_ID));
         when(partition.isLeader()).thenReturn(true);
         when(partition.getLeaderEpoch()).thenReturn(7);
+        NereusUnifiedLog log = Mockito.mock(NereusUnifiedLog.class);
+        when(partition.localLogOrException()).thenReturn(log);
         KafkaCheckpointSourceState source = source(7);
         KafkaPartitionRecoveryRequest request = request(source);
         NereusKafkaRecoveryStateFactory factory =
@@ -90,6 +93,7 @@ class NereusKafkaRecoveryStateFactoryTest {
 
         recovery.publisher().publish(recovered).join();
 
+        verify(log).installRecoveredState(7, state);
         verify(partition).installNereusRecoveredState(7, state);
         assertSame(IDENTITY, state.identity());
     }

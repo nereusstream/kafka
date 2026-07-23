@@ -17,6 +17,7 @@
 
 package kafka.server.storage
 
+import kafka.log.UnifiedLogFactory
 import kafka.server.ReplicaManager
 import kafka.server.metadata.AsyncTopicDeltaLifecycle
 
@@ -46,6 +47,8 @@ object BrokerStorageRuntimeFactory {
     private val completed = CompletableFuture.completedFuture[Void](null)
 
     override def start(): CompletionStage[Void] = completed
+
+    override def unifiedLogFactory: UnifiedLogFactory = UnifiedLogFactory.Local
 
     override def asyncTopicDeltaLifecycle(replicaManager: ReplicaManager): Option[AsyncTopicDeltaLifecycle] = {
       require(replicaManager != null, "replicaManager must be non-null")
