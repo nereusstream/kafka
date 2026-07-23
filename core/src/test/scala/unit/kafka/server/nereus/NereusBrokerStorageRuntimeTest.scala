@@ -34,17 +34,18 @@ import org.apache.kafka.server.config.{NereusKafkaConfigs, ReplicationConfigs, S
 import org.apache.kafka.server.util.KafkaScheduler
 import org.apache.kafka.storage.internals.log.CleanerConfig
 import org.junit.jupiter.api.Assertions.{assertFalse, assertSame, assertThrows, assertTrue}
-import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.{AfterEach, Test}
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.{mock, never, times, verify, when}
 
 import java.time.Duration
 import java.util.Properties
-import java.util.concurrent.CompletableFuture
+import java.util.concurrent.{CompletableFuture, Executors}
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.function.Function
 
 class NereusBrokerStorageRuntimeTest {
+  private val deadlineScheduler = Executors.newSingleThreadScheduledExecutor()
   private val scanConfig = new NereusListOffsetsScanConfig(
     100,
     1024 * 1024,
@@ -52,6 +53,9 @@ class NereusBrokerStorageRuntimeTest {
     1024 * 1024,
     10,
     Duration.ofSeconds(5))
+
+  @AfterEach
+  def closeDeadlineScheduler(): Unit = deadlineScheduler.shutdownNow()
 
   @Test
   def testFactoryCreatesOnlyForEnabledModeAndRequiresExactTypedProducts(): Unit = {
@@ -70,6 +74,7 @@ class NereusBrokerStorageRuntimeTest {
 
     val disabled = factory.create(context(KafkaConfig.fromProps(TestUtils.createBrokerConfig(0), false)))
     assertTrue(disabled.asyncTopicDeltaLifecycle(mock(classOf[ReplicaManager])).isEmpty)
+    assertTrue(disabled.fetchExecutor.isEmpty)
     assertTrue(disabled.start().toCompletableFuture.isDone)
     assertTrue(runtimeCreations.get() == 0)
     assertTrue(scanConfigCreations.get() == 0)
@@ -78,6 +83,7 @@ class NereusBrokerStorageRuntimeTest {
     assertTrue(enabled.isInstanceOf[NereusBrokerStorageRuntime])
     assertTrue(enabled.unifiedLogFactory.isInstanceOf[NereusUnifiedLogFactory])
     assertTrue(enabled.appendExecutor.nonEmpty)
+    assertTrue(enabled.fetchExecutor.nonEmpty)
     assertTrue(runtimeCreations.get() == 1)
     assertTrue(scanConfigCreations.get() == 1)
 
@@ -182,14 +188,18 @@ class NereusBrokerStorageRuntimeTest {
     runtime
   }
 
-  private def context(config: KafkaConfig): BrokerStorageRuntimeContext = BrokerStorageRuntimeContext(
-    config,
-    "cluster-id",
-    () => 9L,
-    mock(classOf[KRaftMetadataCache]),
-    Time.SYSTEM,
-    mock(classOf[Metrics]),
-    mock(classOf[KafkaScheduler]))
+  private def context(config: KafkaConfig): BrokerStorageRuntimeContext = {
+    val scheduler = mock(classOf[KafkaScheduler])
+    when(scheduler.scheduledExecutorService()).thenReturn(deadlineScheduler)
+    BrokerStorageRuntimeContext(
+      config,
+      "cluster-id",
+      () => 9L,
+      mock(classOf[KRaftMetadataCache]),
+      Time.SYSTEM,
+      mock(classOf[Metrics]),
+      scheduler)
+  }
 
   private def enabledProperties(): Properties = {
     val properties = TestUtils.createBrokerConfig(0)

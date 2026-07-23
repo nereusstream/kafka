@@ -392,7 +392,8 @@ class BrokerServer(
         addPartitionsToTxnManager = Some(addPartitionsToTxnManager),
         directoryEventHandler = directoryEventHandler,
         defaultActionQueue = defaultActionQueue,
-        storageAppendExecutor = brokerStorageRuntime.appendExecutor
+        storageAppendExecutor = brokerStorageRuntime.appendExecutor,
+        storageFetchExecutor = brokerStorageRuntime.fetchExecutor
       )
 
       /* start token manager */

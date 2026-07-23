@@ -26,7 +26,7 @@ import org.apache.kafka.server.log.remote.quota.RLMQuotaMetrics
 import kafka.server.QuotaFactory.{QuotaManagers, UNBOUNDED_QUOTA}
 import kafka.server.epoch.util.MockBlockingSender
 import kafka.server.share.{DelayedShareFetch, SharePartition}
-import kafka.server.storage.BrokerStorageAppendExecutor
+import kafka.server.storage.{BrokerStorageAppendExecutor, BrokerStorageFetchExecutor}
 import kafka.utils.TestUtils.waitUntilTrue
 import kafka.utils.TestUtils
 import org.apache.kafka.clients.FetchSessionHandler
@@ -61,6 +61,7 @@ import org.apache.kafka.metadata.{LeaderRecoveryState, MetadataCache, PartitionR
 import org.apache.kafka.metadata.properties.{MetaProperties, MetaPropertiesEnsemble, MetaPropertiesVersion, PropertiesUtils}
 import org.apache.kafka.raft.KRaftConfigs
 import org.apache.kafka.server.common.{DirectoryEventHandler, KRaftVersion, MetadataVersion, OffsetAndEpoch, RequestLocal, StopPartition, TransactionVersion}
+import org.apache.kafka.server.ActionQueue
 import org.apache.kafka.server.config.{ReplicationConfigs, ServerLogConfigs}
 import org.apache.kafka.server.log.remote.TopicPartitionLog
 import org.apache.kafka.server.log.remote.storage._
@@ -343,6 +344,84 @@ class ReplicaManagerTest {
       val partitionResponse = response.get(5, TimeUnit.SECONDS)(partition)
       assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, partitionResponse.error)
       assertTrue(validationStatsCalled.get())
+    } finally {
+      rm.shutdown(checkpointHW = false)
+    }
+  }
+
+  @Test
+  def testStorageFetchExecutorOwnsStockReadWaveAndDefersResponse(): Unit = {
+    val mockLogMgr = TestUtils.createLogManager(config.logDirs.asScala.map(new File(_)))
+    val submittedRead =
+      new AtomicReference[Boolean => Seq[(TopicIdPartition, LogReadResult)]]
+    val submitted = new CompletableFuture[Seq[(TopicIdPartition, LogReadResult)]]
+    val fetchExecutor = new BrokerStorageFetchExecutor {
+      override def submit(
+        params: FetchParams,
+        fetchInfos: Seq[(TopicIdPartition, PartitionData)],
+        read: Boolean => Seq[(TopicIdPartition, LogReadResult)]
+      ): CompletionStage[Seq[(TopicIdPartition, LogReadResult)]] = {
+        assertEquals(2, fetchInfos.size)
+        assertTrue(submittedRead.compareAndSet(null, read))
+        submitted
+      }
+
+      override def drained: CompletionStage[Void] = CompletableFuture.completedFuture(null)
+
+      override def close(): Unit = {}
+    }
+    val actionQueue = mock(classOf[ActionQueue])
+    val rm = new ReplicaManager(
+      metrics = metrics,
+      config = config,
+      time = time,
+      scheduler = new MockScheduler(time),
+      logManager = mockLogMgr,
+      quotaManagers = quotaManager,
+      metadataCache = new KRaftMetadataCache(config.brokerId, () => KRaftVersion.KRAFT_VERSION_0),
+      logDirFailureChannel = new LogDirFailureChannel(config.logDirs.size),
+      alterPartitionManager = alterPartitionManager,
+      defaultActionQueue = actionQueue,
+      storageFetchExecutor = Some(fetchExecutor))
+    try {
+      val partition = new TopicIdPartition(topicId, topicPartition)
+      val secondPartition = new TopicIdPartition(
+        Uuid.randomUuid(),
+        new TopicPartition("second-topic", 1))
+      val response = new CompletableFuture[Seq[(TopicIdPartition, FetchPartitionData)]]
+      fetchPartitions(
+        rm,
+        FetchRequest.ORDINARY_CONSUMER_ID,
+        Seq(
+          partition -> new PartitionData(
+            topicId,
+            0L,
+            0L,
+            1024,
+            Optional.empty(),
+            Optional.empty()),
+          secondPartition -> new PartitionData(
+            secondPartition.topicId,
+            0L,
+            0L,
+            1024,
+            Optional.empty(),
+            Optional.empty())),
+        response.complete,
+        maxWaitMs = 1000,
+        minBytes = 1)
+
+      assertFalse(response.isDone)
+      assertNotNull(submittedRead.get())
+
+      submitted.complete(submittedRead.get().apply(true))
+      verify(actionQueue).tryCompleteActions()
+
+      val exactResponse = response.get(5, TimeUnit.SECONDS)
+      assertEquals(Seq(partition, secondPartition), exactResponse.map(_._1))
+      val partitionResponses = exactResponse.toMap
+      assertTrue(partitionResponses.values.forall(
+        _.error == Errors.UNKNOWN_TOPIC_OR_PARTITION))
     } finally {
       rm.shutdown(checkpointHW = false)
     }

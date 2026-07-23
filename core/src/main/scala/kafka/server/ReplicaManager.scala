@@ -23,7 +23,7 @@ import kafka.server.HostedPartition.Online
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.ReplicaManager.{AtMinIsrPartitionCountMetricName, FailedIsrUpdatesPerSecMetricName, IsrExpandsPerSecMetricName, IsrShrinksPerSecMetricName, LeaderCountMetricName, OfflineReplicaCountMetricName, PartitionCountMetricName, PartitionsWithLateTransactionsCountMetricName, ProducerIdCountMetricName, ReassigningPartitionsMetricName, UnderMinIsrPartitionCountMetricName, UnderReplicatedPartitionsMetricName, createLogReadResult, isListOffsetsTimestampUnsupported}
 import kafka.server.share.DelayedShareFetch
-import kafka.server.storage.BrokerStorageAppendExecutor
+import kafka.server.storage.{BrokerStorageAppendExecutor, BrokerStorageFetchExecutor}
 import kafka.utils._
 import org.apache.kafka.common.{IsolationLevel, Node, TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.common.errors._
@@ -220,7 +220,8 @@ class ReplicaManager(val config: KafkaConfig,
                      addPartitionsToTxnManager: Option[AddPartitionsToTxnManager] = None,
                      val directoryEventHandler: DirectoryEventHandler = DirectoryEventHandler.NOOP,
                      val defaultActionQueue: ActionQueue = new DelayedActionQueue,
-                     val storageAppendExecutor: Option[BrokerStorageAppendExecutor] = None
+                     val storageAppendExecutor: Option[BrokerStorageAppendExecutor] = None,
+                     val storageFetchExecutor: Option[BrokerStorageFetchExecutor] = None
                      ) extends Logging {
   // Changing the package or class name may cause incompatibility with existing code and metrics configuration
   private val metricsPackage = "kafka.server"
@@ -1816,6 +1817,126 @@ class ReplicaManager(val config: KafkaConfig,
                     fetchInfos: Seq[(TopicIdPartition, PartitionData)],
                     quota: ReplicaQuota,
                     responseCallback: Seq[(TopicIdPartition, FetchPartitionData)] => Unit): Unit = {
+    storageFetchExecutor match {
+      case None =>
+        fetchMessagesUsingStockPurgatory(params, fetchInfos, quota, responseCallback)
+      case Some(executor) =>
+        fetchMessagesUsingStorageExecutor(executor, params, fetchInfos, quota, responseCallback)
+    }
+  }
+
+  private def fetchMessagesUsingStorageExecutor(
+    executor: BrokerStorageFetchExecutor,
+    params: FetchParams,
+    fetchInfos: Seq[(TopicIdPartition, PartitionData)],
+    quota: ReplicaQuota,
+    responseCallback: Seq[(TopicIdPartition, FetchPartitionData)] => Unit
+  ): Unit = {
+    val submitted = try {
+      executor.submit(
+        params,
+        fetchInfos,
+        initialWave => try {
+          readFromLog(
+            params,
+            fetchInfos,
+            quota,
+            readFromPurgatory = !initialWave)
+        } finally {
+          // The KafkaApis request-thread epilogue has already returned before this storage wave runs.
+          defaultActionQueue.tryCompleteActions()
+        })
+    } catch {
+      case failure: Throwable =>
+        completeStorageFetch(
+          params,
+          fetchInfos,
+          responseCallback,
+          failedStorageFetch(fetchInfos, failure))
+        return
+    }
+    submitted.whenComplete { (results, failure) =>
+      val exactResults =
+        if (failure == null) results
+        else failedStorageFetch(fetchInfos, failure)
+      completeStorageFetch(params, fetchInfos, responseCallback, exactResults)
+    }
+  }
+
+  private def completeStorageFetch(
+    params: FetchParams,
+    fetchInfos: Seq[(TopicIdPartition, PartitionData)],
+    responseCallback: Seq[(TopicIdPartition, FetchPartitionData)] => Unit,
+    suppliedResults: Seq[(TopicIdPartition, LogReadResult)]
+  ): Unit = {
+    val logReadResults =
+      if (suppliedResults != null &&
+        suppliedResults.size == fetchInfos.size &&
+        suppliedResults.iterator.zip(fetchInfos.iterator)
+          .forall { case ((actual, _), (expected, _)) => actual == expected }) {
+        suppliedResults
+      } else {
+        failedStorageFetch(
+          fetchInfos,
+          new KafkaStorageException(
+            "storage Fetch executor changed request partition order or cardinality"))
+      }
+    val remoteFetchInfos = new util.LinkedHashMap[TopicIdPartition, RemoteStorageFetchInfo]()
+    val logReadResultMap = new util.LinkedHashMap[TopicIdPartition, LogReadResult]()
+    logReadResults.foreach { case (topicIdPartition, logReadResult) =>
+      brokerTopicStats.topicStats(topicIdPartition.topicPartition.topic).totalFetchRequestRate.mark()
+      brokerTopicStats.allTopicsStats.totalFetchRequestRate.mark()
+      if (logReadResult.info.delayedRemoteStorageFetch.isPresent) {
+        remoteFetchInfos.put(topicIdPartition, logReadResult.info.delayedRemoteStorageFetch.get())
+      }
+      logReadResultMap.put(topicIdPartition, logReadResult)
+    }
+
+    if (remoteFetchInfos.isEmpty) {
+      responseCallback(logReadResults.map { case (tp, result) =>
+        val isReassignmentFetch = params.isFromFollower &&
+          isAddingReplica(tp.topicPartition, params.replicaId)
+        tp -> result.toFetchPartitionData(isReassignmentFetch)
+      })
+    } else {
+      val fetchPartitionStatus = new util.LinkedHashMap[TopicIdPartition, FetchPartitionStatus]
+      fetchInfos.foreach { case (topicIdPartition, partitionData) =>
+        val logReadResult = logReadResultMap.get(topicIdPartition)
+        if (logReadResult != null) {
+          fetchPartitionStatus.put(
+            topicIdPartition,
+            new FetchPartitionStatus(logReadResult.info.fetchOffsetMetadata, partitionData))
+        }
+      }
+      processRemoteFetches(
+        remoteFetchInfos,
+        params,
+        responseCallback,
+        logReadResultMap,
+        fetchPartitionStatus)
+    }
+  }
+
+  private def failedStorageFetch(
+    fetchInfos: Seq[(TopicIdPartition, PartitionData)],
+    suppliedFailure: Throwable
+  ): Seq[(TopicIdPartition, LogReadResult)] = {
+    var failure = suppliedFailure
+    while ((failure.isInstanceOf[CompletionException] || failure.isInstanceOf[ExecutionException]) &&
+      failure.getCause != null) {
+      failure = failure.getCause
+    }
+    fetchInfos.map { case (partition, _) =>
+      partition -> new LogReadResult(Errors.forException(failure))
+    }
+  }
+
+  private def fetchMessagesUsingStockPurgatory(
+    params: FetchParams,
+    fetchInfos: Seq[(TopicIdPartition, PartitionData)],
+    quota: ReplicaQuota,
+    responseCallback: Seq[(TopicIdPartition, FetchPartitionData)] => Unit
+  ): Unit = {
 
     // check if this fetch request can be satisfied right away
     val logReadResults = readFromLog(params, fetchInfos, quota, readFromPurgatory = false)

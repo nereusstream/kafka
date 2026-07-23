@@ -37,6 +37,9 @@ trait BrokerStorageRuntime extends AutoCloseable {
   /** Returns the optional request-path append handoff owned by this runtime. */
   def appendExecutor: Option[BrokerStorageAppendExecutor]
 
+  /** Returns the optional whole-request Fetch handoff owned by this runtime. */
+  def fetchExecutor: Option[BrokerStorageFetchExecutor]
+
   /** Creates or returns the lifecycle bound to the exact ReplicaManager owned by this BrokerServer. */
   def asyncTopicDeltaLifecycle(replicaManager: ReplicaManager): Option[AsyncTopicDeltaLifecycle]
 
