@@ -1141,6 +1141,9 @@ project(':core') {
     // Nereus inject start: exact product-owned adapter boundary
     if (nereusDevelopmentEnabled) {
       implementation "com.nereusstream:nereus-kafka-adapter:${nereusDevelopmentVersion.get()}"
+      implementation "com.nereusstream:nereus-core:${nereusDevelopmentVersion.get()}"
+      implementation "com.nereusstream:nereus-metadata-oxia:${nereusDevelopmentVersion.get()}"
+      implementation "com.nereusstream:nereus-object-store:${nereusDevelopmentVersion.get()}"
     }
     // Nereus inject end: exact product-owned adapter boundary
 
