@@ -158,6 +158,8 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 brokerIdentity,
                 operationEpoch,
                 operationTtl,
+                exact.lifecycle().recoveryChunkRecords(),
+                Math.toIntExact(exact.lifecycle().recoveryChunkBytes()),
                 executableProfiles);
 
         int maxInFlightAppends = addExact(

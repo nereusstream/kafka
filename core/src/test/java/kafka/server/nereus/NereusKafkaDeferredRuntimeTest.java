@@ -205,7 +205,7 @@ class NereusKafkaDeferredRuntimeTest {
                 Time.SYSTEM,
                 Duration.ofSeconds(5),
                 creator,
-                new NereusKafkaPartitionRecoveryLauncherBridge());
+                new NereusKafkaRecoveryStateFactoryBridge());
     }
 
     private static NereusKafkaRuntime readyRuntime(

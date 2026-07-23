@@ -52,6 +52,12 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                 mapped.runtime().runtime().writerId());
         assertEquals(1, mapped.runtime().runtime().operationOwnerEpoch());
         assertEquals(
+                100_000,
+                mapped.runtime().runtime().recoveryChunkRecords());
+        assertEquals(
+                256 * 1024 * 1024,
+                mapped.runtime().runtime().recoveryChunkBytes());
+        assertEquals(
                 java.util.Set.of(StorageProfile.OBJECT_WAL_SYNC_OBJECT),
                 mapped.runtime().runtime().executableProfiles());
         assertFalse(mapped.runtime().streamStorage().autoAcquireAppendSession());

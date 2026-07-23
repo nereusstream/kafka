@@ -19,32 +19,31 @@ package kafka.server.nereus;
 
 import com.nereusstream.api.ErrorCode;
 import com.nereusstream.api.NereusException;
-import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher;
 import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryRequest;
-import com.nereusstream.kafka.recovery.KafkaRecoveredPartition;
+import com.nereusstream.kafka.recovery.KafkaRecoveryState;
+import com.nereusstream.kafka.recovery.KafkaRecoveryStateFactory;
 
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * One-time bridge between pre-ReplicaManager provider construction and fork-owned Kafka state recovery.
+ * One-time bridge between pre-ReplicaManager provider construction and fork-owned fresh Kafka state.
  */
-public final class NereusKafkaPartitionRecoveryLauncherBridge
-        implements KafkaPartitionRecoveryLauncher {
-    private final AtomicReference<KafkaPartitionRecoveryLauncher> delegate =
+public final class NereusKafkaRecoveryStateFactoryBridge
+        implements KafkaRecoveryStateFactory {
+    private final AtomicReference<KafkaRecoveryStateFactory> delegate =
             new AtomicReference<>();
 
-    public void bind(KafkaPartitionRecoveryLauncher supplied) {
-        KafkaPartitionRecoveryLauncher exact =
-                Objects.requireNonNull(supplied, "recoveryLauncher");
-        KafkaPartitionRecoveryLauncher current = delegate.get();
+    public void bind(KafkaRecoveryStateFactory supplied) {
+        KafkaRecoveryStateFactory exact =
+                Objects.requireNonNull(supplied, "recoveryStateFactory");
+        KafkaRecoveryStateFactory current = delegate.get();
         if (current == exact) {
             return;
         }
         if (!delegate.compareAndSet(null, exact)) {
             throw new IllegalStateException(
-                    "Nereus Kafka recovery launcher is already bound");
+                    "Nereus Kafka recovery state factory is already bound");
         }
     }
 
@@ -53,18 +52,18 @@ public final class NereusKafkaPartitionRecoveryLauncherBridge
     }
 
     @Override
-    public CompletableFuture<? extends KafkaRecoveredPartition<?>> recover(
+    public KafkaRecoveryState<?> create(
             KafkaPartitionRecoveryRequest request
     ) {
         Objects.requireNonNull(request, "request");
-        KafkaPartitionRecoveryLauncher current = delegate.get();
+        KafkaRecoveryStateFactory current = delegate.get();
         if (current == null) {
-            return CompletableFuture.failedFuture(new NereusException(
+            throw new NereusException(
                     ErrorCode.METADATA_UNAVAILABLE,
                     true,
-                    "Kafka partition recovery launcher is not bound to ReplicaManager"));
+                    "Kafka recovery state factory is not bound to ReplicaManager");
         }
         return Objects.requireNonNull(
-                current.recover(request), "Kafka recovery launcher returned null");
+                current.create(request), "Kafka recovery state factory returned null");
     }
 }

@@ -155,7 +155,7 @@ class NereusBrokerStorageRuntimeTest {
     val recoveryCreations = new AtomicInteger
     val factory = NereusBrokerStorageRuntimeFactory.production(_ => {
       recoveryCreations.incrementAndGet()
-      mock(classOf[com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher])
+      mock(classOf[com.nereusstream.kafka.recovery.KafkaRecoveryStateFactory])
     })
     val runtime = factory.create(context(KafkaConfig.fromProps(enabledProperties(), false)))
     val replicaManager = mock(classOf[ReplicaManager])

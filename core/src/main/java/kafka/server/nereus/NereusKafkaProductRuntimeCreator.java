@@ -22,7 +22,7 @@ import org.apache.kafka.metadata.KRaftMetadataCache;
 import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 import org.apache.kafka.server.util.KafkaScheduler;
 
-import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher;
+import com.nereusstream.kafka.recovery.KafkaRecoveryStateFactory;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalActivationContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeFactory;
@@ -65,7 +65,7 @@ public final class NereusKafkaProductRuntimeCreator {
             Time time,
             KRaftMetadataCache metadataCache,
             List<Path> logDirectories,
-            KafkaPartitionRecoveryLauncher recoveryLauncher
+            KafkaRecoveryStateFactory recoveryStateFactory
     ) {
         NereusKafkaMappedRuntimeConfiguration mapped = mapper.map(
                 storage,
@@ -90,7 +90,7 @@ public final class NereusKafkaProductRuntimeCreator {
                         Objects.requireNonNull(
                                 scheduler, "scheduler").scheduledExecutorService(),
                         Objects.requireNonNull(
-                                recoveryLauncher, "recoveryLauncher"),
+                                recoveryStateFactory, "recoveryStateFactory"),
                         clock,
                         () -> CompletableFuture.completedFuture(null));
         NereusKafkaObjectWalActivationContext activation =

@@ -58,7 +58,10 @@
   <subpackage name="log">
     <subpackage name="nereus">
       <allow pkg="com.nereusstream.api" />
+      <allow pkg="com.nereusstream.kafka.checkpoint" />
       <allow pkg="com.nereusstream.kafka.partition" />
+      <allow pkg="com.nereusstream.kafka.recovery" />
+      <allow pkg="com.nereusstream.objectstore.kafka.checkpoint" />
       <allow pkg="org.apache.kafka.common.compress" />
       <allow pkg="org.apache.kafka.common.errors" />
       <allow pkg="org.apache.kafka.common.protocol" />
@@ -85,6 +88,7 @@
       <allow pkg="com.nereusstream.api" />
       <allow pkg="com.nereusstream.core" />
       <allow pkg="com.nereusstream.kafka.activation" />
+      <allow pkg="com.nereusstream.kafka.checkpoint" />
       <allow pkg="com.nereusstream.kafka.partition" />
       <allow pkg="com.nereusstream.kafka.recovery" />
       <allow pkg="com.nereusstream.kafka.runtime" />

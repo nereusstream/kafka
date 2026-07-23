@@ -233,6 +233,7 @@ class NereusTopicDeltaLifecycleTest {
 
     assertThrows(classOf[CompletionException], () => applied.join())
     assertTrue(ready.isEmpty)
+    verify(partition).cancelLeaderEpochAwareOffsetLookup(5)
   }
 
   @Test

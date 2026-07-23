@@ -19,48 +19,46 @@ package kafka.server.nereus;
 
 import com.nereusstream.api.NereusException;
 import com.nereusstream.kafka.recovery.KafkaCheckpointRecoveryRequest;
-import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher;
 import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryRequest;
+import com.nereusstream.kafka.recovery.KafkaRecoveryState;
+import com.nereusstream.kafka.recovery.KafkaRecoveryStateFactory;
 
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class NereusKafkaPartitionRecoveryLauncherBridgeTest {
+class NereusKafkaRecoveryStateFactoryBridgeTest {
     @Test
     void failsRetriablyBeforeBinding() {
-        NereusKafkaPartitionRecoveryLauncherBridge bridge =
-                new NereusKafkaPartitionRecoveryLauncherBridge();
+        NereusKafkaRecoveryStateFactoryBridge bridge =
+                new NereusKafkaRecoveryStateFactoryBridge();
 
-        CompletionException failure = assertThrows(
-                CompletionException.class,
-                () -> bridge.recover(request()).join());
+        NereusException failure = assertThrows(
+                NereusException.class,
+                () -> bridge.create(request()));
 
         assertFalse(bridge.bound());
-        assertTrue(failure.getCause() instanceof NereusException);
-        assertTrue(((NereusException) failure.getCause()).retriable());
+        assertTrue(failure.retriable());
     }
 
     @Test
-    void bindsExactlyOneLauncherAndPreservesReturnedFuture() {
-        NereusKafkaPartitionRecoveryLauncherBridge bridge =
-                new NereusKafkaPartitionRecoveryLauncherBridge();
-        CompletableFuture<com.nereusstream.kafka.recovery.KafkaRecoveredPartition<?>>
-                expected = new CompletableFuture<>();
-        KafkaPartitionRecoveryLauncher launcher = ignored -> expected;
+    void bindsExactlyOneFactoryAndPreservesReturnedState() {
+        NereusKafkaRecoveryStateFactoryBridge bridge =
+                new NereusKafkaRecoveryStateFactoryBridge();
+        KafkaRecoveryState<?> expected =
+                org.mockito.Mockito.mock(KafkaRecoveryState.class);
+        KafkaRecoveryStateFactory factory = ignored -> expected;
 
-        bridge.bind(launcher);
-        bridge.bind(launcher);
+        bridge.bind(factory);
+        bridge.bind(factory);
 
         assertTrue(bridge.bound());
-        assertSame(expected, bridge.recover(request()));
+        assertSame(expected, bridge.create(request()));
         assertThrows(
                 IllegalStateException.class,
                 () -> bridge.bind(ignored -> expected));

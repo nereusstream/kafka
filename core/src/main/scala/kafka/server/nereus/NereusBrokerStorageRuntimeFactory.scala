@@ -18,7 +18,7 @@
 package kafka.server.nereus
 
 import com.nereusstream.kafka.runtime.NereusKafkaRuntime
-import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher
+import com.nereusstream.kafka.recovery.KafkaRecoveryStateFactory
 import kafka.log.nereus.NereusListOffsetsScanConfig
 import kafka.server.ReplicaManager
 import kafka.server.storage.{BrokerStorageRuntime, BrokerStorageRuntimeContext, BrokerStorageRuntimeFactory}
@@ -38,7 +38,7 @@ import scala.jdk.CollectionConverters._
 final class NereusBrokerStorageRuntimeFactory(
   runtimeCreator: Function[BrokerStorageRuntimeContext, NereusKafkaRuntime],
   scanConfigCreator: Function[BrokerStorageRuntimeContext, NereusListOffsetsScanConfig],
-  recoveryLauncherCreator: Function[ReplicaManager, KafkaPartitionRecoveryLauncher] = null
+  recoveryStateFactoryCreator: Function[ReplicaManager, KafkaRecoveryStateFactory] = null
 ) extends BrokerStorageRuntimeFactory {
   Objects.requireNonNull(runtimeCreator, "runtimeCreator")
   Objects.requireNonNull(scanConfigCreator, "scanConfigCreator")
@@ -59,7 +59,7 @@ final class NereusBrokerStorageRuntimeFactory(
         context,
         runtime,
         scanConfig,
-        recoveryLauncherCreator)
+        recoveryStateFactoryCreator)
     } catch {
       case failure: Throwable =>
         try {
@@ -73,14 +73,18 @@ final class NereusBrokerStorageRuntimeFactory(
 }
 
 object NereusBrokerStorageRuntimeFactory {
+  /** Production composition with the concrete fork-owned stock RecordBatch recovery state factory. */
+  def production(): NereusBrokerStorageRuntimeFactory =
+    production(replicaManager => new NereusKafkaRecoveryStateFactory(replicaManager))
+
   /**
    * Creates the production Object-WAL factory while keeping provider I/O behind BrokerStorageRuntime.start().
-   * Recovery remains fork-owned and is created only after the exact ReplicaManager is available.
+   * Fresh Kafka recovery state remains fork-owned and is created only after the exact ReplicaManager is available.
    */
   def production(
-    recoveryLauncherCreator: Function[ReplicaManager, KafkaPartitionRecoveryLauncher]
+    recoveryStateFactoryCreator: Function[ReplicaManager, KafkaRecoveryStateFactory]
   ): NereusBrokerStorageRuntimeFactory = {
-    val recoveryCreator = Objects.requireNonNull(recoveryLauncherCreator, "recoveryLauncherCreator")
+    val recoveryCreator = Objects.requireNonNull(recoveryStateFactoryCreator, "recoveryStateFactoryCreator")
     val mapper = new NereusKafkaRuntimeConfigurationMapper
     val productCreator = new NereusKafkaProductRuntimeCreator
     new NereusBrokerStorageRuntimeFactory(
@@ -95,7 +99,7 @@ object NereusBrokerStorageRuntimeFactory {
   ): NereusKafkaRuntime = {
     val storage = context.config.nereusKafkaStorageConfig
     val runtimeInstanceId = UUID.randomUUID().toString
-    val recoveryBridge = new NereusKafkaPartitionRecoveryLauncherBridge
+    val recoveryBridge = new NereusKafkaRecoveryStateFactoryBridge
     new NereusKafkaDeferredRuntime(
       () => context.brokerEpochSupplier(),
       context.scheduler,

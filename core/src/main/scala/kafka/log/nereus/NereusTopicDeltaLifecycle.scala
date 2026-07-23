@@ -149,7 +149,13 @@ final class NereusTopicDeltaLifecycle(
             operationTimeout)
           val opened = partitionLifecycle.openLeader(partition, request)
           if (changes.electedLeaders().containsKey(topicPartition)) {
-            opened.thenRun(() => onLeaderReady(topicPartition, info.partition().leaderEpoch))
+            opened
+              .thenRun(() => onLeaderReady(topicPartition, info.partition().leaderEpoch))
+              .whenComplete((_, failure) => {
+                if (failure != null) {
+                  partition.cancelLeaderEpochAwareOffsetLookup(info.partition().leaderEpoch)
+                }
+              })
           } else {
             opened.thenRun(() => ())
           }

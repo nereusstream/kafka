@@ -26,7 +26,7 @@ import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.partition.KafkaPartitionLeaderOpenRequest;
 import com.nereusstream.kafka.partition.KafkaPartitionStorage;
 import com.nereusstream.kafka.partition.KafkaPartitionStorageManager;
-import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryLauncher;
+import com.nereusstream.kafka.recovery.KafkaRecoveryStateFactory;
 import com.nereusstream.kafka.runtime.DrainReason;
 import com.nereusstream.kafka.runtime.KafkaStorageAdmission;
 import com.nereusstream.kafka.runtime.KafkaStorageHealth;
@@ -57,7 +57,7 @@ public final class NereusKafkaDeferredRuntime implements NereusKafkaRuntime {
     private final Time time;
     private final Duration brokerEpochWaitTimeout;
     private final LongFunction<NereusKafkaRuntime> runtimeCreator;
-    private final NereusKafkaPartitionRecoveryLauncherBridge recoveryBridge;
+    private final NereusKafkaRecoveryStateFactoryBridge recoveryBridge;
     private final KafkaStorageAdmission admission = new KafkaStorageAdmission();
     private final CompletableFuture<NereusKafkaRuntime> readyRuntime =
             new CompletableFuture<>();
@@ -77,7 +77,7 @@ public final class NereusKafkaDeferredRuntime implements NereusKafkaRuntime {
             Time time,
             Duration brokerEpochWaitTimeout,
             LongFunction<NereusKafkaRuntime> runtimeCreator,
-            NereusKafkaPartitionRecoveryLauncherBridge recoveryBridge
+            NereusKafkaRecoveryStateFactoryBridge recoveryBridge
     ) {
         this.brokerEpochSupplier = Objects.requireNonNull(
                 brokerEpochSupplier, "brokerEpochSupplier");
@@ -91,8 +91,8 @@ public final class NereusKafkaDeferredRuntime implements NereusKafkaRuntime {
                 recoveryBridge, "recoveryBridge");
     }
 
-    public void bindRecoveryLauncher(KafkaPartitionRecoveryLauncher launcher) {
-        recoveryBridge.bind(launcher);
+    public void bindRecoveryStateFactory(KafkaRecoveryStateFactory stateFactory) {
+        recoveryBridge.bind(stateFactory);
     }
 
     @Override

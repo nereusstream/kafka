@@ -21,6 +21,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.Optional
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
 import kafka.log._
+import kafka.log.nereus.NereusKafkaRecoveredState
 import kafka.server._
 import kafka.server.share.DelayedShareFetch
 import kafka.utils.CoreUtils.{inReadLock, inWriteLock}
@@ -192,6 +193,7 @@ class Partition(val topicPartition: TopicPartition,
   // Nereus inject start: leader-epoch-fenced asynchronous ListOffsets lookup
   private var leaderEpochAwareOffsetLookup: Option[(Int, LeaderEpochAwareOffsetLookup)] = None
   private var leaderEpochAwareOffsetLookupPending: Option[Int] = None
+  private var nereusRecoveredState: Option[(Int, NereusKafkaRecoveredState)] = None
   // Nereus inject end: leader-epoch-fenced asynchronous ListOffsets lookup
   // Replica ID of the leader, defined when this broker is leader or follower for the partition.
   @volatile var leaderReplicaIdOpt: Option[Int] = None
@@ -579,6 +581,7 @@ class Partition(val topicPartition: TopicPartition,
     // Nereus inject start: clear storage lookup with partition state
     leaderEpochAwareOffsetLookup = None
     leaderEpochAwareOffsetLookupPending = None
+    nereusRecoveredState = None
     // Nereus inject end: clear storage lookup with partition state
     Partition.removeMetrics(topicPartition)
   }
@@ -643,6 +646,7 @@ class Partition(val topicPartition: TopicPartition,
         // Nereus inject start: never retain a lookup across leader epochs
         leaderEpochAwareOffsetLookup = None
         leaderEpochAwareOffsetLookupPending = None
+        nereusRecoveredState = None
         // Nereus inject end: never retain a lookup across leader epochs
         val leaderEpochStartOffset = leaderLog.logEndOffset
         stateChangeLogger.info(s"Leader $topicPartition with topic id $topicId starts at " +
@@ -725,6 +729,7 @@ class Partition(val topicPartition: TopicPartition,
       // Nereus inject start: follower transitions revoke leader-only storage lookup
       leaderEpochAwareOffsetLookup = None
       leaderEpochAwareOffsetLookupPending = None
+      nereusRecoveredState = None
       // Nereus inject end: follower transitions revoke leader-only storage lookup
       partitionEpoch = partitionRegistration.partitionEpoch
 
@@ -1465,6 +1470,38 @@ class Partition(val topicPartition: TopicPartition,
     }
     leaderEpochAwareOffsetLookup = None
     leaderEpochAwareOffsetLookupPending = Some(expectedLeaderEpoch)
+    nereusRecoveredState = None
+  }
+
+  def installNereusRecoveredState(expectedLeaderEpoch: Int,
+                                  state: NereusKafkaRecoveredState): Unit = inWriteLock(leaderIsrUpdateLock) {
+    java.util.Objects.requireNonNull(state, "state")
+    if (!isLeader) {
+      throw new NotLeaderOrFollowerException(
+        s"Cannot install recovered Nereus state for non-leader partition $topicPartition")
+    }
+    if (leaderEpoch != expectedLeaderEpoch || state.leaderEpoch != expectedLeaderEpoch) {
+      throw new FencedLeaderEpochException(
+        s"Cannot install recovered Nereus state for partition $topicPartition at stale leader epoch " +
+          s"$expectedLeaderEpoch; current leader epoch is $leaderEpoch")
+    }
+    if (state.identity.observedTopicName != topic
+      || state.identity.partition != partitionId
+      || !topicId.exists(_.toString == state.identity.topicId)
+      || !state.frozen) {
+      throw new KafkaStorageException(
+        s"Recovered Nereus state does not match the exact Kafka partition $topicPartition")
+    }
+    nereusRecoveredState = Some(expectedLeaderEpoch -> state)
+  }
+
+  def currentNereusRecoveredState(expectedLeaderEpoch: Int): Optional[NereusKafkaRecoveredState] = {
+    inReadLock(leaderIsrUpdateLock) {
+      nereusRecoveredState
+        .filter(_._1 == expectedLeaderEpoch)
+        .map(_._2)
+        .toJava
+    }
   }
 
   def installLeaderEpochAwareOffsetLookup(expectedLeaderEpoch: Int,
@@ -1484,6 +1521,9 @@ class Partition(val topicPartition: TopicPartition,
   def cancelLeaderEpochAwareOffsetLookup(expectedLeaderEpoch: Int): Unit = inWriteLock(leaderIsrUpdateLock) {
     if (leaderEpochAwareOffsetLookupPending.contains(expectedLeaderEpoch)) {
       leaderEpochAwareOffsetLookupPending = None
+    }
+    if (nereusRecoveredState.exists(_._1 == expectedLeaderEpoch)) {
+      nereusRecoveredState = None
     }
   }
 
