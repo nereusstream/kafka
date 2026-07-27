@@ -63,7 +63,10 @@ class DynamicConfigPublisher(
                   // Apply changes to a topic's dynamic configuration.
                   info(s"Updating topic ${resource.name()} with new configuration : " +
                     toLoggableProps(resource, props).mkString(","))
-                  topicConfigHandler.processConfigChanges(resource.name(), props)
+                  topicConfigHandler.processConfigChangesAtMetadataOffset(
+                    resource.name(),
+                    props,
+                    newImage.highestOffsetAndEpoch().offset)
                 } catch {
                   case t: Throwable => faultHandler.handleFault("Error updating topic " +
                     s"${resource.name()} with new configuration: ${toLoggableProps(resource, props).mkString(",")} " +

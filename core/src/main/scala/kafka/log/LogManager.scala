@@ -22,6 +22,7 @@ import java.io.{File, IOException}
 import java.nio.file.{Files, NoSuchFileException}
 import java.util.concurrent._
 import java.util.concurrent.atomic.AtomicInteger
+import kafka.log.nereus.NereusUnifiedLog
 import kafka.server.{KafkaConfig, KafkaRaftServer}
 import kafka.utils.threadsafe
 import kafka.utils.{CoreUtils, Logging}
@@ -987,7 +988,19 @@ class LogManager(logDirs: Seq[File],
   def updateTopicConfig(topic: String,
                         newTopicConfig: Properties,
                         isRemoteLogStorageSystemEnabled: Boolean,
-                        wasRemoteLogEnabled: Boolean): Unit = {
+                        wasRemoteLogEnabled: Boolean): Unit =
+    updateTopicConfig(
+      topic,
+      newTopicConfig,
+      isRemoteLogStorageSystemEnabled,
+      wasRemoteLogEnabled,
+      None)
+
+  def updateTopicConfig(topic: String,
+                        newTopicConfig: Properties,
+                        isRemoteLogStorageSystemEnabled: Boolean,
+                        wasRemoteLogEnabled: Boolean,
+                        metadataOffset: Option[Long]): Unit = {
     topicConfigUpdated(topic)
     val logs = logsByTopic(topic)
     val newLogConfig = LogConfig.fromProps(currentDefaultConfig.originals, newTopicConfig)
@@ -1000,7 +1013,12 @@ class LogManager(logDirs: Seq[File],
     LogConfig.validateRetentionConfigsWhenRemoteCopyDisabled(newLogConfig.values(), isRemoteLogStorageEnabled)
     if (logs.nonEmpty) {
       logs.foreach { log =>
-        val oldLogConfig = log.updateConfig(newLogConfig)
+        val oldLogConfig = (log, metadataOffset) match {
+          case (nereusLog: NereusUnifiedLog, Some(offset)) =>
+            nereusLog.updateConfigAtMetadataOffset(newLogConfig, offset)
+          case _ =>
+            log.updateConfig(newLogConfig)
+        }
         if (oldLogConfig.compact && !newLogConfig.compact) {
           abortCleaning(log.topicPartition)
         }

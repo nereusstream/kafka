@@ -24,23 +24,23 @@ import org.apache.kafka.common.record.FileRecords;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
+import org.apache.kafka.common.requests.ListOffsetsRequest;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.common.RequestLocal;
 import org.apache.kafka.server.storage.log.FetchIsolation;
 import org.apache.kafka.server.util.Scheduler;
 import org.apache.kafka.storage.internals.log.AppendOrigin;
 import org.apache.kafka.storage.internals.log.AbortedTxn;
+import org.apache.kafka.storage.internals.log.AsyncOffsetReader;
 import org.apache.kafka.storage.internals.log.FetchDataInfo;
-import org.apache.kafka.storage.internals.log.LazyIndex;
 import org.apache.kafka.storage.internals.log.LogAppendInfo;
 import org.apache.kafka.storage.internals.log.LogConfig;
 import org.apache.kafka.storage.internals.log.LogDirFailureChannel;
-import org.apache.kafka.storage.internals.log.LogFileUtils;
 import org.apache.kafka.storage.internals.log.LogOffsetMetadata;
 import org.apache.kafka.storage.internals.log.LogOffsetsListener;
-import org.apache.kafka.storage.internals.log.LogSegment;
 import org.apache.kafka.storage.internals.log.LogSegments;
 import org.apache.kafka.storage.internals.log.LogStartOffsetIncrementReason;
+import org.apache.kafka.storage.internals.log.OffsetResultHolder;
 import org.apache.kafka.storage.internals.log.ProducerStateManagerConfig;
 import org.apache.kafka.storage.internals.log.RequiredAcksAwareAppend;
 import org.apache.kafka.storage.internals.log.UnifiedLog;
@@ -93,14 +93,14 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private final Duration fetchTimeout;
     private final int hardMaxFetchBytes;
     private final NereusProducerStateManager producerStateManager;
+    private final NereusLocalLog nereusLocalLog;
+    private final NereusCanonicalLogState canonicalState;
+    private final Time time;
     private final ThreadLocal<AppendInvocation> appendInvocation = new ThreadLocal<>();
 
     private NereusKafkaRecoveredState recoveredState;
     private KafkaPartitionStorage storage;
-    private long canonicalSegmentBaseOffset;
-    private long canonicalLogicalBytes;
-    private long canonicalLargestTimestamp = RecordBatch.NO_TIMESTAMP;
-    private long canonicalMaxTimestampOffset = -1;
+    private long latestConfigMetadataOffset = -1;
 
     private NereusUnifiedLog(
             Parts parts,
@@ -131,6 +131,9 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         }
         this.hardMaxFetchBytes = hardMaxFetchBytes;
         this.producerStateManager = parts.producerStateManager;
+        this.nereusLocalLog = parts.localLog;
+        this.canonicalState = parts.canonicalState;
+        this.time = parts.localLog.time();
         parts.localLog.bindStableAppend(this::appendStable);
     }
 
@@ -165,7 +168,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                         time,
                         maxTransactionTimeoutMs,
                         producerStateManagerConfig,
-                        logDirFailureChannel),
+                        logDirFailureChannel,
+                        identity),
                 brokerTopicStats,
                 producerIdExpirationCheckIntervalMs,
                 Optional.of(topicId),
@@ -200,6 +204,16 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                                 range.leaderEpoch(),
                                 range.startOffset()));
                 super.updateHighWatermark(state.stableEndOffset());
+                canonicalState.restore(
+                        state.logStartOffset(),
+                        state.stableEndOffset(),
+                        state.checkpointState(),
+                        state.committedTail(),
+                        config(),
+                        Math.max(0, latestConfigMetadataOffset),
+                        time.milliseconds());
+                nereusLocalLog.installCanonicalSegments(
+                        canonicalState.segmentBaseOffsets(state.stableEndOffset()));
                 recoveredState = state;
             }
         }
@@ -244,12 +258,6 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             if (storage != null && storage != candidate) {
                 throw fenced("A different Nereus storage instance is already published");
             }
-            canonicalSegmentBaseOffset = recoveredState.logStartOffset();
-            canonicalLogicalBytes = recoveredState.logicalBytes();
-            canonicalLargestTimestamp =
-                    recoveredState.largestTimestamp().orElse(RecordBatch.NO_TIMESTAMP);
-            canonicalMaxTimestampOffset =
-                    recoveredState.maxTimestampOffset().orElse(-1);
             storage = candidate;
         }
     }
@@ -280,6 +288,47 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
 
     public KafkaPartitionIdentity nereusIdentity() {
         return identity;
+    }
+
+    @Override
+    public LogConfig updateConfig(LogConfig newConfig) {
+        synchronized (nereusGuard) {
+            if (recoveredState == null
+                    || canonicalState.matchesCurrentConfig(newConfig)) {
+                return super.updateConfig(newConfig);
+            }
+            long metadataOffset = canonicalState.nextSyntheticMetadataOffset();
+            return updateConfigLocked(newConfig, metadataOffset);
+        }
+    }
+
+    public LogConfig updateConfigAtMetadataOffset(
+            LogConfig newConfig,
+            long metadataOffset
+    ) {
+        if (metadataOffset < 0) {
+            throw new IllegalArgumentException(
+                    "Kafka config metadata offset must be non-negative");
+        }
+        synchronized (nereusGuard) {
+            if (latestConfigMetadataOffset >= 0
+                    && metadataOffset < latestConfigMetadataOffset) {
+                throw invariant("Kafka config metadata offset regressed");
+            }
+            return updateConfigLocked(newConfig, metadataOffset);
+        }
+    }
+
+    private LogConfig updateConfigLocked(
+            LogConfig newConfig,
+            long metadataOffset
+    ) {
+        Objects.requireNonNull(newConfig, "newConfig");
+        if (recoveredState != null) {
+            canonicalState.updateConfig(newConfig, metadataOffset);
+        }
+        latestConfigMetadataOffset = metadataOffset;
+        return super.updateConfig(newConfig);
     }
 
     @Override
@@ -481,6 +530,17 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 throw fenced(
                         "Nereus DeleteRecords completion belongs to a stale leader");
             }
+            canonicalState.advanceLogStart(durableOffset);
+            try {
+                nereusLocalLog.installCanonicalSegments(
+                        canonicalState.segmentBaseOffsets(
+                                expectedStorage.stableSnapshot().stableEndOffset()));
+            } catch (IOException failure) {
+                fenceUnknownAppend(expectedStorage);
+                throw new KafkaStorageException(
+                        "Failed to rebuild Nereus virtual segment shells after durable trim",
+                        failure);
+            }
             super.maybeIncrementLogStartOffset(
                     durableOffset,
                     LogStartOffsetIncrementReason.ClientRecordDeletion);
@@ -554,43 +614,10 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             throw invariant(
                     "Nereus maintenance capture does not match the exact stable source");
         }
-        KafkaVirtualSegmentState.LogConfigHistoryEntry config = canonicalConfig(
-                config(), canonicalSegmentBaseOffset);
-        List<KafkaVirtualSegmentState.VirtualSegment> segments;
-        List<KafkaDerivedIndexState.SegmentTimeIndex> timeIndexes;
-        List<KafkaDerivedIndexState.SegmentLogicalByteIndex> logicalIndexes;
-        if (canonicalLogicalBytes == 0
-                && canonicalSegmentBaseOffset == source.endOffset()) {
-            segments = List.of();
-            timeIndexes = List.of();
-            logicalIndexes = List.of();
-        } else {
-            if (canonicalLargestTimestamp < 0
-                    || canonicalMaxTimestampOffset < canonicalSegmentBaseOffset
-                    || canonicalMaxTimestampOffset >= source.endOffset()) {
-                throw invariant(
-                        "Nereus maintenance cannot publish an incomplete timestamp image");
-            }
-            segments = List.of(new KafkaVirtualSegmentState.VirtualSegment(
-                    canonicalSegmentBaseOffset,
-                    source.endOffset(),
-                    0,
-                    0,
-                    0,
-                    0,
-                    canonicalLargestTimestamp,
-                    canonicalMaxTimestampOffset,
-                    canonicalLogicalBytes,
-                    0,
-                    canonicalLogicalBytes,
-                    config.configDigest(),
-                    KafkaVirtualSegmentState.RollReason.INITIAL,
-                    KafkaVirtualSegmentState.SegmentState.ACTIVE));
-            timeIndexes = List.of(new KafkaDerivedIndexState.SegmentTimeIndex(
-                    canonicalSegmentBaseOffset, List.of()));
-            logicalIndexes = List.of(new KafkaDerivedIndexState.SegmentLogicalByteIndex(
-                    canonicalSegmentBaseOffset, canonicalLogicalBytes, List.of()));
-        }
+        KafkaVirtualSegmentState virtualSegments = canonicalState.virtualSegments();
+        KafkaDerivedIndexState derivedIndexes = canonicalState.derivedIndexes();
+        virtualSegments.requireBounds(source.trimOffset(), source.endOffset());
+        derivedIndexes.requireBounds(source.trimOffset(), source.endOffset());
         return new KafkaCanonicalCheckpointState(
                 source.endOffset(),
                 source.trimOffset(),
@@ -600,16 +627,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                         source.trimOffset(),
                         source.endOffset(),
                         canonicalLeaderEpochs(source.trimOffset())),
-                new KafkaVirtualSegmentState(
-                        source.trimOffset(),
-                        source.endOffset(),
-                        segments,
-                        List.of(config)),
-                new KafkaDerivedIndexState(
-                        source.trimOffset(),
-                        source.endOffset(),
-                        timeIndexes,
-                        logicalIndexes));
+                virtualSegments,
+                derivedIndexes);
     }
 
     private List<KafkaLeaderEpochState.LeaderEpochRange> canonicalLeaderEpochs(
@@ -629,58 +648,126 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 .toList();
     }
 
-    private static KafkaVirtualSegmentState.LogConfigHistoryEntry canonicalConfig(
-            LogConfig config,
-            long effectiveFromOffset
-    ) {
-        int cleanupPolicyFlags = (config.delete
-                ? KafkaVirtualSegmentState.LogConfigHistoryEntry.CLEANUP_DELETE_FLAG
-                : 0)
-                | (config.compact
-                        ? KafkaVirtualSegmentState.LogConfigHistoryEntry.CLEANUP_COMPACT_FLAG
-                        : 0);
-        if (cleanupPolicyFlags == 0) {
-            throw invariant("Nereus Kafka log has no supported cleanup policy");
-        }
-        return KafkaVirtualSegmentState.LogConfigHistoryEntry.create(
-                0,
-                effectiveFromOffset,
-                config.segmentSize(),
-                config.segmentMs,
-                config.segmentJitterMs,
-                config.maxIndexSize,
-                config.indexInterval,
-                config.retentionSize,
-                config.retentionMs,
-                config.fileDeleteDelayMs,
-                config.deleteRetentionMs,
-                config.compactionLagMs,
-                config.maxCompactionLagMs,
-                config.minCleanableRatio,
-                cleanupPolicyFlags);
-    }
-
     private void observeCommittedAppend(AppendInvocation invocation) {
-        canonicalLogicalBytes = addExact(
-                canonicalLogicalBytes,
-                invocation.logicalBytes,
-                "Nereus canonical logical-byte count overflow");
-        if (invocation.largestTimestamp != RecordBatch.NO_TIMESTAMP
-                && (canonicalLargestTimestamp == RecordBatch.NO_TIMESTAMP
-                        || invocation.largestTimestamp > canonicalLargestTimestamp
-                        || (invocation.largestTimestamp == canonicalLargestTimestamp
-                                && invocation.maxTimestampOffset
-                                        < canonicalMaxTimestampOffset))) {
-            canonicalLargestTimestamp = invocation.largestTimestamp;
-            canonicalMaxTimestampOffset = invocation.maxTimestampOffset;
+        canonicalState.commitStable(invocation.batches, time.milliseconds());
+        nereusLocalLog.updateLogEndOffset(logEndOffset());
+    }
+
+    @Override
+    public OffsetResultHolder fetchOffsetByTimestamp(
+            long targetTimestamp,
+            Optional<AsyncOffsetReader> remoteOffsetReader
+    ) {
+        Objects.requireNonNull(remoteOffsetReader, "remoteOffsetReader");
+        if (targetTimestamp == ListOffsetsRequest.EARLIEST_TIMESTAMP
+                || targetTimestamp == ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP) {
+            return timestampResult(RecordBatch.NO_TIMESTAMP, logStartOffset());
+        }
+        if (targetTimestamp == ListOffsetsRequest.LATEST_TIMESTAMP) {
+            return timestampResult(RecordBatch.NO_TIMESTAMP, logEndOffset());
+        }
+        if (targetTimestamp == ListOffsetsRequest.LATEST_TIERED_TIMESTAMP
+                || targetTimestamp == ListOffsetsRequest.EARLIEST_PENDING_UPLOAD_TIMESTAMP) {
+            return timestampResult(RecordBatch.NO_TIMESTAMP, -1);
+        }
+        if (targetTimestamp == ListOffsetsRequest.MAX_TIMESTAMP) {
+            synchronized (nereusGuard) {
+                requireReadable();
+                return new OffsetResultHolder(
+                        canonicalState.maxTimestampPosition()
+                                .map(position -> new FileRecords.TimestampAndOffset(
+                                        position.timestamp(),
+                                        position.offset(),
+                                        Optional.empty())));
+            }
+        }
+        if (targetTimestamp < 0) {
+            return new OffsetResultHolder(Optional.empty());
+        }
+        return new OffsetResultHolder(scanOffsetByTimestamp(targetTimestamp));
+    }
+
+    private Optional<FileRecords.TimestampAndOffset> scanOffsetByTimestamp(
+            long targetTimestamp
+    ) {
+        long nextOffset;
+        long maximumOffset;
+        synchronized (nereusGuard) {
+            requireReadable();
+            nextOffset = canonicalState.timestampScanCandidate(targetTimestamp);
+            maximumOffset = storage.stableSnapshot().stableEndOffset();
+        }
+        long scannedBytes = 0;
+        long scanLimit = Math.max(
+                (long) hardMaxFetchBytes,
+                64L * 1024 * 1024);
+        while (nextOffset < maximumOffset) {
+            FetchDataInfo page = read(
+                    nextOffset,
+                    hardMaxFetchBytes,
+                    FetchIsolation.LOG_END,
+                    true);
+            MemoryRecords records = (MemoryRecords) page.records;
+            if (records.sizeInBytes() == 0) {
+                throw NereusKafkaExceptionMapper.map(invariant(
+                        "Nereus timestamp scan made no progress before stable end"));
+            }
+            for (RecordBatch batch : records.batches()) {
+                for (Record record : batch) {
+                    if (record.timestamp() >= targetTimestamp) {
+                        Optional<Integer> epoch =
+                                batch.partitionLeaderEpoch() < 0
+                                        ? Optional.empty()
+                                        : Optional.of(batch.partitionLeaderEpoch());
+                        return Optional.of(new FileRecords.TimestampAndOffset(
+                                record.timestamp(), record.offset(), epoch));
+                    }
+                }
+                nextOffset = Math.addExact(batch.lastOffset(), 1);
+            }
+            scannedBytes = Math.addExact(scannedBytes, records.sizeInBytes());
+            if (scannedBytes > scanLimit && nextOffset < maximumOffset) {
+                throw NereusKafkaExceptionMapper.map(new NereusException(
+                        ErrorCode.READ_LIMIT_TOO_SMALL,
+                        true,
+                        "Nereus timestamp lookup exceeded the bounded scan budget"));
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static OffsetResultHolder timestampResult(
+            long timestamp,
+            long offset
+    ) {
+        return new OffsetResultHolder(new FileRecords.TimestampAndOffset(
+                timestamp, offset, Optional.empty()));
+    }
+
+    @Override
+    public LogOffsetMetadata maybeConvertToOffsetMetadata(long offset) {
+        synchronized (nereusGuard) {
+            if (storage == null
+                    || recoveredState == null
+                    || offset < logStartOffset()
+                    || offset > logEndOffset()) {
+                return new LogOffsetMetadata(offset);
+            }
+            NereusCanonicalLogState.Position position =
+                    canonicalState.positionForOffset(offset);
+            return new LogOffsetMetadata(
+                    offset,
+                    position.segmentBaseOffset(),
+                    Math.toIntExact(position.relativeLogicalBytes()));
         }
     }
 
-    private static long addExact(long left, long right, String message) {
-        try {
-            return Math.addExact(left, right);
-        } catch (ArithmeticException failure) {
-            throw invariant(message);
+    private void requireReadable() {
+        if (storage == null
+                || recoveredState == null
+                || storage.state() != KafkaPartitionState.LEADER_WRITABLE) {
+            throw new KafkaStorageException(
+                    "Nereus partition storage is not recovered and published");
         }
     }
 
@@ -728,6 +815,11 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                             : Optional.empty());
         }
 
+        NereusCanonicalLogState.Position requestedPosition;
+        synchronized (nereusGuard) {
+            requireSamePublishedStorage(exactStorage);
+            requestedPosition = canonicalState.positionForOffset(startOffset);
+        }
         KafkaStorageReadRequest request = new KafkaStorageReadRequest(
                 startOffset,
                 maxOffsetExclusive,
@@ -735,8 +827,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 maxLength,
                 hardMaxFetchBytes,
                 minOneMessage,
-                0,
-                0,
+                requestedPosition.segmentBaseOffset(),
+                requestedPosition.relativeLogicalBytes(),
                 fetchTimeout);
         KafkaStorageReadResult result = awaitRead(exactStorage, request);
         com.nereusstream.kafka.codec.KafkaFetchAssembly assembly = result.fetchAssembly();
@@ -751,10 +843,15 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                         assembly.nextLogicalOffset(),
                         assembly.sizeInBytes());
         long actualFirstOffset = assembly.actualFirstBatchBaseOffset().orElse(startOffset);
-        int relativePosition = Math.toIntExact(assembly.relativeLogicalBytePosition());
+        NereusCanonicalLogState.Position actualPosition;
+        synchronized (nereusGuard) {
+            requireSamePublishedStorage(exactStorage);
+            actualPosition = canonicalState.positionForOffset(actualFirstOffset);
+        }
+        int relativePosition = Math.toIntExact(actualPosition.relativeLogicalBytes());
         LogOffsetMetadata fetchOffset = new LogOffsetMetadata(
                 actualFirstOffset,
-                assembly.virtualSegmentBaseOffset(),
+                actualPosition.segmentBaseOffset(),
                 relativePosition);
         return new FetchDataInfo(
                 fetchOffset, records, false, abortedTransactions);
@@ -991,32 +1088,20 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             Time time,
             int maxTransactionTimeoutMs,
             ProducerStateManagerConfig producerStateManagerConfig,
-            LogDirFailureChannel logDirFailureChannel
+            LogDirFailureChannel logDirFailureChannel,
+            KafkaPartitionIdentity identity
     ) throws IOException {
         Files.createDirectories(dir.toPath());
         TopicPartition topicPartition = UnifiedLog.parseTopicPartitionName(dir);
         LogSegments segments = new LogSegments(topicPartition);
+        NereusCanonicalLogState canonicalState = new NereusCanonicalLogState(
+                identity.durableId().canonicalIdentity());
         NereusTransactionIndex transactionIndex = new NereusTransactionIndex(
-                0L, LogFileUtils.transactionIndexFile(dir, 0L));
-        LogSegment segment = new LogSegment(
-                FileRecords.open(
-                        LogFileUtils.logFile(dir, 0L),
-                        false,
-                        config.initFileSize(),
-                        config.preallocate),
-                LazyIndex.forOffset(
-                        LogFileUtils.offsetIndexFile(dir, 0L),
-                        0L,
-                        config.maxIndexSize),
-                LazyIndex.forTime(
-                        LogFileUtils.timeIndexFile(dir, 0L),
-                        0L,
-                        config.maxIndexSize),
-                transactionIndex,
                 0L,
-                config.indexInterval,
-                config.randomSegmentJitter(),
-                time);
+                org.apache.kafka.storage.internals.log.LogFileUtils
+                        .transactionIndexFile(dir, 0L));
+        NereusLogSegment segment = NereusLogSegment.open(
+                dir, 0L, config, time, transactionIndex, canonicalState);
         segments.add(segment);
         NereusLocalLog localLog = new NereusLocalLog(
                 dir,
@@ -1028,7 +1113,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 time,
                 topicPartition,
                 logDirFailureChannel,
-                transactionIndex);
+                transactionIndex,
+                canonicalState);
         org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache leaderEpochCache =
                 UnifiedLog.createLeaderEpochCache(
                 dir,
@@ -1044,7 +1130,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 producerStateManagerConfig,
                 time,
                 transactionIndex);
-        return new Parts(localLog, leaderEpochCache, producerStateManager);
+        return new Parts(
+                localLog, leaderEpochCache, producerStateManager, canonicalState);
     }
 
     private static Duration positive(Duration value, String name) {
@@ -1073,16 +1160,15 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private record Parts(
             NereusLocalLog localLog,
             org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache leaderEpochCache,
-            NereusProducerStateManager producerStateManager
+            NereusProducerStateManager producerStateManager,
+            NereusCanonicalLogState canonicalState
     ) { }
 
     private static final class AppendInvocation {
         private final int leaderEpoch;
         private final short requiredAcks;
         private KafkaPartitionStorage committedStorage;
-        private long logicalBytes;
-        private long largestTimestamp = RecordBatch.NO_TIMESTAMP;
-        private long maxTimestampOffset = -1;
+        private List<NereusCanonicalLogState.BatchObservation> batches = List.of();
 
         private AppendInvocation(int leaderEpoch, short requiredAcks) {
             this.leaderEpoch = leaderEpoch;
@@ -1094,20 +1180,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 MemoryRecords records
         ) {
             committedStorage = exactStorage;
-            logicalBytes = records.sizeInBytes();
-            for (RecordBatch batch : records.batches()) {
-                for (Record record : batch) {
-                    long timestamp = record.timestamp();
-                    if (timestamp >= 0
-                            && (largestTimestamp == RecordBatch.NO_TIMESTAMP
-                                    || timestamp > largestTimestamp
-                                    || (timestamp == largestTimestamp
-                                            && record.offset() < maxTimestampOffset))) {
-                        largestTimestamp = timestamp;
-                        maxTimestampOffset = record.offset();
-                    }
-                }
-            }
+            batches = NereusCanonicalLogState.observe(records);
         }
     }
 

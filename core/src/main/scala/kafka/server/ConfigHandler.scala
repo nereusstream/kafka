@@ -36,6 +36,12 @@ import scala.collection.Seq
   */
 trait ConfigHandler {
   def processConfigChanges(entityName: String, value: Properties): Unit
+
+  def processConfigChangesAtMetadataOffset(
+    entityName: String,
+    value: Properties,
+    metadataOffset: Long
+  ): Unit = processConfigChanges(entityName, value)
 }
 
 /**
@@ -47,15 +53,20 @@ class TopicConfigHandler(private val replicaManager: ReplicaManager,
                          val quotas: QuotaManagers) extends ConfigHandler with Logging  {
 
   private def updateLogConfig(topic: String,
-                              topicConfig: Properties): Unit = {
+                              topicConfig: Properties,
+                              metadataOffset: Option[Long] = None): Unit = {
     val logManager = replicaManager.logManager
 
     val logs = logManager.logsByTopic(topic)
     val wasRemoteLogEnabled = logs.exists(_.remoteLogEnabled())
     val wasCopyDisabled = logs.exists(_.config.remoteLogCopyDisable())
 
-    logManager.updateTopicConfig(topic, topicConfig, kafkaConfig.remoteLogManagerConfig.isRemoteStorageSystemEnabled,
-      wasRemoteLogEnabled)
+    logManager.updateTopicConfig(
+      topic,
+      topicConfig,
+      kafkaConfig.remoteLogManagerConfig.isRemoteStorageSystemEnabled,
+      wasRemoteLogEnabled,
+      metadataOffset)
     maybeUpdateRemoteLogComponents(topic, logs, wasRemoteLogEnabled, wasCopyDisabled)
   }
 
@@ -106,9 +117,7 @@ class TopicConfigHandler(private val replicaManager: ReplicaManager,
     }
   }
 
-  def processConfigChanges(topic: String, topicConfig: Properties): Unit = {
-    updateLogConfig(topic, topicConfig)
-
+  private def updateThrottles(topic: String, topicConfig: Properties): Unit = {
     def updateThrottledList(prop: String, quotaManager: ReplicationQuotaManager): Unit = {
       if (topicConfig.containsKey(prop) && topicConfig.getProperty(prop).nonEmpty) {
         val partitions = parseThrottledPartitions(topicConfig, kafkaConfig.brokerId, prop)
@@ -121,6 +130,20 @@ class TopicConfigHandler(private val replicaManager: ReplicaManager,
     }
     updateThrottledList(QuotaConfig.LEADER_REPLICATION_THROTTLED_REPLICAS_CONFIG, quotas.leader)
     updateThrottledList(QuotaConfig.FOLLOWER_REPLICATION_THROTTLED_REPLICAS_CONFIG, quotas.follower)
+  }
+
+  def processConfigChanges(topic: String, topicConfig: Properties): Unit = {
+    updateLogConfig(topic, topicConfig)
+    updateThrottles(topic, topicConfig)
+  }
+
+  override def processConfigChangesAtMetadataOffset(
+    topic: String,
+    topicConfig: Properties,
+    metadataOffset: Long
+  ): Unit = {
+    updateLogConfig(topic, topicConfig, Some(metadataOffset))
+    updateThrottles(topic, topicConfig)
   }
 
   def parseThrottledPartitions(topicConfig: Properties, brokerId: Int, prop: String): Seq[Int] = {

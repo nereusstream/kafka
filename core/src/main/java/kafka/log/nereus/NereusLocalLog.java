@@ -17,6 +17,7 @@
 package kafka.log.nereus;
 
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.util.Scheduler;
@@ -37,6 +38,7 @@ import java.util.List;
  */
 public final class NereusLocalLog extends LocalLog {
     private final NereusTransactionIndex transactionIndex;
+    private final NereusCanonicalLogState canonicalState;
     private StableAppend stableAppend;
 
     NereusLocalLog(
@@ -49,7 +51,8 @@ public final class NereusLocalLog extends LocalLog {
             Time time,
             TopicPartition topicPartition,
             LogDirFailureChannel logDirFailureChannel,
-            NereusTransactionIndex transactionIndex
+            NereusTransactionIndex transactionIndex,
+            NereusCanonicalLogState canonicalState
     ) {
         super(
                 dir,
@@ -63,6 +66,8 @@ public final class NereusLocalLog extends LocalLog {
                 logDirFailureChannel);
         this.transactionIndex = Objects.requireNonNull(
                 transactionIndex, "transactionIndex");
+        this.canonicalState = Objects.requireNonNull(
+                canonicalState, "canonicalState");
     }
 
     void bindStableAppend(StableAppend exact) {
@@ -81,6 +86,82 @@ public final class NereusLocalLog extends LocalLog {
         }
         exact.append(lastOffset, records);
         updateLogEndOffset(lastOffset + 1);
+    }
+
+    @Override
+    public org.apache.kafka.storage.internals.log.LogSegment roll(
+            Long expectedNextOffset
+    ) {
+        long newOffset = Math.max(
+                Objects.requireNonNull(expectedNextOffset, "expectedNextOffset"),
+                logEndOffset());
+        org.apache.kafka.storage.internals.log.LogSegment active =
+                segments().activeSegment();
+        if (active.baseOffset() == newOffset) {
+            return active;
+        }
+        if (newOffset < active.baseOffset() || segments().contains(newOffset)) {
+            throw new KafkaStorageException(
+                    "Invalid Nereus synthetic segment roll from "
+                            + active.baseOffset()
+                            + " to "
+                            + newOffset);
+        }
+        canonicalState.stageRoll(newOffset, time().milliseconds());
+        try {
+            active.onBecomeInactiveSegment();
+            NereusLogSegment next = NereusLogSegment.open(
+                    dir(),
+                    newOffset,
+                    config(),
+                    time(),
+                    transactionIndex,
+                    canonicalState);
+            segments().add(next);
+            updateLogEndOffset(nextOffsetMetadata().messageOffset);
+            return next;
+        } catch (IOException | RuntimeException failure) {
+            canonicalState.cancelPendingRoll(newOffset);
+            throw new KafkaStorageException(
+                    "Failed to roll the Nereus synthetic segment at " + newOffset,
+                    failure);
+        }
+    }
+
+    void installCanonicalSegments(List<Long> baseOffsets) throws IOException {
+        Objects.requireNonNull(baseOffsets, "baseOffsets");
+        if (baseOffsets.isEmpty()
+                || baseOffsets.get(0) < 0
+                || baseOffsets.get(baseOffsets.size() - 1) > logEndOffset()) {
+            throw new IllegalArgumentException("invalid canonical segment bases");
+        }
+        IOException closeFailure = null;
+        for (org.apache.kafka.storage.internals.log.LogSegment segment :
+                segments().values()) {
+            try {
+                segment.close();
+            } catch (IOException failure) {
+                if (closeFailure == null) {
+                    closeFailure = failure;
+                } else {
+                    closeFailure.addSuppressed(failure);
+                }
+            }
+        }
+        if (closeFailure != null) {
+            throw closeFailure;
+        }
+        segments().clear();
+        for (long baseOffset : baseOffsets) {
+            segments().add(NereusLogSegment.open(
+                    dir(),
+                    baseOffset,
+                    config(),
+                    time(),
+                    transactionIndex,
+                    canonicalState));
+        }
+        updateLogEndOffset(nextOffsetMetadata().messageOffset);
     }
 
     @Override

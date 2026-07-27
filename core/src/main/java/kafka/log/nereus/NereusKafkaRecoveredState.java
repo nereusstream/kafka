@@ -40,6 +40,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 /**
@@ -58,6 +59,8 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
     private final KafkaCanonicalCheckpointStateCodecV1 checkpointCodec =
             new KafkaCanonicalCheckpointStateCodecV1();
     private final List<LeaderEpochRange> leaderEpochRanges = new ArrayList<>();
+    private final List<NereusCanonicalLogState.BatchObservation> committedTail =
+            new ArrayList<>();
 
     private long nextOffset;
     private int batchCount;
@@ -67,6 +70,7 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
     private long maxTimestampOffset = -1;
     private long lastStableOffset;
     private KafkaProducerTransactionState producerTransactionState;
+    private KafkaCanonicalCheckpointState checkpointState;
     private boolean checkpointHydrated;
     private boolean frozen;
 
@@ -119,6 +123,7 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
                             checkpointOffset,
                             logStartOffset,
                             checkpointOffset);
+            checkpointState = checkpoint;
             producerStateManager.restoreCanonical(
                     checkpoint.producerTransactionState());
             checkpoint.leaderEpochState().ranges().forEach(range ->
@@ -150,7 +155,7 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
             throw invariant("Kafka recovery state received a non-contiguous batch");
         }
         RecordBatch batch = exactBatch(replay);
-        long batchRecords = validateRecords(batch);
+        BatchFacts batchFacts = validateRecords(batch);
         long expectedNext = addExact(
                 batch.lastOffset(), 1, "Kafka recovery batch offset overflows");
         try {
@@ -162,11 +167,17 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
         nextOffset = expectedNext;
         batchCount = addExact(batchCount, 1, "Kafka recovery batch count overflows");
         recordCount = addExact(
-                recordCount, batchRecords, "Kafka recovery record count overflows");
+                recordCount, batchFacts.recordCount(), "Kafka recovery record count overflows");
         logicalBytes = addExact(
                 logicalBytes,
                 replay.encodedBatch().length,
                 "Kafka recovery logical bytes overflow");
+        committedTail.add(new NereusCanonicalLogState.BatchObservation(
+                batch.baseOffset(),
+                expectedNext,
+                replay.encodedBatch().length,
+                batchFacts.largestTimestamp(),
+                batchFacts.maxTimestampOffset()));
     }
 
     private RecordBatch exactBatch(KafkaReplayBatch replay) {
@@ -190,15 +201,25 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
         return batch;
     }
 
-    private long validateRecords(RecordBatch batch) {
+    private BatchFacts validateRecords(RecordBatch batch) {
         long recordOffset = batch.baseOffset();
         long batchRecords = 0;
+        long batchLargestTimestamp = RecordBatch.NO_TIMESTAMP;
+        long batchMaxTimestampOffset = -1;
         for (Record record : batch) {
             record.ensureValid();
             if (record.offset() != recordOffset) {
                 throw invariant("Kafka recovery RecordBatch contains a non-dense record offset");
             }
             observeTimestamp(record.timestamp(), record.offset());
+            if (record.timestamp() >= 0
+                    && (batchLargestTimestamp < 0
+                            || record.timestamp() > batchLargestTimestamp
+                            || (record.timestamp() == batchLargestTimestamp
+                                    && record.offset() < batchMaxTimestampOffset))) {
+                batchLargestTimestamp = record.timestamp();
+                batchMaxTimestampOffset = record.offset();
+            }
             recordOffset = addExact(recordOffset, 1, "Kafka recovery record offset overflows");
             batchRecords = addExact(batchRecords, 1, "Kafka recovery record count overflows");
         }
@@ -206,7 +227,8 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
         if (recordOffset != expectedNext || batchRecords != expectedNext - batch.baseOffset()) {
             throw invariant("Kafka recovery RecordBatch logical span does not match its records");
         }
-        return batchRecords;
+        return new BatchFacts(
+                batchRecords, batchLargestTimestamp, batchMaxTimestampOffset);
     }
 
     void freeze(KafkaCheckpointSourceState source) {
@@ -301,6 +323,16 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
     public List<LeaderEpochRange> leaderEpochRanges() {
         requireFrozen();
         return List.copyOf(leaderEpochRanges);
+    }
+
+    Optional<KafkaCanonicalCheckpointState> checkpointState() {
+        requireFrozen();
+        return Optional.ofNullable(checkpointState);
+    }
+
+    List<NereusCanonicalLogState.BatchObservation> committedTail() {
+        requireFrozen();
+        return List.copyOf(committedTail);
     }
 
     @Override
@@ -400,4 +432,10 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
             }
         }
     }
+
+    private record BatchFacts(
+            long recordCount,
+            long largestTimestamp,
+            long maxTimestampOffset
+    ) { }
 }

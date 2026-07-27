@@ -18,7 +18,7 @@
 package kafka.log.nereus
 
 import com.nereusstream.api.{AppendAuthority, AppendResult, Checksum, ChecksumType}
-import com.nereusstream.kafka.checkpoint.{KafkaCanonicalCheckpointState, KafkaCheckpointSourceState}
+import com.nereusstream.kafka.checkpoint.{KafkaCanonicalCheckpointState, KafkaCheckpointSourceState, KafkaVirtualSegmentState}
 import com.nereusstream.kafka.codec.{KafkaAppendBatchEncoder, KafkaFetchAssembly, KafkaRecordBatchCodec}
 import com.nereusstream.kafka.partition.{KafkaAppendContext, KafkaPartitionState, KafkaPartitionStorage, KafkaStableAppendResult, KafkaStableSnapshot, KafkaStorageReadRequest, KafkaStorageReadResult}
 import com.nereusstream.kafka.retention.{KafkaDeleteRecordsCoordinator, KafkaPartitionMaintenance, KafkaTrimBarrier}
@@ -50,7 +50,7 @@ import org.apache.kafka.server.config.{NereusKafkaConfigs, ReplicationConfigs, S
 import org.apache.kafka.server.common.{RequestLocal, TransactionVersion}
 import org.apache.kafka.server.util.{KafkaScheduler, MockTime}
 import org.apache.kafka.server.storage.log.FetchIsolation
-import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, LogDirFailureChannel, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, LogConfig, LogDirFailureChannel, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
@@ -107,6 +107,14 @@ class NereusUnifiedLogFactoryTest {
         log.appendAsLeader(TestUtils.singletonRecords("must-not-hit-local-log".getBytes), 7))
 
       val nereusLog = log.asInstanceOf[NereusUnifiedLog]
+      val rollOverrides = new Properties()
+      rollOverrides.put(LogConfig.INTERNAL_SEGMENT_BYTES_CONFIG, "200")
+      rollOverrides.put("index.interval.bytes", "1")
+      rollOverrides.put("message.timestamp.type", "CreateTime")
+      nereusLog.updateConfig(LogConfig.fromProps(nereusLog.config.originals, rollOverrides))
+      assertEquals(
+        org.apache.kafka.common.record.TimestampType.CREATE_TIME,
+        nereusLog.config.messageTimestampType)
       val source = emptySource(nereusLog, 7)
       val codec = new NereusKafkaRecoveryStateCodec(
         nereusLog.nereusIdentity(),
@@ -221,7 +229,9 @@ class NereusUnifiedLogFactoryTest {
       nereusLog.installStorage(7, storage)
       assertTrue(nereusLog.nereusWritable(7))
       val appendInfo = nereusLog.appendAsLeader(
-        TestUtils.singletonRecords("stable-data".getBytes),
+        MemoryRecords.withRecords(
+          Compression.NONE,
+          new SimpleRecord(100, "stable-data".getBytes)),
         7,
         AppendOrigin.CLIENT,
         RequestLocal.noCaching,
@@ -232,7 +242,10 @@ class NereusUnifiedLogFactoryTest {
       assertEquals(0L, appendInfo.lastOffset())
       assertEquals((-1).toShort, appendAcks.get())
       assertEquals(1L, nereusLog.logEndOffset)
-      assertEquals(0L, nereusLog.size)
+      assertEquals(stableBytes.get().length.toLong, nereusLog.size)
+      val endMetadata = nereusLog.maybeConvertToOffsetMetadata(1)
+      assertEquals(0L, endMetadata.segmentBaseOffset)
+      assertEquals(stableBytes.get().length, endMetadata.relativePositionInSegment)
 
       val fetched = nereusLog.read(0, 1024, FetchIsolation.LOG_END, false)
       assertEquals(stableBytes.get().length, fetched.records.sizeInBytes)
@@ -255,6 +268,13 @@ class NereusUnifiedLogFactoryTest {
       assertEquals(1L, idempotentInfo.firstOffset())
       assertEquals(1L, idempotentInfo.lastOffset())
       assertEquals(2L, nereusLog.logEndOffset)
+      val metadataConfigOverrides = new Properties()
+      metadataConfigOverrides.put(LogConfig.INTERNAL_SEGMENT_BYTES_CONFIG, "300")
+      metadataConfigOverrides.put("index.interval.bytes", "1")
+      metadataConfigOverrides.put("message.timestamp.type", "CreateTime")
+      nereusLog.updateConfigAtMetadataOffset(
+        LogConfig.fromProps(nereusLog.config.originals, metadataConfigOverrides),
+        42)
 
       val producerId = 17L
       val producerEpoch = 1.toShort
@@ -363,6 +383,13 @@ class NereusUnifiedLogFactoryTest {
       assertEquals(5L, secondMarkerInfo.firstOffset())
       assertEquals(6L, snapshot.get().lastStableOffset())
 
+      val timestampResult = nereusLog
+        .fetchOffsetByTimestamp(1500, Optional.empty())
+        .timestampAndOffsetOpt()
+        .orElseThrow()
+      assertEquals(2000L, timestampResult.timestamp)
+      assertEquals(2L, timestampResult.offset)
+
       val boundedCommittedFetch =
         nereusLog.read(2, committedData.sizeInBytes(), FetchIsolation.TXN_COMMITTED, false)
       val boundedBatches =
@@ -387,6 +414,25 @@ class NereusUnifiedLogFactoryTest {
         assertEquals(6L, canonical.checkpointOffset())
         assertEquals(0L, canonical.logStartOffset())
         assertEquals(6L, canonical.producerTransactionState().mapEndOffset())
+        assertTrue(canonical.virtualSegmentState().segments().size() > 1)
+        assertTrue(canonical.virtualSegmentState().segments().stream().limit(
+          canonical.virtualSegmentState().segments().size() - 1L).allMatch(
+          _.state() == KafkaVirtualSegmentState.SegmentState.CLOSED))
+        assertEquals(
+          KafkaVirtualSegmentState.SegmentState.ACTIVE,
+          canonical.virtualSegmentState().segments().get(
+            canonical.virtualSegmentState().segments().size() - 1).state())
+        assertEquals(
+          canonical.virtualSegmentState().segments().size(),
+          canonical.derivedIndexState().logicalByteIndexes().size())
+        assertEquals(
+          42L,
+          canonical.virtualSegmentState().configHistory().get(
+            canonical.virtualSegmentState().configHistory().size() - 1).metadataOffset())
+        assertTrue(canonical.virtualSegmentState().segments().stream().anyMatch(
+          _.rollReason() == KafkaVirtualSegmentState.RollReason.CONFIG))
+        assertTrue(canonical.derivedIndexState().timeIndexes().stream().anyMatch(
+          index => !index.entries().isEmpty))
         assertEquals(6L, captured.highWatermark())
         assertEquals(6L, captured.lastStableOffset())
 
