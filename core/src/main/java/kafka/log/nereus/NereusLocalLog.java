@@ -29,12 +29,14 @@ import org.apache.kafka.storage.internals.log.LogSegments;
 import java.io.File;
 import java.io.IOException;
 import java.util.Objects;
+import java.util.List;
 
 /**
  * Ephemeral local shell used only to satisfy stock UnifiedLog state machinery. Its segment files are cache artifacts,
  * never partition truth. Durable append/read overrides are owned by {@link NereusUnifiedLog}.
  */
 public final class NereusLocalLog extends LocalLog {
+    private final NereusTransactionIndex transactionIndex;
     private StableAppend stableAppend;
 
     NereusLocalLog(
@@ -46,7 +48,8 @@ public final class NereusLocalLog extends LocalLog {
             Scheduler scheduler,
             Time time,
             TopicPartition topicPartition,
-            LogDirFailureChannel logDirFailureChannel
+            LogDirFailureChannel logDirFailureChannel,
+            NereusTransactionIndex transactionIndex
     ) {
         super(
                 dir,
@@ -58,6 +61,8 @@ public final class NereusLocalLog extends LocalLog {
                 time,
                 topicPartition,
                 logDirFailureChannel);
+        this.transactionIndex = Objects.requireNonNull(
+                transactionIndex, "transactionIndex");
     }
 
     void bindStableAppend(StableAppend exact) {
@@ -76,6 +81,15 @@ public final class NereusLocalLog extends LocalLog {
         }
         exact.append(lastOffset, records);
         updateLogEndOffset(lastOffset + 1);
+    }
+
+    @Override
+    public List<org.apache.kafka.storage.internals.log.LogSegment> truncateFullyAndStartAt(
+            long newOffset
+    ) {
+        transactionIndex.reset();
+        updateLogEndOffset(newOffset);
+        return List.of();
     }
 
     @FunctionalInterface

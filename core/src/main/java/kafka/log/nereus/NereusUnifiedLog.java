@@ -20,21 +20,24 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.errors.OffsetOutOfRangeException;
+import org.apache.kafka.common.record.FileRecords;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.common.RequestLocal;
 import org.apache.kafka.server.storage.log.FetchIsolation;
 import org.apache.kafka.server.util.Scheduler;
 import org.apache.kafka.storage.internals.log.AppendOrigin;
+import org.apache.kafka.storage.internals.log.AbortedTxn;
 import org.apache.kafka.storage.internals.log.FetchDataInfo;
+import org.apache.kafka.storage.internals.log.LazyIndex;
 import org.apache.kafka.storage.internals.log.LogAppendInfo;
 import org.apache.kafka.storage.internals.log.LogConfig;
 import org.apache.kafka.storage.internals.log.LogDirFailureChannel;
+import org.apache.kafka.storage.internals.log.LogFileUtils;
 import org.apache.kafka.storage.internals.log.LogOffsetMetadata;
 import org.apache.kafka.storage.internals.log.LogOffsetsListener;
 import org.apache.kafka.storage.internals.log.LogSegment;
 import org.apache.kafka.storage.internals.log.LogSegments;
-import org.apache.kafka.storage.internals.log.ProducerStateManager;
 import org.apache.kafka.storage.internals.log.ProducerStateManagerConfig;
 import org.apache.kafka.storage.internals.log.RequiredAcksAwareAppend;
 import org.apache.kafka.storage.internals.log.UnifiedLog;
@@ -57,6 +60,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.Map;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -76,6 +80,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private final Duration appendTimeout;
     private final Duration fetchTimeout;
     private final int hardMaxFetchBytes;
+    private final NereusProducerStateManager producerStateManager;
     private final ThreadLocal<AppendInvocation> appendInvocation = new ThreadLocal<>();
 
     private NereusKafkaRecoveredState recoveredState;
@@ -109,6 +114,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             throw new IllegalArgumentException("hardMaxFetchBytes must be positive");
         }
         this.hardMaxFetchBytes = hardMaxFetchBytes;
+        this.producerStateManager = parts.producerStateManager;
         parts.localLog.bindStableAppend(this::appendStable);
     }
 
@@ -171,9 +177,32 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 super.truncateFullyAndStartAt(
                         state.stableEndOffset(),
                         Optional.of(state.logStartOffset()));
+                producerStateManager.restoreCanonical(
+                        state.producerTransactionState());
+                state.leaderEpochRanges().forEach(range ->
+                        super.assignEpochStartOffset(
+                                range.leaderEpoch(),
+                                range.startOffset()));
                 super.updateHighWatermark(state.stableEndOffset());
                 recoveredState = state;
             }
+        }
+    }
+
+    public NereusProducerStateManager prepareProducerRecovery(
+            int leaderEpoch,
+            long logStartOffset
+    ) {
+        synchronized (nereusGuard) {
+            if (leaderEpoch < 0 || logStartOffset < 0) {
+                throw new IllegalArgumentException(
+                        "Kafka recovery bounds must be non-negative");
+            }
+            if (storage != null || recoveredState != null) {
+                throw fenced(
+                        "Kafka producer recovery cannot replace published state");
+            }
+            return producerStateManager;
         }
     }
 
@@ -187,8 +216,13 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 throw invariant("Nereus storage cannot publish before recovered Kafka state");
             }
             requireExactState(leaderEpoch, recoveredState);
+            KafkaStableSnapshot published = candidate.publishDerivedOffsets(
+                    recoveredState.stableEndOffset(),
+                    recoveredState.stableEndOffset(),
+                    recoveredState.lastStableOffset());
             KafkaStableSnapshot snapshot = candidate.stableSnapshot();
-            if (!matchesStorage(candidate, leaderEpoch, snapshot)) {
+            if (!snapshot.equals(published)
+                    || !matchesStorage(candidate, leaderEpoch, snapshot)) {
                 throw invariant("Nereus storage snapshot does not match recovered Kafka state");
             }
             if (storage != null && storage != candidate) {
@@ -255,10 +289,10 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             short transactionVersion,
             short requiredAcks
     ) {
-        requirePublished(leaderEpoch);
-        if (origin != AppendOrigin.CLIENT) {
+        if (origin != AppendOrigin.CLIENT
+                && origin != AppendOrigin.COORDINATOR) {
             throw NereusKafkaExceptionMapper.map(unsupported(
-                    "F9-M3 Nereus append accepts only ordinary client records"));
+                    "Nereus append accepts only client or coordinator records"));
         }
         if (requiredAcks != 0 && requiredAcks != 1 && requiredAcks != -1) {
             throw new IllegalArgumentException("Kafka requiredAcks must be 0, 1, or -1");
@@ -269,13 +303,31 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         AppendInvocation invocation = new AppendInvocation(leaderEpoch, requiredAcks);
         appendInvocation.set(invocation);
         try {
-            return super.appendAsLeader(
-                    records,
-                    leaderEpoch,
-                    origin,
-                    requestLocal,
-                    verificationGuard,
-                    transactionVersion);
+            synchronized (nereusGuard) {
+                requirePublished(leaderEpoch);
+                LogAppendInfo result = super.appendAsLeader(
+                        records,
+                        leaderEpoch,
+                        origin,
+                        requestLocal,
+                        verificationGuard,
+                        transactionVersion);
+                if (invocation.committedStorage != null) {
+                    long stableEndOffset = Math.addExact(result.lastOffset(), 1);
+                    advanceHighWatermarkToStableEnd(stableEndOffset);
+                    KafkaStableSnapshot published =
+                            invocation.committedStorage.publishDerivedOffsets(
+                                    stableEndOffset,
+                                    highWatermark(),
+                                    lastStableOffset());
+                    if (published.stableEndOffset()
+                            != stableEndOffset) {
+                        throw invariant(
+                                "Nereus derived offset publication returned a mismatched end");
+                    }
+                }
+                return result;
+            }
         } catch (RuntimeException | Error failure) {
             if (invocation.committedStorage != null) {
                 fenceUnknownAppend(invocation.committedStorage);
@@ -283,6 +335,20 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             throw failure;
         } finally {
             appendInvocation.remove();
+        }
+    }
+
+    private void advanceHighWatermarkToStableEnd(long stableEndOffset) {
+        try {
+            long updatedHighWatermark = super.updateHighWatermark(stableEndOffset);
+            if (updatedHighWatermark != stableEndOffset) {
+                throw invariant(
+                        "Nereus stable append did not advance the Kafka high watermark");
+            }
+        } catch (IOException failure) {
+            throw new KafkaStorageException(
+                    "Failed to publish the Nereus stable append as Kafka high watermark",
+                    failure);
         }
     }
 
@@ -302,6 +368,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         Objects.requireNonNull(isolation, "isolation");
         KafkaPartitionStorage exactStorage;
         KafkaStableSnapshot snapshot;
+        long maxOffsetExclusive;
         synchronized (nereusGuard) {
             if (storage == null
                     || recoveredState == null
@@ -311,6 +378,11 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             }
             exactStorage = storage;
             snapshot = exactStorage.stableSnapshot();
+            maxOffsetExclusive = switch (isolation) {
+                case LOG_END -> logEndOffset();
+                case HIGH_WATERMARK -> highWatermark();
+                case TXN_COMMITTED -> lastStableOffset();
+            };
         }
         if (startOffset < snapshot.logStartOffset()
                 || startOffset > snapshot.stableEndOffset()) {
@@ -319,14 +391,15 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                             + snapshot.logStartOffset() + ", "
                             + snapshot.stableEndOffset() + "]");
         }
-        long maxOffsetExclusive = switch (isolation) {
-            case LOG_END -> snapshot.stableEndOffset();
-            case HIGH_WATERMARK -> snapshot.highWatermark();
-            case TXN_COMMITTED -> snapshot.lastStableOffset();
-        };
         if (maxLength <= 0 || startOffset >= maxOffsetExclusive) {
             requireSamePublishedStorage(exactStorage);
-            return FetchDataInfo.empty(startOffset);
+            return new FetchDataInfo(
+                    new LogOffsetMetadata(startOffset),
+                    MemoryRecords.EMPTY,
+                    false,
+                    isolation == FetchIsolation.TXN_COMMITTED
+                            ? Optional.of(List.of())
+                            : Optional.empty());
         }
 
         KafkaStorageReadRequest request = new KafkaStorageReadRequest(
@@ -344,13 +417,44 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         requireSamePublishedStorage(exactStorage);
         validateReadResult(snapshot, maxOffsetExclusive, maxLength, minOneMessage, result);
         MemoryRecords records = MemoryRecords.readableRecords(assembly.recordsBuffer());
+        Optional<List<org.apache.kafka.common.message.FetchResponseData.AbortedTransaction>>
+                abortedTransactions = abortedTransactionsForRead(
+                        exactStorage,
+                        isolation,
+                        startOffset,
+                        assembly.nextLogicalOffset(),
+                        assembly.sizeInBytes());
         long actualFirstOffset = assembly.actualFirstBatchBaseOffset().orElse(startOffset);
         int relativePosition = Math.toIntExact(assembly.relativeLogicalBytePosition());
         LogOffsetMetadata fetchOffset = new LogOffsetMetadata(
                 actualFirstOffset,
                 assembly.virtualSegmentBaseOffset(),
                 relativePosition);
-        return new FetchDataInfo(fetchOffset, records, false, Optional.empty());
+        return new FetchDataInfo(
+                fetchOffset, records, false, abortedTransactions);
+    }
+
+    private Optional<List<org.apache.kafka.common.message.FetchResponseData.AbortedTransaction>>
+            abortedTransactionsForRead(
+                    KafkaPartitionStorage exactStorage,
+                    FetchIsolation isolation,
+                    long startOffset,
+                    long upperBoundOffset,
+                    int sizeInBytes
+    ) {
+        if (isolation != FetchIsolation.TXN_COMMITTED) {
+            return Optional.empty();
+        }
+        if (sizeInBytes == 0 || upperBoundOffset <= startOffset) {
+            return Optional.of(List.of());
+        }
+        synchronized (nereusGuard) {
+            requireSamePublishedStorage(exactStorage);
+            return Optional.of(producerStateManager.collectAbortedTransactions(
+                    startOffset, upperBoundOffset).stream()
+                    .map(AbortedTxn::asAbortedTransaction)
+                    .toList());
+        }
     }
 
     private void appendStable(long lastOffset, MemoryRecords records) {
@@ -532,7 +636,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 || !state.identity().equals(identity)
                 || state.leaderEpoch() != leaderEpoch
                 || !state.topicPartition().equals(topicPartition())
-                || !state.topicId().equals(topicId().orElse(Uuid.ZERO_UUID))) {
+                || !state.topicId().equals(topicId().orElse(Uuid.ZERO_UUID))
+                || state.producerStateManager() != producerStateManager) {
             throw invariant("Nereus recovered state does not match the exact log shell");
         }
     }
@@ -565,13 +670,27 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         Files.createDirectories(dir.toPath());
         TopicPartition topicPartition = UnifiedLog.parseTopicPartitionName(dir);
         LogSegments segments = new LogSegments(topicPartition);
-        LogSegment segment = LogSegment.open(
-                dir,
+        NereusTransactionIndex transactionIndex = new NereusTransactionIndex(
+                0L, LogFileUtils.transactionIndexFile(dir, 0L));
+        LogSegment segment = new LogSegment(
+                FileRecords.open(
+                        LogFileUtils.logFile(dir, 0L),
+                        false,
+                        config.initFileSize(),
+                        config.preallocate),
+                LazyIndex.forOffset(
+                        LogFileUtils.offsetIndexFile(dir, 0L),
+                        0L,
+                        config.maxIndexSize),
+                LazyIndex.forTime(
+                        LogFileUtils.timeIndexFile(dir, 0L),
+                        0L,
+                        config.maxIndexSize),
+                transactionIndex,
                 0L,
-                config,
-                time,
-                config.initFileSize(),
-                config.preallocate);
+                config.indexInterval,
+                config.randomSegmentJitter(),
+                time);
         segments.add(segment);
         NereusLocalLog localLog = new NereusLocalLog(
                 dir,
@@ -582,7 +701,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 scheduler,
                 time,
                 topicPartition,
-                logDirFailureChannel);
+                logDirFailureChannel,
+                transactionIndex);
         org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache leaderEpochCache =
                 UnifiedLog.createLeaderEpochCache(
                 dir,
@@ -590,12 +710,14 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 logDirFailureChannel,
                 Optional.empty(),
                 scheduler);
-        ProducerStateManager producerStateManager = new ProducerStateManager(
+        NereusProducerStateManager producerStateManager =
+                new NereusProducerStateManager(
                 topicPartition,
                 dir,
                 maxTransactionTimeoutMs,
                 producerStateManagerConfig,
-                time);
+                time,
+                transactionIndex);
         return new Parts(localLog, leaderEpochCache, producerStateManager);
     }
 
@@ -625,7 +747,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private record Parts(
             NereusLocalLog localLog,
             org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache leaderEpochCache,
-            ProducerStateManager producerStateManager
+            NereusProducerStateManager producerStateManager
     ) { }
 
     private static final class AppendInvocation {

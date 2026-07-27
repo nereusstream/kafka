@@ -28,9 +28,16 @@ import kafka.utils.TestUtils
 
 import org.apache.kafka.common.{TopicPartition, Uuid}
 import org.apache.kafka.common.compress.Compression
-import org.apache.kafka.common.errors.{KafkaStorageException, UnsupportedForMessageFormatException}
+import org.apache.kafka.common.errors.KafkaStorageException
 import org.apache.kafka.common.metrics.Metrics
-import org.apache.kafka.common.record.{CompressionType, MemoryRecords, SimpleRecord}
+import org.apache.kafka.common.record.{
+  CompressionType,
+  ControlRecordType,
+  EndTransactionMarker,
+  MemoryRecords,
+  RecordBatch,
+  SimpleRecord
+}
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.coordinator.group.GroupCoordinatorConfig
 import org.apache.kafka.coordinator.share.ShareCoordinatorConfig
@@ -44,7 +51,7 @@ import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, LogD
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
-import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.{any, anyLong}
 import org.mockito.Mockito.{mock, verify, when}
 
 import java.nio.ByteBuffer
@@ -98,10 +105,17 @@ class NereusUnifiedLogFactoryTest {
 
       val nereusLog = log.asInstanceOf[NereusUnifiedLog]
       val source = emptySource(nereusLog, 7)
-      val codec = new NereusKafkaRecoveryStateCodec(nereusLog.nereusIdentity(), 7, 0, 0)
+      val codec = new NereusKafkaRecoveryStateCodec(
+        nereusLog.nereusIdentity(),
+        7,
+        0,
+        0,
+        nereusLog.prepareProducerRecovery(7, 0))
       val recoveredState = codec.freshState()
       codec.validateRecoveredState(recoveredState, source)
       nereusLog.installRecoveredState(7, recoveredState)
+      assertEquals(7, nereusLog.latestEpoch.orElseThrow())
+      assertEquals(0L, nereusLog.endOffsetForEpoch(7).orElseThrow().offset())
       assertFalse(nereusLog.nereusWritable(7))
 
       val storage = mock(classOf[KafkaPartitionStorage])
@@ -113,6 +127,17 @@ class NereusUnifiedLogFactoryTest {
       when(storage.leaderEpoch()).thenReturn(7)
       when(storage.state()).thenReturn(KafkaPartitionState.LEADER_WRITABLE)
       when(storage.stableSnapshot()).thenAnswer(_ => snapshot.get())
+      when(storage.publishDerivedOffsets(anyLong(), anyLong(), anyLong())).thenAnswer(invocation => {
+        val current = snapshot.get()
+        val published = new KafkaStableSnapshot(
+          current.logStartOffset(),
+          invocation.getArgument[java.lang.Long](0),
+          invocation.getArgument[java.lang.Long](1),
+          invocation.getArgument[java.lang.Long](2),
+          current.commitVersion())
+        snapshot.set(published)
+        published
+      })
       when(storage.resign()).thenReturn(CompletableFuture.completedFuture(null))
       when(storage.append(any(classOf[ByteBuffer]), any(classOf[KafkaAppendContext]))).thenAnswer(invocation => {
         val records = invocation.getArgument[ByteBuffer](0)
@@ -121,12 +146,15 @@ class NereusUnifiedLogFactoryTest {
           .encode(records, context.expectedStartOffset())
         val owned = new Array[Byte](records.remaining())
         records.duplicate().get(owned)
-        stableBytes.set(owned)
+        stableBytes.set(stableBytes.get() ++ owned)
         appendAcks.set(context.requiredAcks())
-        val next = KafkaStableSnapshot.nonTransactional(
-          snapshot.get().logStartOffset(),
+        val current = snapshot.get()
+        val next = new KafkaStableSnapshot(
+          current.logStartOffset(),
           encoded.range().endOffset(),
-          snapshot.get().commitVersion() + 1)
+          current.highWatermark(),
+          current.lastStableOffset(),
+          current.commitVersion() + 1)
         snapshot.set(next)
         val appendResult = mock(classOf[AppendResult])
         when(appendResult.committedEndOffset()).thenReturn(encoded.range().endOffset())
@@ -138,13 +166,47 @@ class NereusUnifiedLogFactoryTest {
       })
       when(storage.read(any(classOf[KafkaStorageReadRequest]))).thenAnswer(invocation => {
         val request = invocation.getArgument[KafkaStorageReadRequest](0)
-        val bytes = stableBytes.get()
+        val allBatches = MemoryRecords
+          .readableRecords(ByteBuffer.wrap(stableBytes.get()))
+          .batches()
+          .iterator()
+        val selected = new java.util.ArrayList[RecordBatch]()
+        var selectedBytes = 0
+        var reachedBudget = false
+        while (allBatches.hasNext && !reachedBudget) {
+          val batch = allBatches.next()
+          if (batch.lastOffset() >= request.startOffset()
+            && batch.baseOffset() < request.maxOffsetExclusive()) {
+            val candidateBytes = Math.addExact(selectedBytes, batch.sizeInBytes())
+            if (candidateBytes <= request.maxPartitionBytes()
+              || (selected.isEmpty && request.minOneMessage())) {
+              selected.add(batch)
+              selectedBytes = candidateBytes
+            } else {
+              reachedBudget = true
+            }
+          }
+        }
+        val selectedBuffer = ByteBuffer.allocate(selectedBytes)
+        val selectedIterator = selected.iterator()
+        while (selectedIterator.hasNext) {
+          selectedIterator.next().writeTo(selectedBuffer)
+        }
+        selectedBuffer.flip()
+        val bytes = new Array[Byte](selectedBuffer.remaining())
+        selectedBuffer.get(bytes)
+        val actualFirstOffset =
+          if (selected.isEmpty) OptionalLong.empty()
+          else OptionalLong.of(selected.get(0).baseOffset())
+        val nextLogicalOffset =
+          if (selected.isEmpty) request.startOffset()
+          else selected.get(selected.size() - 1).nextOffset()
         val assembly = mock(classOf[KafkaFetchAssembly])
         when(assembly.recordsBuffer()).thenReturn(ByteBuffer.wrap(bytes).asReadOnlyBuffer())
         when(assembly.sizeInBytes()).thenReturn(bytes.length)
-        when(assembly.actualFirstBatchBaseOffset()).thenReturn(OptionalLong.of(request.startOffset()))
-        when(assembly.nextLogicalOffset()).thenReturn(snapshot.get().stableEndOffset())
-        when(assembly.sourceCoverageEndOffset()).thenReturn(snapshot.get().stableEndOffset())
+        when(assembly.actualFirstBatchBaseOffset()).thenReturn(actualFirstOffset)
+        when(assembly.nextLogicalOffset()).thenReturn(nextLogicalOffset)
+        when(assembly.sourceCoverageEndOffset()).thenReturn(nextLogicalOffset)
         when(assembly.firstEntryOverflow()).thenReturn(false)
         when(assembly.virtualSegmentBaseOffset()).thenReturn(0L)
         when(assembly.relativeLogicalBytePosition()).thenReturn(0L)
@@ -167,18 +229,6 @@ class NereusUnifiedLogFactoryTest {
       assertEquals(1L, nereusLog.logEndOffset)
       assertEquals(0L, nereusLog.size)
 
-      val idempotent = MemoryRecords.withIdempotentRecords(
-        0,
-        Compression.of(CompressionType.NONE).build(),
-        7,
-        1.toShort,
-        0,
-        7,
-        new SimpleRecord(1000, "unsupported".getBytes))
-      assertThrows(classOf[UnsupportedForMessageFormatException], () =>
-        nereusLog.appendAsLeader(idempotent, 7))
-      assertEquals(1L, nereusLog.logEndOffset)
-
       val fetched = nereusLog.read(0, 1024, FetchIsolation.LOG_END, false)
       assertEquals(stableBytes.get().length, fetched.records.sizeInBytes)
       val fetchedBatches = fetched.records.asInstanceOf[MemoryRecords].batches().iterator()
@@ -188,10 +238,142 @@ class NereusUnifiedLogFactoryTest {
       assertEquals(7, fetchedBatch.partitionLeaderEpoch())
       assertFalse(fetchedBatches.hasNext)
 
+      val idempotent = MemoryRecords.withIdempotentRecords(
+        0,
+        Compression.of(CompressionType.NONE).build(),
+        7,
+        1.toShort,
+        0,
+        7,
+        new SimpleRecord(1000, "idempotent".getBytes))
+      val idempotentInfo = nereusLog.appendAsLeader(idempotent, 7)
+      assertEquals(1L, idempotentInfo.firstOffset())
+      assertEquals(1L, idempotentInfo.lastOffset())
+      assertEquals(2L, nereusLog.logEndOffset)
+
+      val producerId = 17L
+      val producerEpoch = 1.toShort
+      val transactionVersion = TransactionVersion.TV_2.featureLevel()
+      val verificationGuard =
+        nereusLog.maybeStartTransactionVerification(producerId, 0, producerEpoch, true)
+      assertFalse(verificationGuard == VerificationGuard.SENTINEL)
+      val transactionalRecords = MemoryRecords.withTransactionalRecords(
+        Compression.NONE,
+        producerId,
+        producerEpoch,
+        0,
+        new SimpleRecord(2000, "transactional".getBytes))
+      val transactionalInfo = nereusLog.appendAsLeader(
+        transactionalRecords,
+        7,
+        AppendOrigin.CLIENT,
+        RequestLocal.noCaching,
+        verificationGuard,
+        transactionVersion,
+        -1)
+      assertEquals(2L, transactionalInfo.firstOffset())
+      assertEquals(2L, transactionalInfo.lastOffset())
+      assertTrue(nereusLog.hasOngoingTransaction(producerId, producerEpoch))
+      assertEquals(3L, snapshot.get().stableEndOffset())
+      assertEquals(3L, snapshot.get().highWatermark())
+      assertEquals(2L, snapshot.get().lastStableOffset())
+      val blockedTransactionalFetch =
+        nereusLog.read(2, 1024, FetchIsolation.TXN_COMMITTED, false)
+      assertEquals(0, blockedTransactionalFetch.records.sizeInBytes)
+      assertTrue(blockedTransactionalFetch.abortedTransactions.isPresent)
+      assertTrue(blockedTransactionalFetch.abortedTransactions.orElseThrow().isEmpty)
+
+      val markerEpoch = (producerEpoch + 1).toShort
+      val abortMarker = MemoryRecords.withEndTransactionMarker(
+        producerId,
+        markerEpoch,
+        new EndTransactionMarker(ControlRecordType.ABORT, 9))
+      val markerInfo = nereusLog.appendAsLeader(
+        abortMarker,
+        7,
+        AppendOrigin.COORDINATOR,
+        RequestLocal.noCaching,
+        VerificationGuard.SENTINEL,
+        transactionVersion,
+        -1)
+      assertEquals(3L, markerInfo.firstOffset())
+      assertEquals(3L, markerInfo.lastOffset())
+      assertFalse(nereusLog.hasOngoingTransaction(producerId, markerEpoch))
+      assertEquals(4L, snapshot.get().stableEndOffset())
+      assertEquals(4L, snapshot.get().highWatermark())
+      assertEquals(4L, snapshot.get().lastStableOffset())
+
+      val committedFetch = nereusLog.read(2, 1024, FetchIsolation.TXN_COMMITTED, false)
+      val committedBatches =
+        committedFetch.records.asInstanceOf[MemoryRecords].batches().iterator()
+      assertTrue(committedBatches.hasNext)
+      val committedData = committedBatches.next()
+      assertEquals(2L, committedData.baseOffset())
+      assertTrue(committedData.isTransactional)
+      assertFalse(committedData.isControlBatch)
+      assertTrue(committedBatches.hasNext)
+      val committedMarker = committedBatches.next()
+      assertEquals(3L, committedMarker.baseOffset())
+      assertTrue(committedMarker.isTransactional)
+      assertTrue(committedMarker.isControlBatch)
+      assertFalse(committedBatches.hasNext)
+      val abortedTransactions = committedFetch.abortedTransactions.orElseThrow()
+      assertEquals(1, abortedTransactions.size())
+      assertEquals(producerId, abortedTransactions.get(0).producerId())
+      assertEquals(2L, abortedTransactions.get(0).firstOffset())
+
+      val secondProducerId = 18L
+      val secondProducerEpoch = 1.toShort
+      val secondGuard =
+        nereusLog.maybeStartTransactionVerification(
+          secondProducerId,
+          0,
+          secondProducerEpoch,
+          true)
+      val secondTransactionalInfo = nereusLog.appendAsLeader(
+        MemoryRecords.withTransactionalRecords(
+          Compression.NONE,
+          secondProducerId,
+          secondProducerEpoch,
+          0,
+          new SimpleRecord(3000, "second-transaction".getBytes)),
+        7,
+        AppendOrigin.CLIENT,
+        RequestLocal.noCaching,
+        secondGuard,
+        transactionVersion,
+        -1)
+      assertEquals(4L, secondTransactionalInfo.firstOffset())
+      val secondMarkerInfo = nereusLog.appendAsLeader(
+        MemoryRecords.withEndTransactionMarker(
+          secondProducerId,
+          (secondProducerEpoch + 1).toShort,
+          new EndTransactionMarker(ControlRecordType.ABORT, 10)),
+        7,
+        AppendOrigin.COORDINATOR,
+        RequestLocal.noCaching,
+        VerificationGuard.SENTINEL,
+        transactionVersion,
+        -1)
+      assertEquals(5L, secondMarkerInfo.firstOffset())
+      assertEquals(6L, snapshot.get().lastStableOffset())
+
+      val boundedCommittedFetch =
+        nereusLog.read(2, committedData.sizeInBytes(), FetchIsolation.TXN_COMMITTED, false)
+      val boundedBatches =
+        boundedCommittedFetch.records.asInstanceOf[MemoryRecords].batches().iterator()
+      assertTrue(boundedBatches.hasNext)
+      assertEquals(2L, boundedBatches.next().baseOffset())
+      assertFalse(boundedBatches.hasNext)
+      val boundedAbortedTransactions =
+        boundedCommittedFetch.abortedTransactions.orElseThrow()
+      assertEquals(1, boundedAbortedTransactions.size())
+      assertEquals(producerId, boundedAbortedTransactions.get(0).producerId())
+
       corruptNextStableResult.set(true)
       assertThrows(classOf[KafkaStorageException], () =>
         nereusLog.appendAsLeader(TestUtils.singletonRecords("invalid-stable-result".getBytes), 7))
-      assertEquals(1L, nereusLog.logEndOffset)
+      assertEquals(6L, nereusLog.logEndOffset)
       verify(storage).resign()
 
       nereusLog.removeStorage(7, storage)

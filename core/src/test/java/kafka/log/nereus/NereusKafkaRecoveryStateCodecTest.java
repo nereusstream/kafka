@@ -17,27 +17,40 @@
 
 package kafka.log.nereus;
 
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.record.CompressionType;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.SimpleRecord;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.storage.internals.log.LogFileUtils;
+import org.apache.kafka.storage.internals.log.ProducerStateManagerConfig;
 
 import com.nereusstream.api.AppendAuthority;
 import com.nereusstream.api.Checksum;
 import com.nereusstream.api.ChecksumType;
 import com.nereusstream.api.ErrorCode;
 import com.nereusstream.api.NereusException;
+import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointState;
+import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointStateCodecV1;
 import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
+import com.nereusstream.kafka.checkpoint.KafkaDerivedIndexState;
+import com.nereusstream.kafka.checkpoint.KafkaLeaderEpochState;
+import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
+import com.nereusstream.kafka.checkpoint.KafkaVirtualSegmentState;
 import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.recovery.KafkaReplayBatch;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -49,8 +62,11 @@ class NereusKafkaRecoveryStateCodecTest {
                     0,
                     "events");
 
+    @TempDir
+    Path tempDir;
+
     @Test
-    void rebuildsAndFreezesExactM3DerivedStateAcrossLeaderEpochs() {
+    void rebuildsAndFreezesExactDerivedStateAcrossLeaderEpochs() throws Exception {
         byte[] first = bytes(MemoryRecords.withRecords(
                 0,
                 Compression.of(CompressionType.GZIP).build(),
@@ -63,7 +79,7 @@ class NereusKafkaRecoveryStateCodecTest {
                 7,
                 new SimpleRecord(200, "c".getBytes())));
         NereusKafkaRecoveryStateCodec codec =
-                new NereusKafkaRecoveryStateCodec(IDENTITY, 7, 0, 3);
+                codec(7, 0, 3, "epochs");
         NereusKafkaRecoveredState state = codec.freshState();
 
         codec.replayBatch(state, new KafkaReplayBatch(0, 1, first));
@@ -90,7 +106,7 @@ class NereusKafkaRecoveryStateCodecTest {
     }
 
     @Test
-    void rejectsIdempotentDataAndCheckpointHydrationUntilM4() {
+    void acceptsIdempotentReplayAndCanonicalCheckpointHydration() throws Exception {
         byte[] idempotent = bytes(MemoryRecords.withIdempotentRecords(
                 0,
                 Compression.of(CompressionType.NONE).build(),
@@ -100,32 +116,148 @@ class NereusKafkaRecoveryStateCodecTest {
                 7,
                 new SimpleRecord(100, "a".getBytes())));
         NereusKafkaRecoveryStateCodec codec =
-                new NereusKafkaRecoveryStateCodec(IDENTITY, 7, 0, 1);
+                codec(7, 0, 1, "idempotent");
         NereusKafkaRecoveredState state = codec.freshState();
 
-        NereusException unsupported = assertThrows(
-                NereusException.class,
-                () -> codec.replayBatch(
-                        state,
-                        new KafkaReplayBatch(0, 0, idempotent)));
-
-        assertEquals(ErrorCode.UNSUPPORTED_FORMAT, unsupported.code());
-        assertFalse(unsupported.retriable());
+        codec.replayBatch(state, new KafkaReplayBatch(0, 0, idempotent));
+        codec.validateRecoveredState(state, source(0, 1, 7));
+        assertEquals(1, state.producerTransactionState().producers().size());
+        assertEquals(
+                99,
+                state.producerTransactionState().producers().get(0).producerId());
 
         NereusKafkaRecoveryStateCodec checkpointCodec =
-                new NereusKafkaRecoveryStateCodec(IDENTITY, 7, 0, 0);
+                codec(7, 0, 0, "checkpoint");
         NereusKafkaRecoveredState checkpointState = checkpointCodec.freshState();
-        NereusException checkpointUnsupported = assertThrows(
-                NereusException.class,
-                () -> checkpointCodec.hydrateCheckpoint(
-                        checkpointState,
-                        List.of(),
-                        0));
-        assertEquals(ErrorCode.UNSUPPORTED_FORMAT, checkpointUnsupported.code());
+        KafkaProducerTransactionState empty =
+                new KafkaProducerTransactionState(
+                        0, List.of(), List.of(), List.of());
+        KafkaCanonicalCheckpointState genesis =
+                new KafkaCanonicalCheckpointState(
+                        0,
+                        0,
+                        0,
+                        empty,
+                        new KafkaLeaderEpochState(0, 0, List.of()),
+                        new KafkaVirtualSegmentState(0, 0, List.of(), List.of()),
+                        new KafkaDerivedIndexState(0, 0, List.of(), List.of()));
+        checkpointCodec.hydrateCheckpoint(
+                checkpointState,
+                new KafkaCanonicalCheckpointStateCodecV1()
+                        .encodeSections(genesis),
+                0);
+        checkpointCodec.validateRecoveredState(
+                checkpointState, source(0, 0, 7));
+        assertEquals(empty, checkpointState.producerTransactionState());
     }
 
     @Test
-    void rejectsTrailingBytesAndAFrozenSourceMismatch() {
+    void hydratesAllCanonicalSectionsBeforeReplayingTheCommittedTail()
+            throws Exception {
+        KafkaVirtualSegmentState.LogConfigHistoryEntry config =
+                KafkaVirtualSegmentState.LogConfigHistoryEntry.create(
+                        1,
+                        0,
+                        1_024,
+                        60_000,
+                        0,
+                        1_024,
+                        64,
+                        -1,
+                        -1,
+                        0,
+                        86_400_000,
+                        0,
+                        Long.MAX_VALUE,
+                        0.5,
+                        KafkaVirtualSegmentState.LogConfigHistoryEntry
+                                .CLEANUP_DELETE_FLAG);
+        KafkaVirtualSegmentState virtual =
+                new KafkaVirtualSegmentState(
+                        0,
+                        1,
+                        List.of(new KafkaVirtualSegmentState.VirtualSegment(
+                                0,
+                                1,
+                                0,
+                                1_000,
+                                0,
+                                0,
+                                1_000,
+                                0,
+                                10,
+                                0,
+                                10,
+                                config.configDigest(),
+                                KafkaVirtualSegmentState.RollReason.INITIAL,
+                                KafkaVirtualSegmentState.SegmentState.ACTIVE)),
+                        List.of(config));
+        KafkaCanonicalCheckpointState checkpoint =
+                new KafkaCanonicalCheckpointState(
+                        1,
+                        0,
+                        1,
+                        new KafkaProducerTransactionState(
+                                1, List.of(), List.of(), List.of()),
+                        new KafkaLeaderEpochState(
+                                0,
+                                1,
+                                List.of(new KafkaLeaderEpochState
+                                        .LeaderEpochRange(5, 0))),
+                        virtual,
+                        new KafkaDerivedIndexState(
+                                0,
+                                1,
+                                List.of(new KafkaDerivedIndexState
+                                        .SegmentTimeIndex(
+                                                0,
+                                                List.of(new KafkaDerivedIndexState
+                                                        .TimeIndexEntry(
+                                                                1_000,
+                                                                0)))),
+                                List.of(new KafkaDerivedIndexState
+                                        .SegmentLogicalByteIndex(
+                                                0,
+                                                10,
+                                                List.of()))));
+        byte[] tail = bytes(MemoryRecords.withIdempotentRecords(
+                1,
+                Compression.of(CompressionType.NONE).build(),
+                99,
+                (short) 1,
+                0,
+                7,
+                new SimpleRecord(2_000, "tail".getBytes())));
+        NereusKafkaRecoveryStateCodec codec =
+                codec(7, 0, 2, "checkpoint-tail");
+        NereusKafkaRecoveredState state = codec.freshState();
+
+        codec.hydrateCheckpoint(
+                state,
+                new KafkaCanonicalCheckpointStateCodecV1()
+                        .encodeSections(checkpoint),
+                1);
+        codec.replayBatch(state, new KafkaReplayBatch(1, 1, tail));
+        codec.validateRecoveredState(state, source(0, 2, 7));
+
+        assertEquals(10 + tail.length, state.logicalBytes());
+        assertEquals(1, state.batchCount());
+        assertEquals(1, state.recordCount());
+        assertEquals(2_000, state.largestTimestamp().orElseThrow());
+        assertEquals(1, state.maxTimestampOffset().orElseThrow());
+        assertEquals(
+                List.of(
+                        new NereusKafkaRecoveredState.LeaderEpochRange(5, 0),
+                        new NereusKafkaRecoveredState.LeaderEpochRange(7, 1)),
+                state.leaderEpochRanges());
+        assertEquals(
+                99,
+                state.producerTransactionState()
+                        .producers().get(0).producerId());
+    }
+
+    @Test
+    void rejectsTrailingBytesAndAFrozenSourceMismatch() throws Exception {
         byte[] exact = bytes(MemoryRecords.withRecords(
                 0,
                 Compression.of(CompressionType.NONE).build(),
@@ -134,7 +266,7 @@ class NereusKafkaRecoveryStateCodecTest {
         byte[] trailing = java.util.Arrays.copyOf(exact, exact.length + 1);
         trailing[trailing.length - 1] = 1;
         NereusKafkaRecoveryStateCodec trailingCodec =
-                new NereusKafkaRecoveryStateCodec(IDENTITY, 7, 0, 1);
+                codec(7, 0, 1, "trailing");
 
         NereusException malformed = assertThrows(
                 NereusException.class,
@@ -145,7 +277,7 @@ class NereusKafkaRecoveryStateCodecTest {
         assertEquals(ErrorCode.METADATA_INVARIANT_VIOLATION, malformed.code());
 
         NereusKafkaRecoveryStateCodec mismatchCodec =
-                new NereusKafkaRecoveryStateCodec(IDENTITY, 7, 0, 1);
+                codec(7, 0, 1, "mismatch");
         NereusKafkaRecoveredState mismatch = mismatchCodec.freshState();
         mismatchCodec.replayBatch(
                 mismatch,
@@ -158,6 +290,34 @@ class NereusKafkaRecoveryStateCodecTest {
         assertEquals(
                 ErrorCode.METADATA_INVARIANT_VIOLATION,
                 sourceMismatch.code());
+    }
+
+    private NereusKafkaRecoveryStateCodec codec(
+            int leaderEpoch,
+            long logStartOffset,
+            long stableEndOffset,
+            String directory
+    ) throws IOException {
+        Path path = Files.createDirectories(tempDir.resolve(directory));
+        NereusTransactionIndex transactionIndex =
+                new NereusTransactionIndex(
+                        logStartOffset,
+                        LogFileUtils.transactionIndexFile(
+                                path.toFile(), logStartOffset));
+        NereusProducerStateManager producerStateManager =
+                new NereusProducerStateManager(
+                        new TopicPartition("events", 0),
+                        path.toFile(),
+                        15 * 60 * 1000,
+                        new ProducerStateManagerConfig(86_400_000, false),
+                        Time.SYSTEM,
+                        transactionIndex);
+        return new NereusKafkaRecoveryStateCodec(
+                IDENTITY,
+                leaderEpoch,
+                logStartOffset,
+                stableEndOffset,
+                producerStateManager);
     }
 
     private static KafkaCheckpointSourceState source(

@@ -20,6 +20,7 @@ package kafka.server.nereus;
 import kafka.cluster.Partition;
 import kafka.log.nereus.NereusKafkaRecoveredState;
 import kafka.log.nereus.NereusKafkaRecoveryStateCodec;
+import kafka.log.nereus.NereusProducerStateManager;
 import kafka.log.nereus.NereusUnifiedLog;
 import kafka.server.ReplicaManager;
 
@@ -71,12 +72,20 @@ public final class NereusKafkaRecoveryStateFactory
                             "Kafka recovery target is not an online ReplicaManager partition");
                 });
         requireExactPartition(partition, identity, leaderEpoch);
+        if (!(partition.localLogOrException() instanceof NereusUnifiedLog nereusLog)) {
+            throw invariant(
+                    "Kafka recovery target does not own a Nereus UnifiedLog");
+        }
+        NereusProducerStateManager producerStateManager =
+                nereusLog.prepareProducerRecovery(
+                        leaderEpoch, source.trimOffset());
         NereusKafkaRecoveryStateCodec codec =
                 new NereusKafkaRecoveryStateCodec(
                         identity,
                         leaderEpoch,
                         source.trimOffset(),
-                        source.endOffset());
+                        source.endOffset(),
+                        producerStateManager);
         return new KafkaRecoveryState<>(
                 codec,
                 recovered -> publish(

@@ -26,11 +26,15 @@ import org.apache.kafka.storage.internals.log.LeaderEpochAwareRecoveryState;
 
 import com.nereusstream.api.ErrorCode;
 import com.nereusstream.api.NereusException;
+import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointState;
+import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointStateCodecV1;
 import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
+import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
 import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.recovery.KafkaReplayBatch;
 import com.nereusstream.objectstore.kafka.checkpoint.KafkaCheckpointSection;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -39,17 +43,20 @@ import java.util.Objects;
 import java.util.OptionalLong;
 
 /**
- * Fresh M3-derived Kafka state rebuilt from exact COMMITTED RecordBatch bytes.
+ * Fresh Kafka state rebuilt from NKC1 and exact COMMITTED RecordBatch bytes.
  *
  * <p>The object is mutable only while owned by one recovery codec. Validation freezes it before the partition
- * publisher can expose it. M3 deliberately rejects producer, transaction, control and NKC1-derived state; M4 replaces
- * those fail-closed boundaries with stock producer/transaction recovery.
+ * publisher can expose it. Producer idempotence and transaction semantics are delegated to the exact stock
+ * {@link NereusProducerStateManager} instance that the target {@link NereusUnifiedLog} will publish.
  */
 public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecoveryState {
     private final KafkaPartitionIdentity identity;
     private final int leaderEpoch;
     private final long logStartOffset;
     private final long expectedStableEndOffset;
+    private final NereusProducerStateManager producerStateManager;
+    private final KafkaCanonicalCheckpointStateCodecV1 checkpointCodec =
+            new KafkaCanonicalCheckpointStateCodecV1();
     private final List<LeaderEpochRange> leaderEpochRanges = new ArrayList<>();
 
     private long nextOffset;
@@ -58,13 +65,17 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
     private long logicalBytes;
     private long largestTimestamp = RecordBatch.NO_TIMESTAMP;
     private long maxTimestampOffset = -1;
+    private long lastStableOffset;
+    private KafkaProducerTransactionState producerTransactionState;
+    private boolean checkpointHydrated;
     private boolean frozen;
 
     NereusKafkaRecoveredState(
             KafkaPartitionIdentity identity,
             int leaderEpoch,
             long logStartOffset,
-            long expectedStableEndOffset
+            long expectedStableEndOffset,
+            NereusProducerStateManager producerStateManager
     ) {
         this.identity = Objects.requireNonNull(identity, "identity");
         if (leaderEpoch < 0
@@ -75,6 +86,16 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
         this.leaderEpoch = leaderEpoch;
         this.logStartOffset = logStartOffset;
         this.expectedStableEndOffset = expectedStableEndOffset;
+        this.producerStateManager = Objects.requireNonNull(
+                producerStateManager, "producerStateManager");
+        try {
+            this.producerStateManager.resetForRecovery(logStartOffset);
+        } catch (IOException failure) {
+            throw invariant(
+                    "Kafka producer state reset failed before recovery",
+                    failure);
+        }
+        this.nextOffset = logStartOffset;
     }
 
     void hydrateCheckpoint(
@@ -83,11 +104,43 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
     ) {
         requireMutable();
         Objects.requireNonNull(sections, "sections");
-        throw new NereusException(
-                ErrorCode.UNSUPPORTED_FORMAT,
-                false,
-                "F9-M3 Kafka recovery does not yet consume NKC1 derived-state sections at offset "
-                        + checkpointOffset);
+        if (checkpointHydrated
+                || batchCount != 0
+                || nextOffset != logStartOffset
+                || checkpointOffset < logStartOffset
+                || checkpointOffset > expectedStableEndOffset) {
+            throw invariant(
+                    "Kafka producer checkpoint is not the initial bounded recovery state");
+        }
+        try {
+            KafkaCanonicalCheckpointState checkpoint =
+                    checkpointCodec.decodeSections(
+                            sections,
+                            checkpointOffset,
+                            logStartOffset,
+                            checkpointOffset);
+            producerStateManager.restoreCanonical(
+                    checkpoint.producerTransactionState());
+            checkpoint.leaderEpochState().ranges().forEach(range ->
+                    observeLeaderEpoch(
+                            range.leaderEpoch(),
+                            range.startOffset()));
+            checkpoint.virtualSegmentState().segments().forEach(segment -> {
+                logicalBytes = addExact(
+                        logicalBytes,
+                        segment.logicalBytes(),
+                        "Kafka checkpoint logical bytes overflow");
+                observeTimestamp(
+                        segment.largestTimestamp(),
+                        segment.maxTimestampOffset());
+            });
+            nextOffset = checkpointOffset;
+            checkpointHydrated = true;
+        } catch (IOException | RuntimeException failure) {
+            throw invariant(
+                    "Kafka producer checkpoint cannot hydrate stock state",
+                    failure);
+        }
     }
 
     void replay(KafkaReplayBatch replay) {
@@ -97,10 +150,14 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
             throw invariant("Kafka recovery state received a non-contiguous batch");
         }
         RecordBatch batch = exactBatch(replay);
-        requireM3Batch(batch);
         long batchRecords = validateRecords(batch);
         long expectedNext = addExact(
                 batch.lastOffset(), 1, "Kafka recovery batch offset overflows");
+        try {
+            producerStateManager.replayBatch(batch);
+        } catch (IOException | RuntimeException failure) {
+            throw invariant("Kafka producer state replay failed", failure);
+        }
         observeLeaderEpoch(batch.partitionLeaderEpoch(), batch.baseOffset());
         nextOffset = expectedNext;
         batchCount = addExact(batchCount, 1, "Kafka recovery batch count overflows");
@@ -133,15 +190,6 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
         return batch;
     }
 
-    private static void requireM3Batch(RecordBatch batch) {
-        if (batch.hasProducerId() || batch.isTransactional() || batch.isControlBatch()) {
-            throw new NereusException(
-                    ErrorCode.UNSUPPORTED_FORMAT,
-                    false,
-                    "F9-M3 recovery accepts only non-idempotent non-transactional data batches");
-        }
-    }
-
     private long validateRecords(RecordBatch batch) {
         long recordOffset = batch.baseOffset();
         long batchRecords = 0;
@@ -172,6 +220,12 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
                 || source.stateMapEndOffset() != source.endOffset()) {
             throw invariant("Kafka recovered state does not match the frozen stable source");
         }
+        producerTransactionState =
+                producerStateManager.freezeCanonical(expectedStableEndOffset);
+        lastStableOffset = producerStateManager.firstUnstableOffset()
+                .map(offset -> Math.min(
+                        offset.messageOffset, expectedStableEndOffset))
+                .orElse(expectedStableEndOffset);
         observeLeaderEpoch(leaderEpoch, expectedStableEndOffset);
         frozen = true;
     }
@@ -206,7 +260,13 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
     }
 
     public long lastStableOffset() {
-        return stableEndOffset();
+        requireFrozen();
+        return lastStableOffset;
+    }
+
+    public KafkaProducerTransactionState producerTransactionState() {
+        requireFrozen();
+        return producerTransactionState;
     }
 
     public int batchCount() {
@@ -246,6 +306,10 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
     @Override
     public boolean frozen() {
         return frozen;
+    }
+
+    NereusProducerStateManager producerStateManager() {
+        return producerStateManager;
     }
 
     private void observeLeaderEpoch(int observedEpoch, long startOffset) {
@@ -316,6 +380,17 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
                 ErrorCode.METADATA_INVARIANT_VIOLATION,
                 false,
                 message);
+    }
+
+    private static NereusException invariant(
+            String message,
+            Throwable cause
+    ) {
+        return new NereusException(
+                ErrorCode.METADATA_INVARIANT_VIOLATION,
+                false,
+                message,
+                cause);
     }
 
     public record LeaderEpochRange(int leaderEpoch, long startOffset) {

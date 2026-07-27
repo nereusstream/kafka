@@ -22,6 +22,8 @@ import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
+import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 
@@ -52,6 +54,35 @@ public class ProducerStateEntry {
         this.coordinatorEpoch = coordinatorEpoch;
         this.lastTimestamp = lastTimestamp;
         this.currentTxnFirstOffset = currentTxnFirstOffset;
+    }
+
+    /**
+     * Restores an exact producer entry whose final scalar fields and retained batch window were
+     * captured independently.
+     *
+     * <p>Unlike {@link #addBatch(short, int, long, int, long)}, loading the retained batches must
+     * not overwrite {@code lastTimestamp}: a later transaction marker may be the producer's last
+     * observed record even though the deduplication window still contains only data batches.
+     */
+    public static ProducerStateEntry fromBatchMetadata(long producerId,
+                                                       short producerEpoch,
+                                                       int coordinatorEpoch,
+                                                       long lastTimestamp,
+                                                       OptionalLong currentTxnFirstOffset,
+                                                       List<BatchMetadata> batches) {
+        Objects.requireNonNull(currentTxnFirstOffset, "currentTxnFirstOffset");
+        List<BatchMetadata> exactBatches = List.copyOf(Objects.requireNonNull(batches, "batches"));
+        if (exactBatches.size() > NUM_BATCHES_TO_RETAIN) {
+            throw new IllegalArgumentException("Too many retained producer batches");
+        }
+        ProducerStateEntry entry = new ProducerStateEntry(
+                producerId,
+                producerEpoch,
+                coordinatorEpoch,
+                lastTimestamp,
+                currentTxnFirstOffset);
+        exactBatches.forEach(batch -> entry.addBatchMetadata(Objects.requireNonNull(batch, "batch")));
+        return entry;
     }
 
     int firstSeq() {

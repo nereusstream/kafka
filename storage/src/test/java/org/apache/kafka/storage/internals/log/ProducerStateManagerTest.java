@@ -1335,6 +1335,28 @@ public class ProducerStateManagerTest {
         assertEntries(expectedEntryMap, ProducerStateManager.readSnapshot(file));
     }
 
+    @Test
+    public void testRestoreBatchMetadataDoesNotOverwriteFinalTimestamp() {
+        List<BatchMetadata> batches = List.of(
+                new BatchMetadata(1, 11L, 1, 1_000L),
+                new BatchMetadata(3, 13L, 1, 1_001L));
+
+        ProducerStateEntry restored = ProducerStateEntry.fromBatchMetadata(
+                7L,
+                (short) 2,
+                9,
+                2_002L,
+                OptionalLong.empty(),
+                batches);
+
+        assertEquals(7L, restored.producerId());
+        assertEquals((short) 2, restored.producerEpoch());
+        assertEquals(9, restored.coordinatorEpoch());
+        assertEquals(2_002L, restored.lastTimestamp());
+        assertEquals(OptionalLong.empty(), restored.currentTxnFirstOffset());
+        assertEquals(batches, List.copyOf(restored.batchMetadata()));
+    }
+
     private void appendEntry(ProducerStateManager stateManager,
                              long producerId,
                              short producerEpoch,

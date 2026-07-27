@@ -19,6 +19,7 @@ package kafka.server.nereus;
 
 import kafka.cluster.Partition;
 import kafka.log.nereus.NereusKafkaRecoveredState;
+import kafka.log.nereus.NereusProducerStateManager;
 import kafka.log.nereus.NereusUnifiedLog;
 import kafka.server.ReplicaManager;
 
@@ -30,6 +31,7 @@ import com.nereusstream.api.Checksum;
 import com.nereusstream.api.ChecksumType;
 import com.nereusstream.api.NereusException;
 import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
+import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
 import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.recovery.KafkaCheckpointRecoveryRequest;
 import com.nereusstream.kafka.recovery.KafkaPartitionRecoveryRequest;
@@ -40,6 +42,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 
 import scala.Option;
@@ -73,6 +76,15 @@ class NereusKafkaRecoveryStateFactoryTest {
         when(partition.getLeaderEpoch()).thenReturn(7);
         NereusUnifiedLog log = Mockito.mock(NereusUnifiedLog.class);
         when(partition.localLogOrException()).thenReturn(log);
+        NereusProducerStateManager producerStateManager =
+                Mockito.mock(NereusProducerStateManager.class);
+        when(log.prepareProducerRecovery(7, 0))
+                .thenReturn(producerStateManager);
+        when(producerStateManager.firstUnstableOffset())
+                .thenReturn(Optional.empty());
+        when(producerStateManager.freezeCanonical(0))
+                .thenReturn(new KafkaProducerTransactionState(
+                        0, List.of(), List.of(), List.of()));
         KafkaCheckpointSourceState source = source(7);
         KafkaPartitionRecoveryRequest request = request(source);
         NereusKafkaRecoveryStateFactory factory =

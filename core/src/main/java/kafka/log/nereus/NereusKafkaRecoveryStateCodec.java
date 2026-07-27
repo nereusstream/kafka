@@ -27,20 +27,22 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Creates exactly one fresh M3 Kafka state and delegates all replay invariants to it. */
+/** Creates exactly one fresh Kafka state and delegates all replay invariants to it. */
 public final class NereusKafkaRecoveryStateCodec
         implements KafkaRecoveryStateCodec<NereusKafkaRecoveredState> {
     private final KafkaPartitionIdentity identity;
     private final int leaderEpoch;
     private final long logStartOffset;
     private final long stableEndOffset;
+    private final NereusProducerStateManager producerStateManager;
     private final AtomicBoolean created = new AtomicBoolean();
 
     public NereusKafkaRecoveryStateCodec(
             KafkaPartitionIdentity identity,
             int leaderEpoch,
             long logStartOffset,
-            long stableEndOffset
+            long stableEndOffset,
+            NereusProducerStateManager producerStateManager
     ) {
         this.identity = Objects.requireNonNull(identity, "identity");
         if (leaderEpoch < 0
@@ -51,6 +53,8 @@ public final class NereusKafkaRecoveryStateCodec
         this.leaderEpoch = leaderEpoch;
         this.logStartOffset = logStartOffset;
         this.stableEndOffset = stableEndOffset;
+        this.producerStateManager = Objects.requireNonNull(
+                producerStateManager, "producerStateManager");
     }
 
     @Override
@@ -62,7 +66,8 @@ public final class NereusKafkaRecoveryStateCodec
                 identity,
                 leaderEpoch,
                 logStartOffset,
-                stableEndOffset);
+                stableEndOffset,
+                producerStateManager);
     }
 
     @Override
