@@ -18,8 +18,10 @@ package kafka.cluster
 
 import java.lang.{Long => JLong}
 import java.util.concurrent.locks.ReentrantReadWriteLock
-import java.util.Optional
+import java.util.{Objects, Optional}
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
+import com.nereusstream.kafka.partition.KafkaPartitionStorage
+import com.nereusstream.kafka.retention.KafkaPartitionMaintenance
 import kafka.log._
 import kafka.log.nereus.NereusUnifiedLog
 import kafka.server._
@@ -1700,25 +1702,53 @@ class Partition(val topicPartition: TopicPartition,
         val durableLowWatermark = nereusLog.deleteRecords(
           capturedLeaderEpoch,
           convertedOffset,
-          (expectedStorage, expectedLeaderEpoch, durableOffset) => {
-            inReadLock(leaderIsrUpdateLock) {
-              leaderLogIfLocal match {
-                case Some(current: NereusUnifiedLog)
-                    if (current eq nereusLog) && leaderEpoch == expectedLeaderEpoch =>
-                  current.publishDurableLogStart(
-                    expectedStorage,
-                    expectedLeaderEpoch,
-                    durableOffset)
-                  tryCompleteDelayedRequests()
-                case _ =>
-                  throw new NotLeaderOrFollowerException(
-                    s"Nereus DeleteRecords completion is stale for partition $topicPartition")
-              }
-            }
-          })
+          nereusMaintenanceAuthority(nereusLog))
         LogDeleteRecordsResult(
           requestedOffset = convertedOffset,
           lowWatermark = durableLowWatermark)
+    }
+  }
+
+  private[kafka] def nereusMaintenanceAuthority(
+    expectedLog: NereusUnifiedLog
+  ): NereusUnifiedLog.MaintenanceAuthority = {
+    Objects.requireNonNull(expectedLog, "expectedLog")
+    new NereusUnifiedLog.MaintenanceAuthority {
+      override def capture(
+        expectedStorage: KafkaPartitionStorage,
+        expectedLeaderEpoch: Int,
+        capture: NereusUnifiedLog.MaintenanceCapture
+      ): KafkaPartitionMaintenance.Capture = inReadLock(leaderIsrUpdateLock) {
+        requireCurrentNereusLeader(expectedLog, expectedLeaderEpoch)
+        Objects.requireNonNull(capture, "capture").capture()
+      }
+
+      override def publish(
+        expectedStorage: KafkaPartitionStorage,
+        expectedLeaderEpoch: Int,
+        durableOffset: Long
+      ): Unit = inReadLock(leaderIsrUpdateLock) {
+        val current = requireCurrentNereusLeader(expectedLog, expectedLeaderEpoch)
+        current.publishDurableLogStart(
+          expectedStorage,
+          expectedLeaderEpoch,
+          durableOffset)
+        tryCompleteDelayedRequests()
+      }
+    }
+  }
+
+  private def requireCurrentNereusLeader(
+    expectedLog: NereusUnifiedLog,
+    expectedLeaderEpoch: Int
+  ): NereusUnifiedLog = {
+    leaderLogIfLocal match {
+      case Some(current: NereusUnifiedLog)
+          if (current eq expectedLog) && leaderEpoch == expectedLeaderEpoch =>
+        current
+      case _ =>
+        throw new NotLeaderOrFollowerException(
+          s"Nereus maintenance completion is stale for partition $topicPartition")
     }
   }
 

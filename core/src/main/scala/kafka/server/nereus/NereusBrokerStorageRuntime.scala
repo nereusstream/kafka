@@ -177,6 +177,7 @@ final class NereusBrokerStorageRuntime(
       deferred.bindRecoveryStateFactory(Objects.requireNonNull(
         recoveryStateFactoryCreator.apply(replicaManager),
         "Kafka recovery state factory creator returned null"))
+      deferred.bindReplicaManager(replicaManager)
     case _ =>
   }
 

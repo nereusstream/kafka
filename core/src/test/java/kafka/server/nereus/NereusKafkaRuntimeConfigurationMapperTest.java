@@ -43,10 +43,11 @@ class NereusKafkaRuntimeConfigurationMapperTest {
 
     @Test
     void mapsExactObjectWalRuntimeWithoutProviderIo() {
+        NereusKafkaStorageConfig config = configuration(
+                NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT,
+                "s3");
         NereusKafkaMappedRuntimeConfiguration mapped =
-                map(configuration(
-                        NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT,
-                        "s3"));
+                map(config);
 
         assertEquals(
                 "kafka-broker-7-epoch-0",
@@ -88,6 +89,12 @@ class NereusKafkaRuntimeConfigurationMapperTest {
         assertEquals(
                 1024L * 1024 * 1024,
                 mapped.maintenance().maxStagingBytes());
+        assertEquals(
+                config.retentionCompaction().retentionCheckInterval(),
+                mapped.maintenance().retentionInterval());
+        assertEquals(
+                config.lifecycle().executorThreads(),
+                mapped.maintenance().maxConcurrentPartitions());
         assertEquals(
                 ChecksumType.SHA256,
                 mapped.maintenance().contentPolicySha256().type());

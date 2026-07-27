@@ -22,7 +22,7 @@ import org.apache.kafka.metadata.KRaftMetadataCache;
 import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 import org.apache.kafka.server.util.KafkaScheduler;
 
-import com.nereusstream.kafka.recovery.KafkaRecoveryStateFactory;
+import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalActivationContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeFactory;
@@ -65,8 +65,10 @@ public final class NereusKafkaProductRuntimeCreator {
             Time time,
             KRaftMetadataCache metadataCache,
             List<Path> logDirectories,
-            KafkaRecoveryStateFactory recoveryStateFactory
+            NereusKafkaForkRuntimeBridges bridges
     ) {
+        NereusKafkaForkRuntimeBridges exactBridges =
+                Objects.requireNonNull(bridges, "bridges");
         NereusKafkaMappedRuntimeConfiguration mapped = mapper.map(
                 storage,
                 kafkaClusterId,
@@ -90,7 +92,8 @@ public final class NereusKafkaProductRuntimeCreator {
                         Objects.requireNonNull(
                                 scheduler, "scheduler").scheduledExecutorService(),
                         Objects.requireNonNull(
-                                recoveryStateFactory, "recoveryStateFactory"),
+                                exactBridges.recoveryStateFactory(),
+                                "recoveryStateFactory"),
                         clock,
                         () -> CompletableFuture.completedFuture(null));
         NereusKafkaObjectWalActivationContext activation =
@@ -106,7 +109,9 @@ public final class NereusKafkaProductRuntimeCreator {
                                 storage.rollout().capabilityHeartbeat(),
                                 storage.rollout().readinessTimeout()),
                         Optional.empty(),
-                        Optional.of(mapped.maintenance()));
+                        Optional.of(new NereusKafkaMaintenanceContext(
+                                mapped.maintenance(),
+                                exactBridges.ownedPartitions())));
         return NereusKafkaObjectWalRuntimeFactory.createActivated(
                 mapped.runtime(), context, activation);
     }

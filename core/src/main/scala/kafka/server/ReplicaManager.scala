@@ -19,6 +19,7 @@ package kafka.server
 import com.yammer.metrics.core.Meter
 import kafka.cluster.Partition
 import kafka.log.LogManager
+import kafka.log.nereus.NereusUnifiedLog
 import kafka.server.HostedPartition.Online
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.ReplicaManager.{AtMinIsrPartitionCountMetricName, FailedIsrUpdatesPerSecMetricName, IsrExpandsPerSecMetricName, IsrShrinksPerSecMetricName, LeaderCountMetricName, OfflineReplicaCountMetricName, PartitionCountMetricName, PartitionsWithLateTransactionsCountMetricName, ProducerIdCountMetricName, ReassigningPartitionsMetricName, UnderMinIsrPartitionCountMetricName, UnderReplicatedPartitionsMetricName, createLogReadResult, isListOffsetsTimestampUnsupported}
@@ -2379,6 +2380,25 @@ class ReplicaManager(val config: KafkaConfig,
 
   private def leaderPartitionsIterator: Iterator[Partition] =
     onlinePartitionsIterator.filter(_.leaderLogIfLocal.isDefined)
+
+  // Nereus inject start: bounded weakly-consistent snapshot for product background maintenance
+  private[server] def nereusOnlineLeaderPartitions(
+    maximumPartitions: Int
+  ): util.List[Partition] = {
+    if (maximumPartitions <= 0 || maximumPartitions > 100000)
+      throw new IllegalArgumentException("maximumPartitions must be in [1, 100000]")
+    val result = new util.ArrayList[Partition](Math.min(maximumPartitions, 1024))
+    val leaders = leaderPartitionsIterator
+    while (leaders.hasNext && result.size() <= maximumPartitions) {
+      val partition = leaders.next()
+      partition.leaderLogIfLocal match {
+        case Some(_: NereusUnifiedLog) => result.add(partition)
+        case _ =>
+      }
+    }
+    result
+  }
+  // Nereus inject end: bounded weakly-consistent snapshot for product background maintenance
 
   def getLogEndOffset(topicPartition: TopicPartition): Option[Long] =
     onlinePartition(topicPartition).flatMap(_.leaderLogIfLocal.map(_.logEndOffset))

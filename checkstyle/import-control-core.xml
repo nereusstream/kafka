@@ -93,6 +93,7 @@
       <allow pkg="com.nereusstream.kafka.checkpoint" />
       <allow pkg="com.nereusstream.kafka.partition" />
       <allow pkg="com.nereusstream.kafka.recovery" />
+      <allow pkg="com.nereusstream.kafka.retention" />
       <allow pkg="com.nereusstream.kafka.runtime" />
       <allow pkg="com.nereusstream.metadata.oxia" />
       <allow pkg="com.nereusstream.metadata.oxia.records" />

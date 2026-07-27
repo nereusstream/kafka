@@ -58,6 +58,7 @@ public final class NereusKafkaDeferredRuntime implements NereusKafkaRuntime {
     private final Duration brokerEpochWaitTimeout;
     private final LongFunction<NereusKafkaRuntime> runtimeCreator;
     private final NereusKafkaRecoveryStateFactoryBridge recoveryBridge;
+    private final NereusKafkaOwnedPartitionSourceBridge ownedPartitions;
     private final KafkaStorageAdmission admission = new KafkaStorageAdmission();
     private final CompletableFuture<NereusKafkaRuntime> readyRuntime =
             new CompletableFuture<>();
@@ -79,6 +80,25 @@ public final class NereusKafkaDeferredRuntime implements NereusKafkaRuntime {
             LongFunction<NereusKafkaRuntime> runtimeCreator,
             NereusKafkaRecoveryStateFactoryBridge recoveryBridge
     ) {
+        this(
+                brokerEpochSupplier,
+                scheduler,
+                time,
+                brokerEpochWaitTimeout,
+                runtimeCreator,
+                recoveryBridge,
+                new NereusKafkaOwnedPartitionSourceBridge());
+    }
+
+    public NereusKafkaDeferredRuntime(
+            LongSupplier brokerEpochSupplier,
+            KafkaScheduler scheduler,
+            Time time,
+            Duration brokerEpochWaitTimeout,
+            LongFunction<NereusKafkaRuntime> runtimeCreator,
+            NereusKafkaRecoveryStateFactoryBridge recoveryBridge,
+            NereusKafkaOwnedPartitionSourceBridge ownedPartitions
+    ) {
         this.brokerEpochSupplier = Objects.requireNonNull(
                 brokerEpochSupplier, "brokerEpochSupplier");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
@@ -89,10 +109,16 @@ public final class NereusKafkaDeferredRuntime implements NereusKafkaRuntime {
                 runtimeCreator, "runtimeCreator");
         this.recoveryBridge = Objects.requireNonNull(
                 recoveryBridge, "recoveryBridge");
+        this.ownedPartitions = Objects.requireNonNull(
+                ownedPartitions, "ownedPartitions");
     }
 
     public void bindRecoveryStateFactory(KafkaRecoveryStateFactory stateFactory) {
         recoveryBridge.bind(stateFactory);
+    }
+
+    public void bindReplicaManager(kafka.server.ReplicaManager replicaManager) {
+        ownedPartitions.bind(replicaManager);
     }
 
     @Override

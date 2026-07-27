@@ -390,13 +390,13 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     public long deleteRecords(
             int leaderEpoch,
             long normalizedOffset,
-            DurableLogStartPublisher publisher
+            MaintenanceAuthority authority
     ) {
         if (leaderEpoch < 0 || normalizedOffset < 0) {
             throw new IllegalArgumentException(
                     "Kafka DeleteRecords leader epoch and normalized offset must be non-negative");
         }
-        Objects.requireNonNull(publisher, "publisher");
+        Objects.requireNonNull(authority, "authority");
         KafkaPartitionStorage exactStorage;
         KafkaPartitionMaintenance maintenance;
         synchronized (nereusGuard) {
@@ -406,8 +406,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                     new KafkaStorageException(
                             "Nereus partition maintenance is not configured"));
         }
-        KafkaPartitionMaintenance.Hooks hooks = maintenanceHooks(
-                exactStorage, leaderEpoch, publisher);
+        KafkaPartitionMaintenance.Hooks hooks =
+                maintenanceHooks(exactStorage, leaderEpoch, authority);
         CompletableFuture<KafkaDeleteRecordsCoordinator.Result> deletion;
         try {
             deletion = Objects.requireNonNull(
@@ -448,6 +448,24 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         return result.durableLowWatermark();
     }
 
+    /** Creates authority-fenced hooks for the product-owned periodic retention runtime. */
+    public KafkaPartitionMaintenance.Hooks maintenanceHooks(
+            int leaderEpoch,
+            MaintenanceAuthority authority
+    ) {
+        Objects.requireNonNull(authority, "authority");
+        KafkaPartitionStorage exactStorage;
+        synchronized (nereusGuard) {
+            requirePublished(leaderEpoch);
+            exactStorage = storage;
+            if (exactStorage.maintenance().isEmpty()) {
+                throw new KafkaStorageException(
+                        "Nereus partition maintenance is not configured");
+            }
+        }
+        return maintenanceHooks(exactStorage, leaderEpoch, authority);
+    }
+
     public void publishDurableLogStart(
             KafkaPartitionStorage expectedStorage,
             int expectedLeaderEpoch,
@@ -472,23 +490,31 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private KafkaPartitionMaintenance.Hooks maintenanceHooks(
             KafkaPartitionStorage exactStorage,
             int leaderEpoch,
-            DurableLogStartPublisher publisher
+            MaintenanceAuthority authority
     ) {
         return new KafkaPartitionMaintenance.Hooks() {
             @Override
             public CompletableFuture<KafkaPartitionMaintenance.Capture> capture(
-                    KafkaCheckpointSourceState currentSource
+                KafkaCheckpointSourceState currentSource
             ) {
                 try {
-                    synchronized (nereusGuard) {
-                        requireSamePublishedStorage(exactStorage);
-                        KafkaStableSnapshot snapshot = exactStorage.stableSnapshot();
-                        return CompletableFuture.completedFuture(
-                                new KafkaPartitionMaintenance.Capture(
-                                        canonicalCheckpoint(currentSource, snapshot),
-                                        snapshot.highWatermark(),
-                                        snapshot.lastStableOffset()));
-                    }
+                    KafkaPartitionMaintenance.Capture captured =
+                            authority.capture(
+                                    exactStorage,
+                                    leaderEpoch,
+                                    () -> {
+                                        synchronized (nereusGuard) {
+                                            requireSamePublishedStorage(exactStorage);
+                                            KafkaStableSnapshot snapshot =
+                                                    exactStorage.stableSnapshot();
+                                            return new KafkaPartitionMaintenance.Capture(
+                                                    canonicalCheckpoint(
+                                                            currentSource, snapshot),
+                                                    snapshot.highWatermark(),
+                                                    snapshot.lastStableOffset());
+                                        }
+                                    });
+                    return CompletableFuture.completedFuture(captured);
                 } catch (Throwable failure) {
                     return CompletableFuture.failedFuture(failure);
                 }
@@ -506,7 +532,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                         throw fenced(
                                 "Nereus durable trim completion changed partition authority");
                     }
-                    publisher.publish(exactStorage, leaderEpoch, durableTrimOffset);
+                    authority.publish(exactStorage, leaderEpoch, durableTrimOffset);
                     return CompletableFuture.completedFuture(null);
                 } catch (Throwable failure) {
                     return CompletableFuture.failedFuture(failure);
@@ -1085,11 +1111,21 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         }
     }
 
-    @FunctionalInterface
-    public interface DurableLogStartPublisher {
+    /** Partition-lock authority supplied by the exact current ReplicaManager partition. */
+    public interface MaintenanceAuthority {
+        KafkaPartitionMaintenance.Capture capture(
+                KafkaPartitionStorage expectedStorage,
+                int expectedLeaderEpoch,
+                MaintenanceCapture capture);
+
         void publish(
                 KafkaPartitionStorage expectedStorage,
                 int expectedLeaderEpoch,
                 long durableOffset);
+    }
+
+    @FunctionalInterface
+    public interface MaintenanceCapture {
+        KafkaPartitionMaintenance.Capture capture();
     }
 }

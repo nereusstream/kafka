@@ -292,6 +292,11 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 storage.lifecycle().recoveryTimeout(),
                 storage.append().timeout(),
                 pendingProtection,
+                storage.retentionCompaction().retentionCheckInterval(),
+                storage.lifecycle().executorThreads(),
+                Math.max(
+                        storage.lifecycle().executorThreads(),
+                        storage.lifecycle().registryScanPageSize()),
                 new Checksum(
                         ChecksumType.SHA256,
                         HexFormat.of().formatHex(configurationDigest)),

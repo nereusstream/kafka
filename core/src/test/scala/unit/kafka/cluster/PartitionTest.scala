@@ -4281,12 +4281,12 @@ class PartitionTest extends AbstractPartitionTest {
     when(nereusLog.deleteRecords(
       anyInt(),
       anyLong(),
-      any(classOf[NereusUnifiedLog.DurableLogStartPublisher])))
+      any(classOf[NereusUnifiedLog.MaintenanceAuthority])))
       .thenAnswer(invocation => {
         val capturedEpoch = invocation.getArgument[Integer](0)
         val capturedOffset = invocation.getArgument[java.lang.Long](1)
         val publisher =
-          invocation.getArgument[NereusUnifiedLog.DurableLogStartPublisher](2)
+          invocation.getArgument[NereusUnifiedLog.MaintenanceAuthority](2)
         assertEquals(leaderEpoch, capturedEpoch)
         assertEquals(2L, capturedOffset)
         publisher.publish(expectedStorage, capturedEpoch, capturedOffset)

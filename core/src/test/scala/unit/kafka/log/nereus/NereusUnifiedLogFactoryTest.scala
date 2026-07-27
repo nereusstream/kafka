@@ -413,14 +413,30 @@ class NereusUnifiedLogFactoryTest {
       val durableLowWatermark = nereusLog.deleteRecords(
         7,
         1,
-        (expectedStorage, expectedLeaderEpoch, durableOffset) => {
-          assertEquals(storage, expectedStorage)
-          assertEquals(7, expectedLeaderEpoch)
-          nereusLog.publishDurableLogStart(
-            expectedStorage,
-            expectedLeaderEpoch,
-            durableOffset)
-          durableLogStartPublications.incrementAndGet()
+        new NereusUnifiedLog.MaintenanceAuthority {
+          override def capture(
+            expectedStorage: KafkaPartitionStorage,
+            expectedLeaderEpoch: Int,
+            capture: NereusUnifiedLog.MaintenanceCapture
+          ): KafkaPartitionMaintenance.Capture = {
+            assertEquals(storage, expectedStorage)
+            assertEquals(7, expectedLeaderEpoch)
+            capture.capture()
+          }
+
+          override def publish(
+            expectedStorage: KafkaPartitionStorage,
+            expectedLeaderEpoch: Int,
+            durableOffset: Long
+          ): Unit = {
+            assertEquals(storage, expectedStorage)
+            assertEquals(7, expectedLeaderEpoch)
+            nereusLog.publishDurableLogStart(
+              expectedStorage,
+              expectedLeaderEpoch,
+              durableOffset)
+            durableLogStartPublications.incrementAndGet()
+          }
         })
       assertEquals(1L, durableLowWatermark)
       assertEquals(1L, nereusLog.logStartOffset)

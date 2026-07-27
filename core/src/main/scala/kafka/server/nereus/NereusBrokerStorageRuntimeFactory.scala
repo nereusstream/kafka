@@ -100,6 +100,7 @@ object NereusBrokerStorageRuntimeFactory {
     val storage = context.config.nereusKafkaStorageConfig
     val runtimeInstanceId = UUID.randomUUID().toString
     val recoveryBridge = new NereusKafkaRecoveryStateFactoryBridge
+    val ownedPartitions = new NereusKafkaOwnedPartitionSourceBridge
     new NereusKafkaDeferredRuntime(
       () => context.brokerEpochSupplier(),
       context.scheduler,
@@ -118,8 +119,11 @@ object NereusBrokerStorageRuntimeFactory {
         context.time,
         context.metadataCache,
         context.config.logDirs.asScala.map(Path.of(_)).asJava,
-        recoveryBridge),
-      recoveryBridge)
+        new NereusKafkaForkRuntimeBridges(
+          recoveryBridge,
+          ownedPartitions)),
+      recoveryBridge,
+      ownedPartitions)
   }
 
   private def nereusBuild: String = {
