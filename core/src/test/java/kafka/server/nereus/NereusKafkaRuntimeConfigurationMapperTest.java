@@ -20,6 +20,7 @@ package kafka.server.nereus;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 
+import com.nereusstream.api.ChecksumType;
 import com.nereusstream.api.StorageProfile;
 import com.nereusstream.objectstore.S3CompatibleObjectStoreProvider;
 
@@ -81,6 +82,18 @@ class NereusKafkaRuntimeConfigurationMapperTest {
         assertEquals("s3", mapped.objectProviderToken());
         assertTrue(mapped.listOffsets().readTargetBytes()
                 <= mapped.listOffsets().hardMaxReadBytes());
+        assertEquals(
+                Path.of("/tmp/nereus-kafka-cache/checkpoint-staging"),
+                mapped.maintenance().stagingDirectory());
+        assertEquals(
+                1024L * 1024 * 1024,
+                mapped.maintenance().maxStagingBytes());
+        assertEquals(
+                ChecksumType.SHA256,
+                mapped.maintenance().contentPolicySha256().type());
+        assertEquals(
+                "0.1.0-f9-dev",
+                mapped.maintenance().writerBuild());
     }
 
     @Test
@@ -102,6 +115,9 @@ class NereusKafkaRuntimeConfigurationMapperTest {
         assertArrayEquals(
                 firstRecord.providerScopeSha256(),
                 secondRecord.providerScopeSha256());
+        assertEquals(
+                first.maintenance().contentPolicySha256(),
+                second.maintenance().contentPolicySha256());
     }
 
     @Test

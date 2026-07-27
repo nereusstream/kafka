@@ -104,7 +104,9 @@ public final class NereusKafkaProductRuntimeCreator {
                         storage.rollout().readinessTimeout(),
                         activationPollInterval(
                                 storage.rollout().capabilityHeartbeat(),
-                                storage.rollout().readinessTimeout()));
+                                storage.rollout().readinessTimeout()),
+                        Optional.empty(),
+                        Optional.of(mapped.maintenance()));
         return NereusKafkaObjectWalRuntimeFactory.createActivated(
                 mapped.runtime(), context, activation);
     }

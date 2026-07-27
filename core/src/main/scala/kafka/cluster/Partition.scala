@@ -21,6 +21,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.Optional
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
 import kafka.log._
+import kafka.log.nereus.NereusUnifiedLog
 import kafka.server._
 import kafka.server.share.DelayedShareFetch
 import kafka.utils.CoreUtils.{inReadLock, inWriteLock}
@@ -1659,26 +1660,65 @@ class Partition(val topicPartition: TopicPartition,
    *
    * Return low watermark of the partition.
    */
-  def deleteRecordsOnLeader(offset: Long): LogDeleteRecordsResult = inReadLock(leaderIsrUpdateLock) {
-    leaderLogIfLocal match {
-      case Some(leaderLog) =>
-        if (!leaderLog.config.delete && leaderLog.config.compact)
-          throw new PolicyViolationException(s"Records of partition $topicPartition can not be deleted due to the configured policy")
+  def deleteRecordsOnLeader(offset: Long): LogDeleteRecordsResult = {
+    val decision = inReadLock(leaderIsrUpdateLock) {
+      leaderLogIfLocal match {
+        case Some(leaderLog) =>
+          if (!leaderLog.config.delete && leaderLog.config.compact)
+            throw new PolicyViolationException(s"Records of partition $topicPartition can not be deleted due to the configured policy")
 
-        val convertedOffset = if (offset == DeleteRecordsRequest.HIGH_WATERMARK)
-          leaderLog.highWatermark
-        else
-          offset
+          val convertedOffset = if (offset == DeleteRecordsRequest.HIGH_WATERMARK)
+            leaderLog.highWatermark
+          else
+            offset
 
-        if (convertedOffset < 0)
-          throw new OffsetOutOfRangeException(s"The offset $convertedOffset for partition $topicPartition is not valid")
+          if (convertedOffset < 0)
+            throw new OffsetOutOfRangeException(s"The offset $convertedOffset for partition $topicPartition is not valid")
 
-        leaderLog.maybeIncrementLogStartOffset(convertedOffset, LogStartOffsetIncrementReason.ClientRecordDeletion)
+          leaderLog match {
+            // Nereus inject start: durable checkpoint-before-trim outside the partition lock
+            case nereusLog: NereusUnifiedLog =>
+              if (convertedOffset > leaderLog.highWatermark)
+                throw new OffsetOutOfRangeException(
+                  s"The offset $convertedOffset for partition $topicPartition is greater than the high watermark ${leaderLog.highWatermark}")
+              Right((nereusLog, leaderEpoch, convertedOffset))
+            // Nereus inject end: durable checkpoint-before-trim outside the partition lock
+            case _ =>
+              leaderLog.maybeIncrementLogStartOffset(convertedOffset, LogStartOffsetIncrementReason.ClientRecordDeletion)
+              Left(LogDeleteRecordsResult(
+                requestedOffset = convertedOffset,
+                lowWatermark = lowWatermarkIfLeader))
+          }
+        case None =>
+          throw new NotLeaderOrFollowerException(s"Leader not local for partition $topicPartition on broker $localBrokerId")
+      }
+    }
+
+    decision match {
+      case Left(result) => result
+      case Right((nereusLog, capturedLeaderEpoch, convertedOffset)) =>
+        val durableLowWatermark = nereusLog.deleteRecords(
+          capturedLeaderEpoch,
+          convertedOffset,
+          (expectedStorage, expectedLeaderEpoch, durableOffset) => {
+            inReadLock(leaderIsrUpdateLock) {
+              leaderLogIfLocal match {
+                case Some(current: NereusUnifiedLog)
+                    if (current eq nereusLog) && leaderEpoch == expectedLeaderEpoch =>
+                  current.publishDurableLogStart(
+                    expectedStorage,
+                    expectedLeaderEpoch,
+                    durableOffset)
+                  tryCompleteDelayedRequests()
+                case _ =>
+                  throw new NotLeaderOrFollowerException(
+                    s"Nereus DeleteRecords completion is stale for partition $topicPartition")
+              }
+            }
+          })
         LogDeleteRecordsResult(
           requestedOffset = convertedOffset,
-          lowWatermark = lowWatermarkIfLeader)
-      case None =>
-        throw new NotLeaderOrFollowerException(s"Leader not local for partition $topicPartition on broker $localBrokerId")
+          lowWatermark = durableLowWatermark)
     }
   }
 

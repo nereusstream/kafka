@@ -18,9 +18,12 @@
 package kafka.log.nereus
 
 import com.nereusstream.api.{AppendAuthority, AppendResult, Checksum, ChecksumType}
-import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState
+import com.nereusstream.kafka.checkpoint.{KafkaCanonicalCheckpointState, KafkaCheckpointSourceState}
 import com.nereusstream.kafka.codec.{KafkaAppendBatchEncoder, KafkaFetchAssembly, KafkaRecordBatchCodec}
 import com.nereusstream.kafka.partition.{KafkaAppendContext, KafkaPartitionState, KafkaPartitionStorage, KafkaStableAppendResult, KafkaStableSnapshot, KafkaStorageReadRequest, KafkaStorageReadResult}
+import com.nereusstream.kafka.retention.{KafkaDeleteRecordsCoordinator, KafkaPartitionMaintenance, KafkaTrimBarrier}
+import com.nereusstream.metadata.oxia.VersionedKafkaPartitionBinding
+import com.nereusstream.metadata.oxia.records.KafkaPartitionBindingRecord
 import kafka.log.LogManager
 import kafka.server.KafkaConfig
 import kafka.server.storage.BrokerStorageRuntimeContext
@@ -139,6 +142,8 @@ class NereusUnifiedLogFactoryTest {
         published
       })
       when(storage.resign()).thenReturn(CompletableFuture.completedFuture(null))
+      val maintenance = mock(classOf[KafkaPartitionMaintenance])
+      when(storage.maintenance()).thenReturn(Optional.of(maintenance))
       when(storage.append(any(classOf[ByteBuffer]), any(classOf[KafkaAppendContext]))).thenAnswer(invocation => {
         val records = invocation.getArgument[ByteBuffer](0)
         val context = invocation.getArgument[KafkaAppendContext](1)
@@ -370,6 +375,57 @@ class NereusUnifiedLogFactoryTest {
       assertEquals(1, boundedAbortedTransactions.size())
       assertEquals(producerId, boundedAbortedTransactions.get(0).producerId())
 
+      val durableLogStartPublications = new atomic.AtomicInteger()
+      when(maintenance.deleteRecords(
+        any(classOf[KafkaPartitionMaintenance.Hooks]),
+        anyLong())).thenAnswer(invocation => {
+        val hooks = invocation.getArgument[KafkaPartitionMaintenance.Hooks](0)
+        val requestedOffset = invocation.getArgument[java.lang.Long](1)
+        val currentSource = checkpointSource(nereusLog, 7, 0, 6)
+        val captured = hooks.capture(currentSource).join()
+        val canonical: KafkaCanonicalCheckpointState = captured.canonicalState()
+        assertEquals(6L, canonical.checkpointOffset())
+        assertEquals(0L, canonical.logStartOffset())
+        assertEquals(6L, canonical.producerTransactionState().mapEndOffset())
+        assertEquals(6L, captured.highWatermark())
+        assertEquals(6L, captured.lastStableOffset())
+
+        val current = snapshot.get()
+        snapshot.set(new KafkaStableSnapshot(
+          requestedOffset,
+          current.stableEndOffset(),
+          current.highWatermark(),
+          current.lastStableOffset(),
+          current.commitVersion() + 1))
+        val revalidated = mock(classOf[KafkaTrimBarrier.Snapshot])
+        when(revalidated.identity()).thenReturn(nereusLog.nereusIdentity())
+        val publishedBinding = mock(classOf[VersionedKafkaPartitionBinding])
+        val binding = mock(classOf[KafkaPartitionBindingRecord])
+        when(binding.observedLeaderEpoch()).thenReturn(7)
+        when(publishedBinding.value()).thenReturn(binding)
+        hooks.advanceLogStart(revalidated, requestedOffset, publishedBinding).join()
+        CompletableFuture.completedFuture(
+          new KafkaDeleteRecordsCoordinator.Result(
+            requestedOffset,
+            requestedOffset,
+            Optional.empty()))
+      })
+      val durableLowWatermark = nereusLog.deleteRecords(
+        7,
+        1,
+        (expectedStorage, expectedLeaderEpoch, durableOffset) => {
+          assertEquals(storage, expectedStorage)
+          assertEquals(7, expectedLeaderEpoch)
+          nereusLog.publishDurableLogStart(
+            expectedStorage,
+            expectedLeaderEpoch,
+            durableOffset)
+          durableLogStartPublications.incrementAndGet()
+        })
+      assertEquals(1L, durableLowWatermark)
+      assertEquals(1L, nereusLog.logStartOffset)
+      assertEquals(1, durableLogStartPublications.get())
+
       corruptNextStableResult.set(true)
       assertThrows(classOf[KafkaStorageException], () =>
         nereusLog.appendAsLeader(TestUtils.singletonRecords("invalid-stable-result".getBytes), 7))
@@ -403,6 +459,14 @@ class NereusUnifiedLogFactoryTest {
       scheduler)
 
   private def emptySource(log: NereusUnifiedLog, leaderEpoch: Int): KafkaCheckpointSourceState =
+    checkpointSource(log, leaderEpoch, 0, 0)
+
+  private def checkpointSource(
+    log: NereusUnifiedLog,
+    leaderEpoch: Int,
+    trimOffset: Long,
+    endOffset: Long
+  ): KafkaCheckpointSourceState =
     new KafkaCheckpointSourceState(
       new AppendAuthority(
         "kafka-partition-leader-v1",
@@ -414,13 +478,13 @@ class NereusUnifiedLogFactoryTest {
       1,
       "fencing-token",
       1,
-      0,
-      0,
+      trimOffset,
+      endOffset,
       1,
       "commit-1",
       new Checksum(ChecksumType.SHA256, "a" * 64),
       false,
-      0)
+      endOffset)
 
   private def enabledProperties(logDir: String, cacheDir: String): Properties = {
     val properties = TestUtils.createBrokerConfig(0)

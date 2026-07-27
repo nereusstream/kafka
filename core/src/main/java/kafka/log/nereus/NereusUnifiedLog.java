@@ -22,6 +22,8 @@ import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.errors.OffsetOutOfRangeException;
 import org.apache.kafka.common.record.FileRecords;
 import org.apache.kafka.common.record.MemoryRecords;
+import org.apache.kafka.common.record.Record;
+import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.common.RequestLocal;
 import org.apache.kafka.server.storage.log.FetchIsolation;
@@ -38,6 +40,7 @@ import org.apache.kafka.storage.internals.log.LogOffsetMetadata;
 import org.apache.kafka.storage.internals.log.LogOffsetsListener;
 import org.apache.kafka.storage.internals.log.LogSegment;
 import org.apache.kafka.storage.internals.log.LogSegments;
+import org.apache.kafka.storage.internals.log.LogStartOffsetIncrementReason;
 import org.apache.kafka.storage.internals.log.ProducerStateManagerConfig;
 import org.apache.kafka.storage.internals.log.RequiredAcksAwareAppend;
 import org.apache.kafka.storage.internals.log.UnifiedLog;
@@ -46,6 +49,11 @@ import org.apache.kafka.storage.internals.log.VerificationGuard;
 import com.nereusstream.api.AppendOutcome;
 import com.nereusstream.api.ErrorCode;
 import com.nereusstream.api.NereusException;
+import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointState;
+import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
+import com.nereusstream.kafka.checkpoint.KafkaDerivedIndexState;
+import com.nereusstream.kafka.checkpoint.KafkaLeaderEpochState;
+import com.nereusstream.kafka.checkpoint.KafkaVirtualSegmentState;
 import com.nereusstream.kafka.partition.KafkaAppendContext;
 import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.partition.KafkaPartitionState;
@@ -54,6 +62,10 @@ import com.nereusstream.kafka.partition.KafkaStableAppendResult;
 import com.nereusstream.kafka.partition.KafkaStableSnapshot;
 import com.nereusstream.kafka.partition.KafkaStorageReadRequest;
 import com.nereusstream.kafka.partition.KafkaStorageReadResult;
+import com.nereusstream.kafka.retention.KafkaDeleteRecordsCoordinator;
+import com.nereusstream.kafka.retention.KafkaPartitionMaintenance;
+import com.nereusstream.kafka.retention.KafkaTrimBarrier;
+import com.nereusstream.metadata.oxia.VersionedKafkaPartitionBinding;
 
 import java.io.File;
 import java.io.IOException;
@@ -85,6 +97,10 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
 
     private NereusKafkaRecoveredState recoveredState;
     private KafkaPartitionStorage storage;
+    private long canonicalSegmentBaseOffset;
+    private long canonicalLogicalBytes;
+    private long canonicalLargestTimestamp = RecordBatch.NO_TIMESTAMP;
+    private long canonicalMaxTimestampOffset = -1;
 
     private NereusUnifiedLog(
             Parts parts,
@@ -228,6 +244,12 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             if (storage != null && storage != candidate) {
                 throw fenced("A different Nereus storage instance is already published");
             }
+            canonicalSegmentBaseOffset = recoveredState.logStartOffset();
+            canonicalLogicalBytes = recoveredState.logicalBytes();
+            canonicalLargestTimestamp =
+                    recoveredState.largestTimestamp().orElse(RecordBatch.NO_TIMESTAMP);
+            canonicalMaxTimestampOffset =
+                    recoveredState.maxTimestampOffset().orElse(-1);
             storage = candidate;
         }
     }
@@ -314,6 +336,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                         transactionVersion);
                 if (invocation.committedStorage != null) {
                     long stableEndOffset = Math.addExact(result.lastOffset(), 1);
+                    observeCommittedAppend(invocation);
                     advanceHighWatermarkToStableEnd(stableEndOffset);
                     KafkaStableSnapshot published =
                             invocation.committedStorage.publishDerivedOffsets(
@@ -356,6 +379,283 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     public LogAppendInfo appendAsFollower(MemoryRecords records, int leaderEpoch) {
         throw new KafkaStorageException(
                 "Nereus authoritative storage does not accept Kafka follower appends");
+    }
+
+    /**
+     * Executes the product-owned checkpoint-before-trim flow outside the Kafka partition lock.
+     *
+     * <p>The supplied publisher reacquires the exact partition lock before exposing the durable
+     * log start and waking delayed Fetch/DeleteRecords operations.
+     */
+    public long deleteRecords(
+            int leaderEpoch,
+            long normalizedOffset,
+            DurableLogStartPublisher publisher
+    ) {
+        if (leaderEpoch < 0 || normalizedOffset < 0) {
+            throw new IllegalArgumentException(
+                    "Kafka DeleteRecords leader epoch and normalized offset must be non-negative");
+        }
+        Objects.requireNonNull(publisher, "publisher");
+        KafkaPartitionStorage exactStorage;
+        KafkaPartitionMaintenance maintenance;
+        synchronized (nereusGuard) {
+            requirePublished(leaderEpoch);
+            exactStorage = storage;
+            maintenance = exactStorage.maintenance().orElseThrow(() ->
+                    new KafkaStorageException(
+                            "Nereus partition maintenance is not configured"));
+        }
+        KafkaPartitionMaintenance.Hooks hooks = maintenanceHooks(
+                exactStorage, leaderEpoch, publisher);
+        CompletableFuture<KafkaDeleteRecordsCoordinator.Result> deletion;
+        try {
+            deletion = Objects.requireNonNull(
+                    maintenance.deleteRecords(hooks, normalizedOffset),
+                    "Nereus DeleteRecords future");
+        } catch (Throwable failure) {
+            throw NereusKafkaExceptionMapper.map(failure);
+        }
+        KafkaDeleteRecordsCoordinator.Result result;
+        try {
+            result = deletion.get(appendTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw NereusKafkaExceptionMapper.map(new NereusException(
+                    ErrorCode.CANCELLED,
+                    true,
+                    "Nereus DeleteRecords wait was interrupted",
+                    failure));
+        } catch (TimeoutException failure) {
+            throw NereusKafkaExceptionMapper.map(new NereusException(
+                    ErrorCode.TIMEOUT,
+                    true,
+                    "Nereus DeleteRecords did not finish before the configured timeout",
+                    failure));
+        } catch (ExecutionException failure) {
+            throw NereusKafkaExceptionMapper.map(failure);
+        }
+        synchronized (nereusGuard) {
+            requireSamePublishedStorage(exactStorage);
+            if (result.requestedOffset() != normalizedOffset
+                    || result.durableLowWatermark() < normalizedOffset
+                    || result.durableLowWatermark()
+                            != exactStorage.stableSnapshot().logStartOffset()) {
+                throw invariant(
+                        "Nereus DeleteRecords result does not match durable partition state");
+            }
+        }
+        return result.durableLowWatermark();
+    }
+
+    public void publishDurableLogStart(
+            KafkaPartitionStorage expectedStorage,
+            int expectedLeaderEpoch,
+            long durableOffset
+    ) {
+        Objects.requireNonNull(expectedStorage, "expectedStorage");
+        synchronized (nereusGuard) {
+            if (storage != expectedStorage
+                    || recoveredState == null
+                    || recoveredState.leaderEpoch() != expectedLeaderEpoch
+                    || expectedStorage.state() != KafkaPartitionState.LEADER_WRITABLE
+                    || expectedStorage.stableSnapshot().logStartOffset() < durableOffset) {
+                throw fenced(
+                        "Nereus DeleteRecords completion belongs to a stale leader");
+            }
+            super.maybeIncrementLogStartOffset(
+                    durableOffset,
+                    LogStartOffsetIncrementReason.ClientRecordDeletion);
+        }
+    }
+
+    private KafkaPartitionMaintenance.Hooks maintenanceHooks(
+            KafkaPartitionStorage exactStorage,
+            int leaderEpoch,
+            DurableLogStartPublisher publisher
+    ) {
+        return new KafkaPartitionMaintenance.Hooks() {
+            @Override
+            public CompletableFuture<KafkaPartitionMaintenance.Capture> capture(
+                    KafkaCheckpointSourceState currentSource
+            ) {
+                try {
+                    synchronized (nereusGuard) {
+                        requireSamePublishedStorage(exactStorage);
+                        KafkaStableSnapshot snapshot = exactStorage.stableSnapshot();
+                        return CompletableFuture.completedFuture(
+                                new KafkaPartitionMaintenance.Capture(
+                                        canonicalCheckpoint(currentSource, snapshot),
+                                        snapshot.highWatermark(),
+                                        snapshot.lastStableOffset()));
+                    }
+                } catch (Throwable failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+
+            @Override
+            public CompletableFuture<Void> advanceLogStart(
+                    KafkaTrimBarrier.Snapshot revalidated,
+                    long durableTrimOffset,
+                    VersionedKafkaPartitionBinding publishedBinding
+            ) {
+                try {
+                    if (!revalidated.identity().equals(identity)
+                            || publishedBinding.value().observedLeaderEpoch() != leaderEpoch) {
+                        throw fenced(
+                                "Nereus durable trim completion changed partition authority");
+                    }
+                    publisher.publish(exactStorage, leaderEpoch, durableTrimOffset);
+                    return CompletableFuture.completedFuture(null);
+                } catch (Throwable failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+        };
+    }
+
+    private KafkaCanonicalCheckpointState canonicalCheckpoint(
+            KafkaCheckpointSourceState source,
+            KafkaStableSnapshot snapshot
+    ) {
+        Objects.requireNonNull(source, "source");
+        if (source.trimOffset() != snapshot.logStartOffset()
+                || source.endOffset() != snapshot.stableEndOffset()
+                || source.stateMapEndOffset() != source.endOffset()
+                || source.appendInFlight()
+                || producerStateManager.mapEndOffset() != source.endOffset()) {
+            throw invariant(
+                    "Nereus maintenance capture does not match the exact stable source");
+        }
+        KafkaVirtualSegmentState.LogConfigHistoryEntry config = canonicalConfig(
+                config(), canonicalSegmentBaseOffset);
+        List<KafkaVirtualSegmentState.VirtualSegment> segments;
+        List<KafkaDerivedIndexState.SegmentTimeIndex> timeIndexes;
+        List<KafkaDerivedIndexState.SegmentLogicalByteIndex> logicalIndexes;
+        if (canonicalLogicalBytes == 0
+                && canonicalSegmentBaseOffset == source.endOffset()) {
+            segments = List.of();
+            timeIndexes = List.of();
+            logicalIndexes = List.of();
+        } else {
+            if (canonicalLargestTimestamp < 0
+                    || canonicalMaxTimestampOffset < canonicalSegmentBaseOffset
+                    || canonicalMaxTimestampOffset >= source.endOffset()) {
+                throw invariant(
+                        "Nereus maintenance cannot publish an incomplete timestamp image");
+            }
+            segments = List.of(new KafkaVirtualSegmentState.VirtualSegment(
+                    canonicalSegmentBaseOffset,
+                    source.endOffset(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    canonicalLargestTimestamp,
+                    canonicalMaxTimestampOffset,
+                    canonicalLogicalBytes,
+                    0,
+                    canonicalLogicalBytes,
+                    config.configDigest(),
+                    KafkaVirtualSegmentState.RollReason.INITIAL,
+                    KafkaVirtualSegmentState.SegmentState.ACTIVE));
+            timeIndexes = List.of(new KafkaDerivedIndexState.SegmentTimeIndex(
+                    canonicalSegmentBaseOffset, List.of()));
+            logicalIndexes = List.of(new KafkaDerivedIndexState.SegmentLogicalByteIndex(
+                    canonicalSegmentBaseOffset, canonicalLogicalBytes, List.of()));
+        }
+        return new KafkaCanonicalCheckpointState(
+                source.endOffset(),
+                source.trimOffset(),
+                source.endOffset(),
+                producerStateManager.exportCanonical(source.endOffset()),
+                new KafkaLeaderEpochState(
+                        source.trimOffset(),
+                        source.endOffset(),
+                        canonicalLeaderEpochs(source.trimOffset())),
+                new KafkaVirtualSegmentState(
+                        source.trimOffset(),
+                        source.endOffset(),
+                        segments,
+                        List.of(config)),
+                new KafkaDerivedIndexState(
+                        source.trimOffset(),
+                        source.endOffset(),
+                        timeIndexes,
+                        logicalIndexes));
+    }
+
+    private List<KafkaLeaderEpochState.LeaderEpochRange> canonicalLeaderEpochs(
+            long logStartOffset
+    ) {
+        List<NereusKafkaRecoveredState.LeaderEpochRange> recovered =
+                recoveredState.leaderEpochRanges();
+        int first = 0;
+        for (int index = 0; index < recovered.size(); index++) {
+            if (recovered.get(index).startOffset() <= logStartOffset) {
+                first = index;
+            }
+        }
+        return recovered.subList(first, recovered.size()).stream()
+                .map(range -> new KafkaLeaderEpochState.LeaderEpochRange(
+                        range.leaderEpoch(), range.startOffset()))
+                .toList();
+    }
+
+    private static KafkaVirtualSegmentState.LogConfigHistoryEntry canonicalConfig(
+            LogConfig config,
+            long effectiveFromOffset
+    ) {
+        int cleanupPolicyFlags = (config.delete
+                ? KafkaVirtualSegmentState.LogConfigHistoryEntry.CLEANUP_DELETE_FLAG
+                : 0)
+                | (config.compact
+                        ? KafkaVirtualSegmentState.LogConfigHistoryEntry.CLEANUP_COMPACT_FLAG
+                        : 0);
+        if (cleanupPolicyFlags == 0) {
+            throw invariant("Nereus Kafka log has no supported cleanup policy");
+        }
+        return KafkaVirtualSegmentState.LogConfigHistoryEntry.create(
+                0,
+                effectiveFromOffset,
+                config.segmentSize(),
+                config.segmentMs,
+                config.segmentJitterMs,
+                config.maxIndexSize,
+                config.indexInterval,
+                config.retentionSize,
+                config.retentionMs,
+                config.fileDeleteDelayMs,
+                config.deleteRetentionMs,
+                config.compactionLagMs,
+                config.maxCompactionLagMs,
+                config.minCleanableRatio,
+                cleanupPolicyFlags);
+    }
+
+    private void observeCommittedAppend(AppendInvocation invocation) {
+        canonicalLogicalBytes = addExact(
+                canonicalLogicalBytes,
+                invocation.logicalBytes,
+                "Nereus canonical logical-byte count overflow");
+        if (invocation.largestTimestamp != RecordBatch.NO_TIMESTAMP
+                && (canonicalLargestTimestamp == RecordBatch.NO_TIMESTAMP
+                        || invocation.largestTimestamp > canonicalLargestTimestamp
+                        || (invocation.largestTimestamp == canonicalLargestTimestamp
+                                && invocation.maxTimestampOffset
+                                        < canonicalMaxTimestampOffset))) {
+            canonicalLargestTimestamp = invocation.largestTimestamp;
+            canonicalMaxTimestampOffset = invocation.maxTimestampOffset;
+        }
+    }
+
+    private static long addExact(long left, long right, String message) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException failure) {
+            throw invariant(message);
+        }
     }
 
     @Override
@@ -518,7 +818,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             fenceUnknownAppend(exactStorage);
             throw failure;
         }
-        invocation.markStable(exactStorage);
+        invocation.markStable(exactStorage, records);
     }
 
     private KafkaStorageReadResult awaitRead(
@@ -754,14 +1054,42 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         private final int leaderEpoch;
         private final short requiredAcks;
         private KafkaPartitionStorage committedStorage;
+        private long logicalBytes;
+        private long largestTimestamp = RecordBatch.NO_TIMESTAMP;
+        private long maxTimestampOffset = -1;
 
         private AppendInvocation(int leaderEpoch, short requiredAcks) {
             this.leaderEpoch = leaderEpoch;
             this.requiredAcks = requiredAcks;
         }
 
-        private void markStable(KafkaPartitionStorage exactStorage) {
+        private void markStable(
+                KafkaPartitionStorage exactStorage,
+                MemoryRecords records
+        ) {
             committedStorage = exactStorage;
+            logicalBytes = records.sizeInBytes();
+            for (RecordBatch batch : records.batches()) {
+                for (Record record : batch) {
+                    long timestamp = record.timestamp();
+                    if (timestamp >= 0
+                            && (largestTimestamp == RecordBatch.NO_TIMESTAMP
+                                    || timestamp > largestTimestamp
+                                    || (timestamp == largestTimestamp
+                                            && record.offset() < maxTimestampOffset))) {
+                        largestTimestamp = timestamp;
+                        maxTimestampOffset = record.offset();
+                    }
+                }
+            }
         }
+    }
+
+    @FunctionalInterface
+    public interface DurableLogStartPublisher {
+        void publish(
+                KafkaPartitionStorage expectedStorage,
+                int expectedLeaderEpoch,
+                long durableOffset);
     }
 }

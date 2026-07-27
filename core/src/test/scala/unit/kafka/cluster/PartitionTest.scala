@@ -19,6 +19,7 @@ package kafka.cluster
 import java.net.InetAddress
 import com.yammer.metrics.core.Metric
 import kafka.log.LogManager
+import kafka.log.nereus.NereusUnifiedLog
 import kafka.server._
 import kafka.utils._
 import org.apache.kafka.common.errors.{ApiException, FencedLeaderEpochException, InconsistentTopicIdException, InvalidRequiredAcksException, InvalidTxnStateException, NotLeaderOrFollowerException, OffsetNotAvailableException, OffsetOutOfRangeException, PolicyViolationException, UnknownLeaderEpochException}
@@ -26,7 +27,7 @@ import org.apache.kafka.common.message.{AlterPartitionResponseData, FetchRespons
 import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.record.FileRecords.TimestampAndOffset
 import org.apache.kafka.common.record._
-import org.apache.kafka.common.requests.{AlterPartitionResponse, FetchRequest, ListOffsetsRequest, RequestHeader}
+import org.apache.kafka.common.requests.{AlterPartitionResponse, DeleteRecordsRequest, FetchRequest, ListOffsetsRequest, RequestHeader}
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.common.{DirectoryId, IsolationLevel, TopicPartition, Uuid}
 import org.apache.kafka.metadata.{KRaftMetadataCache, LeaderRecoveryState, MetadataCache, PartitionRegistration}
@@ -43,6 +44,7 @@ import java.lang.{Long => JLong}
 import java.nio.ByteBuffer
 import java.util.Optional
 import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Semaphore}
+import com.nereusstream.kafka.partition.KafkaPartitionStorage
 import kafka.server.share.DelayedShareFetch
 import org.apache.kafka.clients.ClientResponse
 import org.apache.kafka.common.compress.Compression
@@ -4261,5 +4263,45 @@ class PartitionTest extends AbstractPartitionTest {
 
     partition.setLog(mockLog, false)
     assertThrows(classOf[PolicyViolationException], () =>  partition.deleteRecordsOnLeader(1L))
+  }
+
+  @Test
+  def testNereusDeleteRecordsPreservesStockValidationAndPublishesAfterDurableTrim(): Unit = {
+    val leaderEpoch = 5
+    val partition = setupPartitionWithMocks(leaderEpoch, isLeader = true)
+    val deletePolicyConfig = new LogConfig(util.Map.of(
+      TopicConfig.CLEANUP_POLICY_CONFIG, "delete"
+    ))
+    val nereusLog = mock(classOf[NereusUnifiedLog])
+    val expectedStorage = mock(classOf[KafkaPartitionStorage])
+    when(nereusLog.config).thenReturn(deletePolicyConfig)
+    when(nereusLog.logEndOffset).thenReturn(2L)
+    when(nereusLog.logStartOffset).thenReturn(0L)
+    when(nereusLog.highWatermark).thenReturn(2L)
+    when(nereusLog.deleteRecords(
+      anyInt(),
+      anyLong(),
+      any(classOf[NereusUnifiedLog.DurableLogStartPublisher])))
+      .thenAnswer(invocation => {
+        val capturedEpoch = invocation.getArgument[Integer](0)
+        val capturedOffset = invocation.getArgument[java.lang.Long](1)
+        val publisher =
+          invocation.getArgument[NereusUnifiedLog.DurableLogStartPublisher](2)
+        assertEquals(leaderEpoch, capturedEpoch)
+        assertEquals(2L, capturedOffset)
+        publisher.publish(expectedStorage, capturedEpoch, capturedOffset)
+        capturedOffset
+      })
+    partition.setLog(nereusLog, false)
+
+    assertThrows(classOf[OffsetOutOfRangeException], () =>
+      partition.deleteRecordsOnLeader(3L))
+    val result = partition.deleteRecordsOnLeader(DeleteRecordsRequest.HIGH_WATERMARK)
+
+    assertEquals(2L, result.requestedOffset)
+    assertEquals(2L, result.lowWatermark)
+    verify(nereusLog).publishDurableLogStart(expectedStorage, leaderEpoch, 2L)
+    verify(delayedOperations).checkAndCompleteAll()
+    verify(nereusLog, never()).maybeIncrementLogStartOffset(anyLong(), any())
   }
 }

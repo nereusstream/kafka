@@ -23,9 +23,12 @@ import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.server.config.NereusKafkaConfigs;
 import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 
+import com.nereusstream.api.Checksum;
+import com.nereusstream.api.ChecksumType;
 import com.nereusstream.api.StorageProfile;
 import com.nereusstream.core.StreamStorageConfig;
 import com.nereusstream.kafka.activation.KafkaBrokerCapabilitySpecification;
+import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaRuntimeConfiguration;
 import com.nereusstream.metadata.oxia.KafkaBrokerIdentity;
@@ -34,12 +37,14 @@ import com.nereusstream.metadata.oxia.records.KafkaStorageProtocolActivationReco
 import com.nereusstream.objectstore.ObjectPutRetryPolicy;
 import com.nereusstream.objectstore.ObjectStoreConfiguration;
 import com.nereusstream.objectstore.S3CompatibleObjectStoreProvider;
+import com.nereusstream.objectstore.staging.StagingFileManager;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
@@ -236,9 +241,15 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                         exact.rollout().capabilityHeartbeat(),
                         exact.rollout().capabilityExpiry());
 
-        NereusListOffsetsScanConfig listOffsets = listOffsets(exact);
+        NereusKafkaMaintenanceConfiguration maintenance = maintenance(
+                exact,
+                configurationDigest,
+                providerTimeout,
+                pendingProtection,
+                orphanGrace,
+                nereusBuild);
         return new NereusKafkaMappedRuntimeConfiguration(
-                objectWal, capability, listOffsets, providerToken);
+                objectWal, capability, listOffsets(exact), maintenance, providerToken);
     }
 
     /** Maps request-scan limits without requiring broker identity or constructing provider resources. */
@@ -255,6 +266,36 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 maxObjectBytes,
                 exact.fetch().operationMaxRereads(),
                 exact.fetch().timeout());
+    }
+
+    private static NereusKafkaMaintenanceConfiguration maintenance(
+            NereusKafkaStorageConfig storage,
+            byte[] configurationDigest,
+            Duration providerTimeout,
+            Duration pendingProtection,
+            Duration orphanGrace,
+            String nereusBuild
+    ) {
+        Path checkpointStagingDirectory = storage.core().cacheDir()
+                .orElseThrow()
+                .resolve("checkpoint-staging")
+                .normalize();
+        int checkpointUploadChunkBytes = Math.toIntExact(Math.min(
+                StagingFileManager.MAX_UPLOAD_CHUNK_BYTES,
+                storage.lifecycle().checkpointMaxBytes()));
+        return new NereusKafkaMaintenanceConfiguration(
+                checkpointStagingDirectory,
+                storage.lifecycle().checkpointMaxBytes(),
+                checkpointUploadChunkBytes,
+                orphanGrace,
+                providerTimeout,
+                storage.lifecycle().recoveryTimeout(),
+                storage.append().timeout(),
+                pendingProtection,
+                new Checksum(
+                        ChecksumType.SHA256,
+                        HexFormat.of().formatHex(configurationDigest)),
+                nonblank(nereusBuild, "nereusBuild"));
     }
 
     private static byte[] configurationCompatibilitySha256(NereusKafkaStorageConfig storage) {
