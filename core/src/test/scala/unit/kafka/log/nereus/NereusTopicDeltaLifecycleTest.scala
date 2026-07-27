@@ -22,6 +22,7 @@ import com.nereusstream.kafka.partition.{KafkaPartitionIdentity, KafkaPartitionL
 import kafka.cluster.Partition
 import kafka.server.ReplicaManager
 import org.apache.kafka.common.{TopicPartition, Uuid}
+import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.common.metadata.{PartitionChangeRecord, PartitionRecord, RemoveTopicRecord, TopicRecord}
 import org.apache.kafka.image.{MetadataDelta, MetadataImage, MetadataProvenance}
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
@@ -59,7 +60,7 @@ class NereusTopicDeltaLifecycleTest {
   @Test
   def testLeaderCallbackWaitsForExactRecoveredStorageInstallation(): Unit = {
     val topicId = Uuid.randomUuid()
-    val topicPartition = new TopicPartition("events", 0)
+    val topicPartition = new TopicPartition(Topic.TRANSACTION_STATE_TOPIC_NAME, 0)
     val (delta, image) = createLeader(topicPartition, topicId, leaderEpoch = 5, metadataOffset = 10)
     val partition = mock(classOf[Partition])
     val replicaManager = mock(classOf[ReplicaManager])

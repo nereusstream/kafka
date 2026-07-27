@@ -96,10 +96,11 @@ class BrokerMetadataPublisherTest {
   }
 
   @Test
-  def testAsyncTopicLifecycleDefersInternalCoordinatorElectionUntilLeaderReady(): Unit = {
+  def testAsyncTopicLifecycleDefersInternalCoordinatorElectionsUntilLeaderReady(): Unit = {
     val config = KafkaConfig.fromProps(TestUtils.createBrokerConfig(0))
     val replicaManager = mock(classOf[ReplicaManager])
     val groupCoordinator = mock(classOf[GroupCoordinator])
+    val txnCoordinator = mock(classOf[TransactionCoordinator])
     val faultHandler = mock(classOf[FaultHandler])
     val lifecycleCompletion = new CompletableFuture[Void]
     val leaderReady = new AtomicReference[(TopicPartition, Int) => Unit]()
@@ -122,7 +123,7 @@ class BrokerMetadataPublisherTest {
       mock(classOf[LogManager]),
       replicaManager,
       groupCoordinator,
-      mock(classOf[TransactionCoordinator]),
+      txnCoordinator,
       mock(classOf[ShareCoordinator]),
       mock(classOf[SharePartitionManager]),
       mock(classOf[DynamicConfigPublisher]),
@@ -136,16 +137,27 @@ class BrokerMetadataPublisherTest {
       Some(lifecycle))
     publisher._firstPublish = false
 
-    val topicId = Uuid.randomUuid()
+    val groupTopicId = Uuid.randomUuid()
+    val transactionTopicId = Uuid.randomUuid()
     val delta = new MetadataDelta(MetadataImage.EMPTY)
     delta.replay(new TopicRecord()
       .setName(Topic.GROUP_METADATA_TOPIC_NAME)
-      .setTopicId(topicId))
+      .setTopicId(groupTopicId))
     delta.replay(new PartitionRecord()
-      .setTopicId(topicId)
+      .setTopicId(groupTopicId)
       .setPartitionId(0)
       .setLeader(0)
       .setLeaderEpoch(5)
+      .setReplicas(util.List.of(0))
+      .setIsr(util.List.of(0)))
+    delta.replay(new TopicRecord()
+      .setName(Topic.TRANSACTION_STATE_TOPIC_NAME)
+      .setTopicId(transactionTopicId))
+    delta.replay(new PartitionRecord()
+      .setTopicId(transactionTopicId)
+      .setPartitionId(0)
+      .setLeader(0)
+      .setLeaderEpoch(6)
       .setReplicas(util.List.of(0))
       .setIsr(util.List.of(0)))
     val image = delta.apply(new MetadataProvenance(10, 1, 1000, true))
@@ -166,10 +178,13 @@ class BrokerMetadataPublisherTest {
       same(image),
       any[(Partition, Uuid, Int) => Unit])
     verify(groupCoordinator, never()).onElection(0, 5)
+    verify(txnCoordinator, never()).onElection(0, 6)
     assertTrue(publisher.firstPublishFuture.isDone)
     assertTrue(!lifecycleCompletion.isDone)
     leaderReady.get().apply(new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, 0), 5)
     verify(groupCoordinator).onElection(0, 5)
+    leaderReady.get().apply(new TopicPartition(Topic.TRANSACTION_STATE_TOPIC_NAME, 0), 6)
+    verify(txnCoordinator).onElection(0, 6)
     lifecycleCompletion.complete(null)
   }
 

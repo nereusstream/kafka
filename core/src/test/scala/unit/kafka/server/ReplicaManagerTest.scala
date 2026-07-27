@@ -97,7 +97,7 @@ import java.net.InetAddress
 import java.nio.file.{Files, Paths}
 import java.util
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
-import java.util.concurrent.{Callable, CompletableFuture, CompletionStage, ConcurrentHashMap, CountDownLatch, Future, TimeUnit}
+import java.util.concurrent.{Callable, CompletableFuture, CompletionStage, ConcurrentHashMap, ConcurrentLinkedQueue, CountDownLatch, Future, TimeUnit}
 import java.util.function.{BiConsumer, Consumer}
 import java.util.stream.IntStream
 import java.util.{Collections, Optional, OptionalLong, Properties}
@@ -346,6 +346,102 @@ class ReplicaManagerTest {
       assertTrue(validationStatsCalled.get())
     } finally {
       rm.shutdown(checkpointHW = false)
+    }
+  }
+
+  @Test
+  def testStorageAppendExecutorPreservesTransactionGuardAndMarkerVersion(): Unit = {
+    val submitted = new ConcurrentLinkedQueue[Runnable]
+    val appendExecutor = new BrokerStorageAppendExecutor {
+      override def validateRequest(entries: Iterable[MemoryRecords]): Unit = {}
+
+      override def submit(
+        partition: TopicIdPartition,
+        records: MemoryRecords,
+        append: MemoryRecords => LogAppendResult
+      ): CompletionStage[LogAppendResult] = {
+        val result = new CompletableFuture[LogAppendResult]
+        submitted.add(() => {
+          try result.complete(append(records))
+          catch {
+            case failure: Throwable => result.completeExceptionally(failure)
+          }
+        })
+        result
+      }
+
+      override def drained: CompletionStage[Void] =
+        CompletableFuture.completedFuture[Void](null)
+
+      override def close(): Unit = {}
+    }
+    val replicaManager = setupReplicaManagerWithMockedPurgatories(
+      new MockTimer(time),
+      storageAppendExecutor = Some(appendExecutor))
+    try {
+      val leaderDelta = topicsCreateDelta(
+        startId = 0,
+        isStartIdLeader = true,
+        topicName = topic,
+        topicId = topicId)
+      replicaManager.applyDelta(leaderDelta, imageFromTopics(leaderDelta.apply()))
+      val partition = replicaManager.getPartitionOrException(topicPartition)
+      val producerId = 17L
+      val producerEpoch = 1.toShort
+      val transactionVersion = TransactionVersion.TV_2.featureLevel()
+      val verificationGuard =
+        partition.maybeStartTransactionVerification(producerId, 0, producerEpoch, true)
+      assertNotEquals(VerificationGuard.SENTINEL, verificationGuard)
+      val topicIdPartition = new TopicIdPartition(topicId, topicPartition)
+
+      def append(
+        records: MemoryRecords,
+        origin: AppendOrigin,
+        guards: Map[TopicPartition, VerificationGuard]
+      ): CompletableFuture[PartitionResponse] = {
+        val response = new CompletableFuture[PartitionResponse]
+        replicaManager.appendRecords(
+          timeout = 1000,
+          requiredAcks = 1,
+          internalTopicsAllowed = true,
+          origin = origin,
+          entriesPerPartition = Map(topicIdPartition -> records),
+          responseCallback = results => response.complete(results(topicIdPartition)),
+          verificationGuards = guards,
+          transactionVersion = transactionVersion)
+        response
+      }
+
+      val transactionalResponse = append(
+        MemoryRecords.withTransactionalRecords(
+          Compression.NONE,
+          producerId,
+          producerEpoch,
+          0,
+          new SimpleRecord("transactional".getBytes)),
+        AppendOrigin.CLIENT,
+        Map(topicPartition -> verificationGuard))
+      assertFalse(transactionalResponse.isDone)
+      submitted.remove().run()
+      assertEquals(Errors.NONE, transactionalResponse.get(5, TimeUnit.SECONDS).error)
+      assertTrue(partition.localLogOrException.hasOngoingTransaction(producerId, producerEpoch))
+
+      val markerEpoch = (producerEpoch + 1).toShort
+      val markerResponse = append(
+        MemoryRecords.withEndTransactionMarker(
+          producerId,
+          markerEpoch,
+          new EndTransactionMarker(ControlRecordType.ABORT, 9)),
+        AppendOrigin.COORDINATOR,
+        Map.empty)
+      assertFalse(markerResponse.isDone)
+      submitted.remove().run()
+      assertEquals(Errors.NONE, markerResponse.get(5, TimeUnit.SECONDS).error)
+      assertFalse(partition.localLogOrException.hasOngoingTransaction(producerId, markerEpoch))
+      assertEquals(2L, partition.localLogOrException.logEndOffset)
+      assertTrue(submitted.isEmpty)
+    } finally {
+      replicaManager.shutdown(checkpointHW = false)
     }
   }
 
@@ -3120,7 +3216,8 @@ class ReplicaManagerTest {
     directoryEventHandler: DirectoryEventHandler = DirectoryEventHandler.NOOP,
     buildRemoteLogAuxState: Boolean = false,
     remoteFetchQuotaExceeded: Option[Boolean] = None,
-    remoteFetchReaperEnabled: Boolean = false
+    remoteFetchReaperEnabled: Boolean = false,
+    storageAppendExecutor: Option[BrokerStorageAppendExecutor] = None
   ): ReplicaManager = {
     val props = TestUtils.createBrokerConfig(brokerId)
     val path1 = TestUtils.tempRelativeDir("data").getAbsolutePath
@@ -3203,6 +3300,7 @@ class ReplicaManagerTest {
       delayedRemoteListOffsetsPurgatoryParam = Some(mockDelayedRemoteListOffsetsPurgatory),
       delayedShareFetchPurgatoryParam = Some(mockDelayedShareFetchPurgatory),
       addPartitionsToTxnManager = Some(addPartitionsToTxnManager),
+      storageAppendExecutor = storageAppendExecutor,
       directoryEventHandler = directoryEventHandler,
       remoteLogManager = if (enableRemoteStorage) {
         if (remoteLogManager.isDefined)
