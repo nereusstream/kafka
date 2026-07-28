@@ -165,6 +165,18 @@ class NereusUnifiedLogFactoryTest {
         snapshot.set(published)
         published
       })
+      when(storage.publishDurableLogStart(anyLong())).thenAnswer(invocation => {
+        val current = snapshot.get()
+        val durableLogStart = invocation.getArgument[java.lang.Long](0)
+        val published = new KafkaStableSnapshot(
+          durableLogStart,
+          current.stableEndOffset(),
+          current.highWatermark(),
+          Math.max(current.lastStableOffset(), durableLogStart),
+          current.commitVersion())
+        snapshot.set(published)
+        published
+      })
       when(storage.resign()).thenReturn(CompletableFuture.completedFuture(null))
       val maintenance = mock(classOf[KafkaPartitionMaintenance])
       when(storage.maintenance()).thenReturn(Optional.of(maintenance))
@@ -585,13 +597,6 @@ class NereusUnifiedLogFactoryTest {
         assertEquals(6L, captured.highWatermark())
         assertEquals(6L, captured.lastStableOffset())
 
-        val current = snapshot.get()
-        snapshot.set(new KafkaStableSnapshot(
-          requestedOffset,
-          current.stableEndOffset(),
-          current.highWatermark(),
-          current.lastStableOffset(),
-          current.commitVersion() + 1))
         val revalidated = mock(classOf[KafkaTrimBarrier.Snapshot])
         when(revalidated.identity()).thenReturn(nereusLog.nereusIdentity())
         val publishedBinding = mock(classOf[VersionedKafkaPartitionBinding])
@@ -612,6 +617,7 @@ class NereusUnifiedLogFactoryTest {
       assertEquals(1L, durableLowWatermark)
       assertEquals(1L, nereusLog.logStartOffset)
       assertEquals(1, durableLogStartPublications.get())
+      verify(storage).publishDurableLogStart(1L)
 
       corruptNextStableResult.set(true)
       assertThrows(classOf[KafkaStorageException], () =>

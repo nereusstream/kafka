@@ -581,10 +581,15 @@ public final class NereusUnifiedLog extends UnifiedLog
             if (storage != expectedStorage
                     || recoveredState == null
                     || recoveredState.leaderEpoch() != expectedLeaderEpoch
-                    || expectedStorage.state() != KafkaPartitionState.LEADER_WRITABLE
-                    || expectedStorage.stableSnapshot().logStartOffset() < durableOffset) {
+                    || expectedStorage.state() != KafkaPartitionState.LEADER_WRITABLE) {
                 throw fenced(
                         "Nereus DeleteRecords completion belongs to a stale leader");
+            }
+            KafkaStableSnapshot durableSnapshot =
+                    expectedStorage.publishDurableLogStart(durableOffset);
+            if (durableSnapshot.logStartOffset() != durableOffset) {
+                throw invariant(
+                        "Nereus durable trim did not publish the exact partition log start");
             }
             canonicalState.advanceLogStart(durableOffset);
             try {
