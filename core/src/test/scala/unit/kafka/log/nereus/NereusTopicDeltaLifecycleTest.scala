@@ -26,19 +26,26 @@ import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.common.metadata.{PartitionChangeRecord, PartitionRecord, RemoveTopicRecord, TopicRecord}
 import org.apache.kafka.image.{MetadataDelta, MetadataImage, MetadataProvenance}
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
-import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.{AfterEach, Test}
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers.{any, anyInt, anyLong, same}
 import org.mockito.Mockito.{mock, never, verify, when}
 
 import java.time.Duration
-import java.util.concurrent.{CompletableFuture, CompletionException}
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.{CompletableFuture, CompletionException, Executors, TimeUnit}
 import scala.collection.mutable
 
 class NereusTopicDeltaLifecycleTest {
   private val brokerId = 1
   private val timeout = Duration.ofSeconds(5)
   private val profile = StorageProfile.BOOKKEEPER_WAL_ASYNC_OBJECT
+  private val brokerEpochScheduler = Executors.newSingleThreadScheduledExecutor()
+
+  @AfterEach
+  def closeScheduler(): Unit = {
+    brokerEpochScheduler.shutdownNow()
+  }
 
   @Test
   def testNewLeaderPublicationMarksExactEpochPendingSynchronously(): Unit = {
@@ -290,6 +297,8 @@ class NereusTopicDeltaLifecycleTest {
       "kraft-cluster",
       brokerId,
       () => throw new IllegalStateException("broker epoch unavailable"),
+      brokerEpochScheduler,
+      () => System.currentTimeMillis(),
       profile,
       timeout,
       replicaManager,
@@ -305,6 +314,48 @@ class NereusTopicDeltaLifecycleTest {
       any(classOf[Partition]), any(classOf[KafkaPartitionLeaderOpenRequest]))
   }
 
+  @Test
+  def testLeaderOpenWaitsForBrokerRegistrationEpochWithoutCancellingPreparedLookup(): Unit = {
+    val topicId = Uuid.randomUuid()
+    val topicPartition = new TopicPartition("events", 0)
+    val (delta, image) = createLeader(topicPartition, topicId, leaderEpoch = 5, metadataOffset = 10)
+    val partition = mock(classOf[Partition])
+    val replicaManager = mock(classOf[ReplicaManager])
+    when(replicaManager.onlinePartition(topicPartition)).thenReturn(Some(partition))
+    val partitionLifecycle = mock(classOf[NereusListOffsetsLifecycle])
+    when(partitionLifecycle.openLeader(
+      any(classOf[Partition]),
+      any(classOf[KafkaPartitionLeaderOpenRequest])))
+      .thenReturn(CompletableFuture.completedFuture(mock(classOf[KafkaPartitionStorage])))
+    val brokerEpoch = new AtomicLong(-1)
+    val lifecycle = new NereusTopicDeltaLifecycle(
+      "kraft-cluster",
+      brokerId,
+      () => brokerEpoch.get(),
+      brokerEpochScheduler,
+      () => System.currentTimeMillis(),
+      profile,
+      timeout,
+      replicaManager,
+      partitionLifecycle)
+
+    val applied = lifecycle.applyAfterReplicaManager(
+      delta.topicsDelta(), image, (_, _) => (), (_, _) => ())
+
+    assertFalse(applied.isDone)
+    verify(partitionLifecycle, never()).openLeader(
+      any(classOf[Partition]), any(classOf[KafkaPartitionLeaderOpenRequest]))
+    verify(partition, never()).cancelLeaderEpochAwareOffsetLookup(5)
+
+    brokerEpoch.set(9)
+    applied.get(5, TimeUnit.SECONDS)
+
+    val requestCaptor = ArgumentCaptor.forClass(classOf[KafkaPartitionLeaderOpenRequest])
+    verify(partitionLifecycle).openLeader(same(partition), requestCaptor.capture())
+    assertEquals(9, requestCaptor.getValue.brokerEpoch())
+    verify(partition, never()).cancelLeaderEpochAwareOffsetLookup(5)
+  }
+
   private def newLifecycle(
     replicaManager: ReplicaManager,
     partitionLifecycle: NereusListOffsetsLifecycle,
@@ -313,6 +364,8 @@ class NereusTopicDeltaLifecycleTest {
     "kraft-cluster",
     brokerId,
     () => brokerEpoch,
+    brokerEpochScheduler,
+    () => System.currentTimeMillis(),
     profile,
     timeout,
     replicaManager,

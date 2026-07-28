@@ -201,9 +201,9 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 maxInFlightAppends,
                 maxAppendRecoveryTerminals);
 
-        Duration pendingProtection = maximum(
-                exact.lifecycle().recoveryTimeout(),
-                exact.rollout().shutdownDrainTimeout());
+        Duration pendingProtection = addExact(
+                maximum(operationTtl, exact.rollout().shutdownDrainTimeout()),
+                MAXIMUM_CLOCK_SKEW);
         Duration orphanGrace = multiplyExact(pendingProtection, 2);
         MaterializationConfig materialization =
                 materializationConfiguration(exact);
@@ -752,6 +752,14 @@ public final class NereusKafkaRuntimeConfigurationMapper {
 
     private static Duration maximum(Duration left, Duration right) {
         return left.compareTo(right) >= 0 ? left : right;
+    }
+
+    private static Duration addExact(Duration left, Duration right) {
+        try {
+            return left.plus(right);
+        } catch (ArithmeticException failure) {
+            throw new ConfigException("Nereus Kafka duration mapping overflows");
+        }
     }
 
     private static Duration multiplyExact(Duration value, int multiplier) {

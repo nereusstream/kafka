@@ -27,7 +27,8 @@ import org.apache.kafka.image.{MetadataImage, TopicsDelta}
 
 import java.time.Duration
 import java.util.Objects
-import java.util.concurrent.CompletableFuture
+import java.util.concurrent.{CompletableFuture, ScheduledExecutorService, TimeUnit}
+import java.util.function.LongSupplier
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
@@ -39,13 +40,19 @@ final class NereusTopicDeltaLifecycle(
   kafkaClusterId: String,
   brokerId: Int,
   brokerEpochSupplier: () => Long,
+  brokerEpochScheduler: ScheduledExecutorService,
+  currentTimeMillis: LongSupplier,
   storageProfile: StorageProfile,
   operationTimeout: Duration,
   replicaManager: ReplicaManager,
   partitionLifecycle: NereusListOffsetsLifecycle
 ) extends AsyncTopicDeltaLifecycle {
+  private val BrokerEpochPollMillis = 25L
+
   Objects.requireNonNull(kafkaClusterId, "kafkaClusterId")
   Objects.requireNonNull(brokerEpochSupplier, "brokerEpochSupplier")
+  Objects.requireNonNull(brokerEpochScheduler, "brokerEpochScheduler")
+  Objects.requireNonNull(currentTimeMillis, "currentTimeMillis")
   Objects.requireNonNull(storageProfile, "storageProfile")
   Objects.requireNonNull(replicaManager, "replicaManager")
   Objects.requireNonNull(partitionLifecycle, "partitionLifecycle")
@@ -85,19 +92,13 @@ final class NereusTopicDeltaLifecycle(
         invariant("Nereus partition lifecycle requires a non-negative KRaft metadata offset"))
     }
     val brokerEpoch = if (changes.leaders().isEmpty) {
-      0L
+      CompletableFuture.completedFuture(0L)
     } else {
-      try {
-        brokerEpochSupplier()
-      } catch {
-        case failure: Throwable =>
-          return failPreparedLeaders(changes.electedLeaders().asScala, failure)
-      }
-    }
-    if (!changes.leaders().isEmpty && brokerEpoch < 0) {
-      return failPreparedLeaders(
-        changes.electedLeaders().asScala,
-        invariant("Nereus leader open requires a non-negative broker registration epoch"))
+      awaitBrokerEpoch().whenComplete((_, failure) => {
+        if (failure != null) {
+          cancelPreparedLeaders(changes.electedLeaders().asScala)
+        }
+      })
     }
 
     val tails = mutable.HashMap.empty[TopicPartition, CompletableFuture[Void]]
@@ -141,37 +142,39 @@ final class NereusTopicDeltaLifecycle(
 
     changes.leaders().asScala.foreach { case (topicPartition, info) =>
       append(topicPartition) {
-        val partition = replicaManager.onlinePartition(topicPartition).getOrElse {
-          throw invariant("Stock ReplicaManager did not publish the Nereus leader partition before recovery")
-        }
-        try {
-          val request = new KafkaPartitionLeaderOpenRequest(
-            identity(topicPartition, info.topicId().toString),
-            brokerId,
-            info.partition().leaderEpoch,
-            brokerEpoch,
-            storageProfile,
-            metadataOffset,
-            operationTimeout)
-          val opened = partitionLifecycle.openLeader(partition, request)
-          if (changes.electedLeaders().containsKey(topicPartition)) {
-            opened
-              .thenRun(() => onLeaderReady(topicPartition, info.partition().leaderEpoch))
-              .whenComplete((_, failure) => {
-                if (failure != null) {
-                  partition.cancelLeaderEpochAwareOffsetLookup(info.partition().leaderEpoch)
-                }
-              })
-          } else {
-            opened.thenRun(() => ())
+        brokerEpoch.thenCompose(exactBrokerEpoch => {
+          val partition = replicaManager.onlinePartition(topicPartition).getOrElse {
+            throw invariant("Stock ReplicaManager did not publish the Nereus leader partition before recovery")
           }
-        } catch {
-          case failure: Throwable =>
+          try {
+            val request = new KafkaPartitionLeaderOpenRequest(
+              identity(topicPartition, info.topicId().toString),
+              brokerId,
+              info.partition().leaderEpoch,
+              exactBrokerEpoch,
+              storageProfile,
+              metadataOffset,
+              operationTimeout)
+            val opened = partitionLifecycle.openLeader(partition, request)
             if (changes.electedLeaders().containsKey(topicPartition)) {
-              partition.cancelLeaderEpochAwareOffsetLookup(info.partition().leaderEpoch)
+              opened
+                .thenRun(() => onLeaderReady(topicPartition, info.partition().leaderEpoch))
+                .whenComplete((_, failure) => {
+                  if (failure != null) {
+                    partition.cancelLeaderEpochAwareOffsetLookup(info.partition().leaderEpoch)
+                  }
+                })
+            } else {
+              opened.thenRun(() => ())
             }
-            throw failure
-        }
+          } catch {
+            case failure: Throwable =>
+              if (changes.electedLeaders().containsKey(topicPartition)) {
+                partition.cancelLeaderEpochAwareOffsetLookup(info.partition().leaderEpoch)
+              }
+              throw failure
+          }
+        })
       }
     }
 
@@ -211,11 +214,74 @@ final class NereusTopicDeltaLifecycle(
     leaders: collection.Map[TopicPartition, org.apache.kafka.image.LocalReplicaChanges.PartitionInfo],
     failure: Throwable
   ): CompletableFuture[Void] = {
+    cancelPreparedLeaders(leaders)
+    CompletableFuture.failedFuture(failure)
+  }
+
+  private def cancelPreparedLeaders(
+    leaders: collection.Map[TopicPartition, org.apache.kafka.image.LocalReplicaChanges.PartitionInfo]
+  ): Unit = {
     leaders.foreach { case (topicPartition, info) =>
       replicaManager.onlinePartition(topicPartition).foreach(
         _.cancelLeaderEpochAwareOffsetLookup(info.partition().leaderEpoch))
     }
-    CompletableFuture.failedFuture(failure)
+  }
+
+  private def awaitBrokerEpoch(): CompletableFuture[Long] = {
+    val result = new CompletableFuture[Long]
+    val deadline = try {
+      Math.addExact(currentTimeMillis.getAsLong, operationTimeout.toMillis)
+    } catch {
+      case failure: Throwable =>
+        result.completeExceptionally(failure)
+        return result
+    }
+    pollBrokerEpoch(deadline, result)
+    result
+  }
+
+  private def pollBrokerEpoch(
+    deadlineMillis: Long,
+    result: CompletableFuture[Long]
+  ): Unit = {
+    if (result.isDone) {
+      return
+    }
+    val brokerEpoch = try {
+      brokerEpochSupplier()
+    } catch {
+      case failure: Throwable =>
+        result.completeExceptionally(failure)
+        return
+    }
+    if (brokerEpoch >= 0) {
+      result.complete(brokerEpoch)
+      return
+    }
+    val remaining = try {
+      Math.subtractExact(deadlineMillis, currentTimeMillis.getAsLong)
+    } catch {
+      case failure: Throwable =>
+        result.completeExceptionally(failure)
+        return
+    }
+    if (remaining <= 0) {
+      result.completeExceptionally(new NereusException(
+        ErrorCode.TIMEOUT,
+        true,
+        "timed out waiting for the KRaft broker registration epoch before Nereus leader recovery"))
+      return
+    }
+    try {
+      brokerEpochScheduler.schedule(
+        new Runnable {
+          override def run(): Unit = pollBrokerEpoch(deadlineMillis, result)
+        },
+        Math.min(BrokerEpochPollMillis, remaining),
+        TimeUnit.MILLISECONDS)
+    } catch {
+      case failure: Throwable => result.completeExceptionally(failure)
+    }
   }
 
   private def requirePositive(timeout: Duration): Unit = {

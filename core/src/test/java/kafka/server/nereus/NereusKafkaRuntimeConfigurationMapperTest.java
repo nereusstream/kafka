@@ -148,11 +148,16 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                 8 * 1024 * 1024,
                 mapped.compaction().uploadChunkBytes());
         assertEquals(
-                Duration.ofMinutes(15),
+                Duration.ofMinutes(15).plusSeconds(5),
                 mapped.compaction().partitionPass().claimDuration());
         assertEquals(
-                Duration.ofMinutes(5),
+                Duration.ofMillis(
+                        Duration.ofMinutes(15).plusSeconds(5).toMillis() / 3),
                 mapped.compaction().partitionPass().claimRenewInterval());
+        assertEquals(
+                mapped.runtime().runtime().operationTtl(),
+                mapped.runtime().pendingProtectionDuration()
+                        .minus(mapped.runtime().maximumClockSkew()));
         assertEquals(3, mapped.compaction().partitionPass().maxTaskAttempts());
     }
 
