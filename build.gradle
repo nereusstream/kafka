@@ -1097,10 +1097,27 @@ project(':core') {
     // org.apache.directory.api/api-all and org.apache.directory.api/api-ldap-schema-data
     testImplementation.exclude module: 'api-ldap-schema-data'
     releaseOnly
+    if (nereusDevelopmentEnabled) {
+      configureEach {
+        // BookKeeper 4.18 uses SLF4J 2.x. Keep exactly one matching provider in
+        // the Nereus-enabled Kafka runtime and do not retain Kafka's 1.x binding
+        // or the OAuth test fixture's Logback provider beside it.
+        exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j-impl'
+        exclude group: 'ch.qos.logback', module: 'logback-classic'
+      }
+    }
   }
 
   dependencies {
     releaseOnly log4jReleaseLibs
+    if (nereusDevelopmentEnabled) {
+      releaseOnly("org.apache.logging.log4j:log4j-slf4j2-impl:${versions.log4j2}") {
+        exclude group: 'org.slf4j', module: 'slf4j-api'
+      }
+      testRuntimeOnly("org.apache.logging.log4j:log4j-slf4j2-impl:${versions.log4j2}") {
+        exclude group: 'org.slf4j', module: 'slf4j-api'
+      }
+    }
     // `core` is often used in users' tests, define the following dependencies as `api` for backwards compatibility
     // even though the `core` module doesn't expose any public API
     api project(':clients')
@@ -1140,16 +1157,22 @@ project(':core') {
 
     // Nereus inject start: exact product-owned adapter boundary
     if (nereusDevelopmentEnabled) {
-      implementation "com.nereusstream:nereus-kafka-adapter:${nereusDevelopmentVersion.get()}"
+      implementation("com.nereusstream:nereus-kafka-adapter:${nereusDevelopmentVersion.get()}") {
+        // The host selects the exact SLF4J -> Log4j provider above. A provider
+        // from a storage dependency must not cross the adapter boundary.
+        exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
+      }
       implementation("com.nereusstream:nereus-bookkeeper:${nereusDevelopmentVersion.get()}") {
         // BookKeeper publishes these Java archives with NAR packaging. Resolve the same
         // archives explicitly as JARs so Kafka's -Werror compiler does not reject the
         // otherwise valid classes solely because their classpath entries end in .nar.
         exclude group: 'org.apache.bookkeeper', module: 'circe-checksum'
         exclude group: 'org.apache.bookkeeper', module: 'cpu-affinity'
+        exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
       }
       implementation "org.apache.bookkeeper:circe-checksum:4.18.0@jar"
       implementation "org.apache.bookkeeper:cpu-affinity:4.18.0@jar"
+      implementation "org.slf4j:slf4j-api:2.0.17"
       implementation "com.nereusstream:nereus-core:${nereusDevelopmentVersion.get()}"
       implementation "com.nereusstream:nereus-materialization:${nereusDevelopmentVersion.get()}"
       implementation "com.nereusstream:nereus-metadata-oxia:${nereusDevelopmentVersion.get()}"
@@ -1355,6 +1378,13 @@ project(':core') {
     from(project(':streams:test-utils').configurations.runtimeClasspath) { into("libs/") }
     from(project(':streams:examples').jar) { into("libs/") }
     from(project(':streams:examples').configurations.runtimeClasspath) { into("libs/") }
+    if (nereusDevelopmentEnabled) {
+      eachFile { details ->
+        if (details.name == "slf4j-api-${versions.slf4j}.jar") {
+          details.exclude()
+        }
+      }
+    }
     duplicatesStrategy 'exclude'
   }
 
