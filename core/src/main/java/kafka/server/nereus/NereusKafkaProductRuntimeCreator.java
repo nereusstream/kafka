@@ -23,6 +23,7 @@ import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 import org.apache.kafka.server.util.KafkaScheduler;
 
 import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceContext;
+import com.nereusstream.kafka.runtime.NereusKafkaCompactionContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalActivationContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeFactory;
@@ -78,6 +79,7 @@ public final class NereusKafkaProductRuntimeCreator {
                 kafkaVersion,
                 nereusBuild,
                 javaVersion);
+        exactBridges.ownedPartitions().configureCompaction(storage, nereusBuild);
         ObjectStoreProvider provider = switch (mapped.objectProviderToken()) {
             case NereusKafkaRuntimeConfigurationMapper.S3_PROVIDER_TOKEN ->
                 new S3CompatibleObjectStoreProvider();
@@ -108,7 +110,9 @@ public final class NereusKafkaProductRuntimeCreator {
                         activationPollInterval(
                                 storage.rollout().capabilityHeartbeat(),
                                 storage.rollout().readinessTimeout()),
-                        Optional.empty(),
+                        Optional.of(new NereusKafkaCompactionContext(
+                                mapped.compaction(),
+                                exactBridges.ownedPartitions())),
                         Optional.of(new NereusKafkaMaintenanceContext(
                                 mapped.maintenance(),
                                 exactBridges.ownedPartitions())));

@@ -21,6 +21,7 @@ import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 
 import com.nereusstream.api.ChecksumType;
+import com.nereusstream.api.ReadIsolation;
 import com.nereusstream.api.StorageProfile;
 import com.nereusstream.objectstore.S3CompatibleObjectStoreProvider;
 
@@ -101,6 +102,42 @@ class NereusKafkaRuntimeConfigurationMapperTest {
         assertEquals(
                 "0.1.0-f9-dev",
                 mapped.maintenance().writerBuild());
+        assertEquals(
+                config.retentionCompaction().retentionCheckInterval(),
+                mapped.compaction().interval());
+        assertEquals(4, mapped.compaction().maxConcurrentPartitions());
+        assertEquals(256, mapped.compaction().maxPartitionsPerPass());
+        assertEquals(256, mapped.compaction().metadataScanPageSize());
+        assertEquals(65_536, mapped.compaction().sourceReadPageRecords());
+        assertEquals(64 * 1024 * 1024, mapped.compaction().sourceReadPageBytes());
+        assertEquals(
+                ReadIsolation.COMMITTED,
+                mapped.compaction().sourceReadOptions().isolation());
+        assertEquals(
+                100_000_000,
+                mapped.compaction().executorLimits().maxSourceBatches());
+        assertEquals(
+                100_000_000,
+                mapped.compaction().executorLimits().maxOutputBatches());
+        assertEquals(
+                8L * 1024 * 1024 * 1024,
+                mapped.compaction().executorLimits().maxOutputBytes());
+        assertEquals(
+                Path.of("/tmp/nereus-kafka-cache/spill"),
+                mapped.compaction().stagingDirectory());
+        assertEquals(
+                100L * 1024 * 1024 * 1024,
+                mapped.compaction().maxStagingBytes());
+        assertEquals(
+                8 * 1024 * 1024,
+                mapped.compaction().uploadChunkBytes());
+        assertEquals(
+                Duration.ofMinutes(15),
+                mapped.compaction().partitionPass().claimDuration());
+        assertEquals(
+                Duration.ofMinutes(5),
+                mapped.compaction().partitionPass().claimRenewInterval());
+        assertEquals(3, mapped.compaction().partitionPass().maxTaskAttempts());
     }
 
     @Test

@@ -25,9 +25,14 @@ import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 
 import com.nereusstream.api.Checksum;
 import com.nereusstream.api.ChecksumType;
+import com.nereusstream.api.ReadIsolation;
+import com.nereusstream.api.ReadOptions;
 import com.nereusstream.api.StorageProfile;
 import com.nereusstream.core.StreamStorageConfig;
 import com.nereusstream.kafka.activation.KafkaBrokerCapabilitySpecification;
+import com.nereusstream.kafka.compaction.KafkaCompactionPartitionPass;
+import com.nereusstream.kafka.compaction.KafkaCompactionTwoPassExecutor;
+import com.nereusstream.kafka.runtime.NereusKafkaCompactionRuntimeConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaRuntimeConfiguration;
@@ -241,15 +246,15 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                         exact.rollout().capabilityHeartbeat(),
                         exact.rollout().capabilityExpiry());
 
-        NereusKafkaMaintenanceConfiguration maintenance = maintenance(
+        return mapped(
                 exact,
+                objectWal,
+                capability,
                 configurationDigest,
                 providerTimeout,
-                pendingProtection,
-                orphanGrace,
-                nereusBuild);
-        return new NereusKafkaMappedRuntimeConfiguration(
-                objectWal, capability, listOffsets(exact), maintenance, providerToken);
+                pendingProtection, orphanGrace,
+                nereusBuild,
+                providerToken);
     }
 
     /** Maps request-scan limits without requiring broker identity or constructing provider resources. */
@@ -266,6 +271,36 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 maxObjectBytes,
                 exact.fetch().operationMaxRereads(),
                 exact.fetch().timeout());
+    }
+
+    private NereusKafkaMappedRuntimeConfiguration mapped(
+            NereusKafkaStorageConfig storage,
+            NereusKafkaObjectWalRuntimeConfiguration objectWal,
+            KafkaBrokerCapabilitySpecification capability,
+            byte[] configurationDigest,
+            Duration providerTimeout,
+            Duration pendingProtection,
+            Duration orphanGrace,
+            String nereusBuild,
+            String providerToken
+    ) {
+        return new NereusKafkaMappedRuntimeConfiguration(
+                objectWal,
+                capability,
+                listOffsets(storage),
+                maintenance(
+                        storage,
+                        configurationDigest,
+                        providerTimeout,
+                        pendingProtection,
+                        orphanGrace,
+                        nereusBuild),
+                compaction(
+                        storage,
+                        providerTimeout,
+                        pendingProtection,
+                        orphanGrace),
+                providerToken);
     }
 
     private static NereusKafkaMaintenanceConfiguration maintenance(
@@ -301,6 +336,64 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                         ChecksumType.SHA256,
                         HexFormat.of().formatHex(configurationDigest)),
                 nonblank(nereusBuild, "nereusBuild"));
+    }
+
+    private static NereusKafkaCompactionRuntimeConfiguration compaction(
+            NereusKafkaStorageConfig storage,
+            Duration providerTimeout,
+            Duration pendingProtection,
+            Duration orphanGrace
+    ) {
+        NereusKafkaStorageConfig.RetentionCompaction configured =
+                storage.retentionCompaction();
+        int concurrentPartitions = Math.min(
+                configured.compactionWorkerThreads(),
+                configured.compactionMaxConcurrentTasks());
+        int maximumPartitions = Math.max(
+                concurrentPartitions,
+                storage.lifecycle().registryScanPageSize());
+        int sourcePageRecords = Math.min(
+                65_536,
+                storage.lifecycle().recoveryChunkRecords());
+        int sourcePageBytes = Math.toIntExact(Math.min(
+                64L * 1024 * 1024,
+                storage.lifecycle().recoveryChunkBytes()));
+        int uploadChunkBytes = Math.max(
+                StagingFileManager.MIN_UPLOAD_CHUNK_BYTES,
+                Math.min(StagingFileManager.MAX_UPLOAD_CHUNK_BYTES, sourcePageBytes));
+        long maximumOutputBatches = Math.min(
+                Integer.MAX_VALUE,
+                configured.compactionTaskMaxRecords());
+        Duration claimRenewal = dividePositive(pendingProtection, 3);
+        return new NereusKafkaCompactionRuntimeConfiguration(
+                configured.retentionCheckInterval(),
+                concurrentPartitions,
+                maximumPartitions,
+                storage.lifecycle().registryScanPageSize(),
+                new ReadOptions(
+                        sourcePageRecords,
+                        sourcePageBytes,
+                        ReadIsolation.COMMITTED,
+                        providerTimeout),
+                sourcePageRecords,
+                sourcePageBytes,
+                new KafkaCompactionTwoPassExecutor.Limits(
+                        configured.compactionTaskMaxRecords(),
+                        Math.toIntExact(maximumOutputBatches),
+                        configured.compactionTaskMaxSourceBytes()),
+                configured.compactionSpillDir().orElseThrow(),
+                configured.compactionSpillMaxBytes(),
+                uploadChunkBytes,
+                orphanGrace,
+                providerTimeout,
+                new KafkaCompactionPartitionPass.Configuration(
+                        pendingProtection,
+                        claimRenewal,
+                        MAXIMUM_CLOCK_SKEW,
+                        minimum(Duration.ofSeconds(1), providerTimeout),
+                        Math.max(3, storage.append().sessionRenewFailureGrace() + 1),
+                        storage.lifecycle().registryScanPageSize(),
+                        maximumPartitions));
     }
 
     private static byte[] configurationCompatibilitySha256(NereusKafkaStorageConfig storage) {
@@ -422,6 +515,15 @@ public final class NereusKafkaRuntimeConfigurationMapper {
         } catch (ArithmeticException failure) {
             throw new ConfigException("Nereus Kafka duration mapping overflows");
         }
+    }
+
+    private static Duration dividePositive(Duration value, int divisor) {
+        long valueMillis = value.toMillis();
+        if (valueMillis <= 1) {
+            throw new ConfigException(
+                    "Nereus Kafka compaction claim duration must exceed one millisecond");
+        }
+        return Duration.ofMillis(Math.max(1, valueMillis / divisor));
     }
 
     private static int addExact(int first, int second, int third) {

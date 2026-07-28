@@ -17,11 +17,17 @@
 
 package kafka.log.nereus
 
-import com.nereusstream.api.{AppendAuthority, AppendResult, Checksum, ChecksumType}
+import com.nereusstream.api.{AppendAuthority, AppendResult, Checksum, ChecksumType, OffsetRange}
 import com.nereusstream.kafka.checkpoint.{KafkaCanonicalCheckpointState, KafkaCheckpointSourceState, KafkaVirtualSegmentState}
 import com.nereusstream.kafka.codec.{KafkaAppendBatchEncoder, KafkaFetchAssembly, KafkaRecordBatchCodec}
+import com.nereusstream.kafka.compaction.{
+  KafkaCompactionPartitionPass,
+  KafkaCompactionPlanner,
+  KafkaCompactionStrategyV1
+}
 import com.nereusstream.kafka.partition.{KafkaAppendContext, KafkaPartitionState, KafkaPartitionStorage, KafkaStableAppendResult, KafkaStableSnapshot, KafkaStorageReadRequest, KafkaStorageReadResult}
 import com.nereusstream.kafka.retention.{KafkaDeleteRecordsCoordinator, KafkaPartitionMaintenance, KafkaTrimBarrier}
+import com.nereusstream.materialization.{MaterializationPolicy, MaterializationPolicyFactory, TopicCompactionSpec}
 import com.nereusstream.metadata.oxia.VersionedKafkaPartitionBinding
 import com.nereusstream.metadata.oxia.records.KafkaPartitionBindingRecord
 import kafka.log.LogManager
@@ -52,14 +58,14 @@ import org.apache.kafka.server.util.{KafkaScheduler, MockTime}
 import org.apache.kafka.server.storage.log.FetchIsolation
 import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, LogConfig, LogDirFailureChannel, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
-import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertSame, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
 import org.mockito.ArgumentMatchers.{any, anyLong}
 import org.mockito.Mockito.{mock, verify, when}
 
 import java.nio.ByteBuffer
 import java.nio.file.Files
-import java.util.concurrent.{CompletableFuture, atomic}
+import java.util.concurrent.{CompletableFuture, CompletionException, atomic}
 import java.util.{Optional, OptionalLong, Properties}
 
 class NereusUnifiedLogFactoryTest {
@@ -382,6 +388,167 @@ class NereusUnifiedLogFactoryTest {
         -1)
       assertEquals(5L, secondMarkerInfo.firstOffset())
       assertEquals(6L, snapshot.get().lastStableOffset())
+      val compactionOverrides = new Properties()
+      compactionOverrides.put("cleanup.policy", "compact")
+      nereusLog.updateConfigAtMetadataOffset(
+        LogConfig.fromProps(nereusLog.config.originals, compactionOverrides),
+        43)
+
+      val durableLogStartPublications = new atomic.AtomicInteger()
+      val maintenanceAuthority = new NereusUnifiedLog.MaintenanceAuthority {
+        override def capture(
+          expectedStorage: KafkaPartitionStorage,
+          expectedLeaderEpoch: Int,
+          capture: NereusUnifiedLog.MaintenanceCapture
+        ): KafkaPartitionMaintenance.Capture = {
+          assertEquals(storage, expectedStorage)
+          assertEquals(7, expectedLeaderEpoch)
+          capture.capture()
+        }
+
+        override def captureCompaction(
+          expectedStorage: KafkaPartitionStorage,
+          expectedLeaderEpoch: Int,
+          capture: NereusUnifiedLog.CompactionCapture
+        ): KafkaPartitionMaintenance.CompactionState = {
+          assertEquals(storage, expectedStorage)
+          assertEquals(7, expectedLeaderEpoch)
+          capture.capture()
+        }
+
+        override def captureCompactionTransactions(
+          expectedStorage: KafkaPartitionStorage,
+          expectedLeaderEpoch: Int,
+          capture: NereusUnifiedLog.CompactionTransactionCapture
+        ): NereusUnifiedLog.CompactionTransactionState = {
+          assertEquals(storage, expectedStorage)
+          assertEquals(7, expectedLeaderEpoch)
+          capture.capture()
+        }
+
+        override def publish(
+          expectedStorage: KafkaPartitionStorage,
+          expectedLeaderEpoch: Int,
+          durableOffset: Long
+        ): Unit = {
+          assertEquals(storage, expectedStorage)
+          assertEquals(7, expectedLeaderEpoch)
+          nereusLog.publishDurableLogStart(
+            expectedStorage,
+            expectedLeaderEpoch,
+            durableOffset)
+          durableLogStartPublications.incrementAndGet()
+        }
+      }
+      val outputPolicy = MaterializationPolicyFactory.kafkaTopicCompacted(
+        new TopicCompactionSpec(
+          KafkaCompactionStrategyV1.STRATEGY_ID,
+          KafkaCompactionStrategyV1.STRATEGY_VERSION,
+          "KCK2"),
+        2,
+        MaterializationPolicy.MAX_SOURCE_RANGES,
+        1_000_000,
+        256L * 1024 * 1024,
+        8_192,
+        "ZSTD")
+      val writeSettings =
+        new KafkaCompactionPartitionPass.WriteSettings("test-build", false)
+      val compactionConfiguration =
+        new NereusUnifiedLog.CompactionConfiguration(
+          outputPolicy,
+          1_000_000,
+          1024 * 1024,
+          64L * 1024 * 1024,
+          writeSettings)
+      val expectedCompactionCapture =
+        mock(classOf[KafkaCompactionPartitionPass.Capture])
+      when(maintenance.captureCompaction(
+        any(classOf[KafkaPartitionMaintenance.CompactionHooks])))
+        .thenAnswer(invocation => {
+          val hooks =
+            invocation.getArgument[KafkaPartitionMaintenance.CompactionHooks](0)
+          val currentSource = checkpointSource(nereusLog, 7, 0, 6)
+          val captured = hooks.capture(currentSource).join()
+          assertEquals(6L, captured.canonicalState().checkpointOffset())
+          assertEquals(6L, captured.canonicalState().producerTransactionState().mapEndOffset())
+          assertEquals(6L, captured.highWatermark())
+          assertEquals(6L, captured.lastStableOffset())
+          assertSame(outputPolicy, captured.outputPolicy())
+          assertSame(writeSettings, captured.writeSettings())
+          val history = captured.canonicalState().virtualSegmentState().configHistory()
+          val policy = KafkaCompactionPlanner.Policy.from(history.get(history.size() - 1))
+          assertTrue(policy.compactEnabled())
+          val candidate = new KafkaCompactionPlanner.Candidate(
+            new OffsetRange(0, 4),
+            new OffsetRange(0, 6),
+            1,
+            policy,
+            Optional.empty(),
+            4_000)
+          val passOne =
+            hooks.capturePassOne(currentSource, candidate, captured).join()
+          assertEquals(6L, passOne.transactionStateEndOffset())
+          assertEquals(2, passOne.abortedTransactions().size())
+          assertEquals(2L, passOne.abortedTransactions().get(0).firstOffset())
+          assertEquals(3L, passOne.abortedTransactions().get(0).markerOffset())
+          assertEquals(4L, passOne.abortedTransactions().get(1).firstOffset())
+          assertEquals(5L, passOne.abortedTransactions().get(1).markerOffset())
+          assertTrue(passOne.openTransactions().isEmpty)
+          assertEquals(2, passOne.markerDecisions().size())
+          assertEquals(3L, passOne.markerDecisions().get(0).markerOffset())
+          assertEquals(
+            KafkaCompactionStrategyV1.MarkerStatus.RETAIN_REQUIRED,
+            passOne.markerDecisions().get(0).status())
+          assertEquals(5L, passOne.markerDecisions().get(1).markerOffset())
+          assertEquals(
+            KafkaCompactionStrategyV1.MarkerStatus.RETAIN_REQUIRED,
+            passOne.markerDecisions().get(1).status())
+          CompletableFuture.completedFuture(expectedCompactionCapture)
+        })
+      val capturedCompaction = nereusLog
+        .compactionCaptureProvider(
+          7,
+          maintenanceAuthority,
+          compactionConfiguration)
+        .capture(nereusLog.nereusIdentity().durableId())
+        .join()
+      assertSame(expectedCompactionCapture, capturedCompaction)
+
+      when(maintenance.captureCompaction(
+        any(classOf[KafkaPartitionMaintenance.CompactionHooks])))
+        .thenAnswer(invocation => {
+          val hooks =
+            invocation.getArgument[KafkaPartitionMaintenance.CompactionHooks](0)
+          val currentSource = checkpointSource(nereusLog, 7, 0, 6)
+          val captured = hooks.capture(currentSource).join()
+          val history = captured.canonicalState().virtualSegmentState().configHistory()
+          val candidate = new KafkaCompactionPlanner.Candidate(
+            new OffsetRange(0, 4),
+            new OffsetRange(0, 6),
+            1,
+            KafkaCompactionPlanner.Policy.from(history.get(history.size() - 1)),
+            Optional.empty(),
+            4_000)
+          hooks
+            .capturePassOne(currentSource, candidate, captured)
+            .thenApply(_ => expectedCompactionCapture)
+        })
+      val overLimit = assertThrows(classOf[CompletionException], () =>
+        nereusLog
+          .compactionCaptureProvider(
+            7,
+            maintenanceAuthority,
+            new NereusUnifiedLog.CompactionConfiguration(
+              outputPolicy,
+              5,
+              1024 * 1024,
+              64L * 1024 * 1024,
+              writeSettings))
+          .capture(nereusLog.nereusIdentity().durableId())
+          .join())
+      assertTrue(
+        overLimit.getCause.getMessage.contains(
+          "decision horizon exceeds the decoded-record limit"))
 
       val timestampResult = nereusLog
         .fetchOffsetByTimestamp(1500, Optional.empty())
@@ -402,7 +569,6 @@ class NereusUnifiedLogFactoryTest {
       assertEquals(1, boundedAbortedTransactions.size())
       assertEquals(producerId, boundedAbortedTransactions.get(0).producerId())
 
-      val durableLogStartPublications = new atomic.AtomicInteger()
       when(maintenance.deleteRecords(
         any(classOf[KafkaPartitionMaintenance.Hooks]),
         anyLong())).thenAnswer(invocation => {
@@ -426,7 +592,7 @@ class NereusUnifiedLogFactoryTest {
           canonical.virtualSegmentState().segments().size(),
           canonical.derivedIndexState().logicalByteIndexes().size())
         assertEquals(
-          42L,
+          43L,
           canonical.virtualSegmentState().configHistory().get(
             canonical.virtualSegmentState().configHistory().size() - 1).metadataOffset())
         assertTrue(canonical.virtualSegmentState().segments().stream().anyMatch(
@@ -459,38 +625,18 @@ class NereusUnifiedLogFactoryTest {
       val durableLowWatermark = nereusLog.deleteRecords(
         7,
         1,
-        new NereusUnifiedLog.MaintenanceAuthority {
-          override def capture(
-            expectedStorage: KafkaPartitionStorage,
-            expectedLeaderEpoch: Int,
-            capture: NereusUnifiedLog.MaintenanceCapture
-          ): KafkaPartitionMaintenance.Capture = {
-            assertEquals(storage, expectedStorage)
-            assertEquals(7, expectedLeaderEpoch)
-            capture.capture()
-          }
-
-          override def publish(
-            expectedStorage: KafkaPartitionStorage,
-            expectedLeaderEpoch: Int,
-            durableOffset: Long
-          ): Unit = {
-            assertEquals(storage, expectedStorage)
-            assertEquals(7, expectedLeaderEpoch)
-            nereusLog.publishDurableLogStart(
-              expectedStorage,
-              expectedLeaderEpoch,
-              durableOffset)
-            durableLogStartPublications.incrementAndGet()
-          }
-        })
+        maintenanceAuthority)
       assertEquals(1L, durableLowWatermark)
       assertEquals(1L, nereusLog.logStartOffset)
       assertEquals(1, durableLogStartPublications.get())
 
       corruptNextStableResult.set(true)
       assertThrows(classOf[KafkaStorageException], () =>
-        nereusLog.appendAsLeader(TestUtils.singletonRecords("invalid-stable-result".getBytes), 7))
+        nereusLog.appendAsLeader(
+          MemoryRecords.withRecords(
+            Compression.NONE,
+            new SimpleRecord(4000, "key".getBytes, "invalid-stable-result".getBytes)),
+          7))
       assertEquals(6L, nereusLog.logEndOffset)
       verify(storage).resign()
 

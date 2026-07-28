@@ -32,7 +32,9 @@ import org.apache.kafka.server.util.Scheduler;
 import org.apache.kafka.storage.internals.log.AppendOrigin;
 import org.apache.kafka.storage.internals.log.AbortedTxn;
 import org.apache.kafka.storage.internals.log.AsyncOffsetReader;
+import org.apache.kafka.storage.internals.log.CleanedTransactionMetadata;
 import org.apache.kafka.storage.internals.log.FetchDataInfo;
+import org.apache.kafka.storage.internals.log.LastRecord;
 import org.apache.kafka.storage.internals.log.LogAppendInfo;
 import org.apache.kafka.storage.internals.log.LogConfig;
 import org.apache.kafka.storage.internals.log.LogDirFailureChannel;
@@ -53,7 +55,15 @@ import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointState;
 import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
 import com.nereusstream.kafka.checkpoint.KafkaDerivedIndexState;
 import com.nereusstream.kafka.checkpoint.KafkaLeaderEpochState;
+import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
 import com.nereusstream.kafka.checkpoint.KafkaVirtualSegmentState;
+import com.nereusstream.kafka.compaction.KafkaCompactionPartitionPass;
+import com.nereusstream.kafka.compaction.KafkaCompactionPassOneCollector;
+import com.nereusstream.kafka.compaction.KafkaCompactionPassOneCollector.AbortedTransactionRange;
+import com.nereusstream.kafka.compaction.KafkaCompactionPassOneCollector.MarkerDecision;
+import com.nereusstream.kafka.compaction.KafkaCompactionPassOneCollector.OpenTransactionRange;
+import com.nereusstream.kafka.compaction.KafkaCompactionPlanner;
+import com.nereusstream.kafka.compaction.KafkaCompactionStrategyV1.MarkerStatus;
 import com.nereusstream.kafka.partition.KafkaAppendContext;
 import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.partition.KafkaPartitionState;
@@ -65,14 +75,16 @@ import com.nereusstream.kafka.partition.KafkaStorageReadResult;
 import com.nereusstream.kafka.retention.KafkaDeleteRecordsCoordinator;
 import com.nereusstream.kafka.retention.KafkaPartitionMaintenance;
 import com.nereusstream.kafka.retention.KafkaTrimBarrier;
+import com.nereusstream.materialization.MaterializationPolicy;
 import com.nereusstream.metadata.oxia.VersionedKafkaPartitionBinding;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.time.Duration;
-import java.util.Map;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -515,6 +527,45 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         return maintenanceHooks(exactStorage, leaderEpoch, authority);
     }
 
+    /**
+     * Creates one product capture provider backed by the exact stock transaction-cleaner oracle.
+     *
+     * <p>The initial canonical state and the active-producer snapshot are taken under the current
+     * Partition lock. The selected decision horizon is then read from Nereus outside that lock,
+     * and the same producer snapshot is revalidated before the capture is returned.
+     */
+    public KafkaCompactionPartitionPass.CaptureProvider compactionCaptureProvider(
+            int leaderEpoch,
+            MaintenanceAuthority authority,
+            CompactionConfiguration configuration
+    ) {
+        Objects.requireNonNull(authority, "authority");
+        CompactionConfiguration exactConfiguration =
+                Objects.requireNonNull(configuration, "configuration");
+        KafkaPartitionStorage exactStorage;
+        KafkaPartitionMaintenance maintenance;
+        synchronized (nereusGuard) {
+            requirePublished(leaderEpoch);
+            exactStorage = storage;
+            maintenance = exactStorage.maintenance().orElseThrow(() ->
+                    new KafkaStorageException(
+                            "Nereus partition maintenance is not configured"));
+        }
+        KafkaPartitionMaintenance.CompactionHooks hooks =
+                compactionHooks(
+                        exactStorage,
+                        leaderEpoch,
+                        authority,
+                        exactConfiguration);
+        return partition -> {
+            if (!partition.equals(identity.durableId())) {
+                return CompletableFuture.failedFuture(
+                        invariant("Kafka compaction requested another partition identity"));
+            }
+            return maintenance.captureCompaction(hooks);
+        };
+    }
+
     public void publishDurableLogStart(
             KafkaPartitionStorage expectedStorage,
             int expectedLeaderEpoch,
@@ -599,6 +650,245 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 }
             }
         };
+    }
+
+    private KafkaPartitionMaintenance.CompactionHooks compactionHooks(
+            KafkaPartitionStorage exactStorage,
+            int leaderEpoch,
+            MaintenanceAuthority authority,
+            CompactionConfiguration configuration
+    ) {
+        return new KafkaPartitionMaintenance.CompactionHooks() {
+            @Override
+            public CompletableFuture<KafkaPartitionMaintenance.CompactionState> capture(
+                    KafkaCheckpointSourceState currentSource
+            ) {
+                try {
+                    KafkaPartitionMaintenance.CompactionState captured =
+                            authority.captureCompaction(
+                                    exactStorage,
+                                    leaderEpoch,
+                                    () -> {
+                                        synchronized (nereusGuard) {
+                                            requireSamePublishedStorage(exactStorage);
+                                            KafkaStableSnapshot snapshot =
+                                                    exactStorage.stableSnapshot();
+                                            return new KafkaPartitionMaintenance.CompactionState(
+                                                    canonicalCheckpoint(
+                                                            currentSource, snapshot),
+                                                    snapshot.highWatermark(),
+                                                    snapshot.lastStableOffset(),
+                                                    configuration.outputPolicy(),
+                                                    configuration.writeSettings());
+                                        }
+                                    });
+                    return CompletableFuture.completedFuture(captured);
+                } catch (Throwable failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+
+            @Override
+            public CompletableFuture<KafkaCompactionPartitionPass.PassOneInputs> capturePassOne(
+                    KafkaCheckpointSourceState currentSource,
+                    KafkaCompactionPlanner.Candidate candidate,
+                    KafkaPartitionMaintenance.CompactionState state
+            ) {
+                try {
+                    return CompletableFuture.completedFuture(
+                            scanCompactionPassOne(
+                                    exactStorage,
+                                    leaderEpoch,
+                                    authority,
+                                    currentSource,
+                                    candidate,
+                                    state,
+                                    configuration));
+                } catch (Throwable failure) {
+                    return CompletableFuture.failedFuture(failure);
+                }
+            }
+        };
+    }
+
+    private KafkaCompactionPartitionPass.PassOneInputs scanCompactionPassOne(
+            KafkaPartitionStorage exactStorage,
+            int leaderEpoch,
+            MaintenanceAuthority authority,
+            KafkaCheckpointSourceState currentSource,
+            KafkaCompactionPlanner.Candidate candidate,
+            KafkaPartitionMaintenance.CompactionState state,
+            CompactionConfiguration configuration
+    ) {
+        if (candidate.shouldCompact()
+                && candidate.decisionHorizon().recordCount()
+                > configuration.maxDecodedRecords()) {
+            throw invariant(
+                    "Kafka compaction decision horizon exceeds the decoded-record limit");
+        }
+        CompactionTransactionState before =
+                captureCompactionTransactions(
+                        exactStorage,
+                        leaderEpoch,
+                        authority,
+                        currentSource,
+                        state);
+        List<MarkerDecision> markers =
+                candidate.shouldCompact()
+                        ? scanMarkerDecisions(candidate, before)
+                        : List.of();
+        CompactionTransactionState after =
+                captureCompactionTransactions(
+                        exactStorage,
+                        leaderEpoch,
+                        authority,
+                        currentSource,
+                        state);
+        if (!after.equals(before)) {
+            throw fenced(
+                    "Kafka producer/transaction state changed during compaction pre-scan");
+        }
+        KafkaProducerTransactionState producerState = before.producerState();
+        List<AbortedTransactionRange> aborted =
+                producerState.abortedTransactions().stream()
+                        .filter(transaction ->
+                                transaction.lastOffset()
+                                        >= candidate.decisionHorizon().startOffset()
+                                && transaction.firstOffset()
+                                        < candidate.decisionHorizon().endOffset())
+                        .map(transaction ->
+                                new AbortedTransactionRange(
+                                        transaction.producerId(),
+                                        transaction.firstOffset(),
+                                        transaction.lastOffset()))
+                        .toList();
+        List<OpenTransactionRange> open =
+                producerState.openTransactions().stream()
+                        .filter(transaction ->
+                                transaction.firstOffset()
+                                        < candidate.decisionHorizon().endOffset())
+                        .map(transaction ->
+                                new OpenTransactionRange(
+                                        transaction.producerId(),
+                                        transaction.firstOffset()))
+                        .toList();
+        if (aborted.size() > KafkaCompactionPassOneCollector.MAX_TRANSACTION_FACTS
+                || open.size() > KafkaCompactionPassOneCollector.MAX_TRANSACTION_FACTS) {
+            throw invariant(
+                    "Kafka compaction transaction facts exceed the pass-one limit");
+        }
+        return new KafkaCompactionPartitionPass.PassOneInputs(
+                currentSource.endOffset(),
+                configuration.maxDecodedRecords(),
+                configuration.maxKeyBytes(),
+                configuration.maxInMemoryKeyBytes(),
+                aborted,
+                open,
+                markers);
+    }
+
+    private CompactionTransactionState captureCompactionTransactions(
+            KafkaPartitionStorage exactStorage,
+            int leaderEpoch,
+            MaintenanceAuthority authority,
+            KafkaCheckpointSourceState source,
+            KafkaPartitionMaintenance.CompactionState state
+    ) {
+        return authority.captureCompactionTransactions(
+                exactStorage,
+                leaderEpoch,
+                () -> {
+                    synchronized (nereusGuard) {
+                        requireSamePublishedStorage(exactStorage);
+                        KafkaStableSnapshot current = exactStorage.stableSnapshot();
+                        KafkaProducerTransactionState producerState =
+                                producerStateManager.exportCanonical(source.endOffset());
+                        if (current.logStartOffset() != source.trimOffset()
+                                || current.stableEndOffset() != source.endOffset()
+                                || !producerState.equals(
+                                        state.canonicalState().producerTransactionState())) {
+                            throw fenced(
+                                    "Kafka compaction transaction capture changed stable source");
+                        }
+                        return new CompactionTransactionState(
+                                producerState,
+                                Map.copyOf(lastRecordsOfActiveProducers()));
+                    }
+                });
+    }
+
+    private List<MarkerDecision> scanMarkerDecisions(
+            KafkaCompactionPlanner.Candidate candidate,
+            CompactionTransactionState transactionState
+    ) {
+        CleanedTransactionMetadata cleaned = new CleanedTransactionMetadata();
+        cleaned.addAbortedTransactions(
+                transactionState.producerState().abortedTransactions().stream()
+                        .map(transaction ->
+                                new AbortedTxn(
+                                        transaction.producerId(),
+                                        transaction.firstOffset(),
+                                        transaction.lastOffset(),
+                                        transaction.lastStableOffset()))
+                        .toList());
+        long nextOffset = candidate.decisionHorizon().startOffset();
+        long endOffset = candidate.decisionHorizon().endOffset();
+        ArrayList<MarkerDecision> markers = new ArrayList<>();
+        while (nextOffset < endOffset) {
+            FetchDataInfo page =
+                    read(
+                            nextOffset,
+                            hardMaxFetchBytes,
+                            FetchIsolation.LOG_END,
+                            true);
+            long pageStart = nextOffset;
+            for (RecordBatch batch : page.records.batches()) {
+                if (batch.baseOffset() >= endOffset) {
+                    break;
+                }
+                if (batch.baseOffset() != nextOffset
+                        || batch.nextOffset() > endOffset) {
+                    throw invariant(
+                            "Kafka compaction transaction pre-scan is not dense");
+                }
+                if (batch.isControlBatch()) {
+                    if (markers.size()
+                            >= KafkaCompactionPassOneCollector.MAX_TRANSACTION_FACTS) {
+                        throw invariant(
+                                "Kafka compaction marker facts exceed the pass-one limit");
+                    }
+                    boolean discardable = cleaned.onControlBatchRead(batch);
+                    boolean activeLastMarker =
+                            isActiveLastMarker(
+                                    batch,
+                                    transactionState.activeProducerLastRecords());
+                    markers.add(
+                            new MarkerDecision(
+                                    batch.lastOffset(),
+                                    discardable && !activeLastMarker
+                                            ? MarkerStatus.DELETE_ELIGIBLE
+                                            : MarkerStatus.RETAIN_REQUIRED));
+                } else {
+                    cleaned.onBatchRead(batch);
+                }
+                nextOffset = batch.nextOffset();
+            }
+            if (nextOffset == pageStart) {
+                throw invariant(
+                        "Kafka compaction transaction pre-scan made no progress");
+            }
+        }
+        return List.copyOf(markers);
+    }
+
+    private static boolean isActiveLastMarker(
+            RecordBatch batch,
+            Map<Long, LastRecord> activeProducerLastRecords
+    ) {
+        LastRecord last = activeProducerLastRecords.get(batch.producerId());
+        return last != null
+                && last.lastDataOffset().isEmpty()
+                && last.producerEpoch() == batch.producerEpoch();
     }
 
     private KafkaCanonicalCheckpointState canonicalCheckpoint(
@@ -1191,6 +1481,16 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 int expectedLeaderEpoch,
                 MaintenanceCapture capture);
 
+        KafkaPartitionMaintenance.CompactionState captureCompaction(
+                KafkaPartitionStorage expectedStorage,
+                int expectedLeaderEpoch,
+                CompactionCapture capture);
+
+        CompactionTransactionState captureCompactionTransactions(
+                KafkaPartitionStorage expectedStorage,
+                int expectedLeaderEpoch,
+                CompactionTransactionCapture capture);
+
         void publish(
                 KafkaPartitionStorage expectedStorage,
                 int expectedLeaderEpoch,
@@ -1200,5 +1500,48 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     @FunctionalInterface
     public interface MaintenanceCapture {
         KafkaPartitionMaintenance.Capture capture();
+    }
+
+    @FunctionalInterface
+    public interface CompactionCapture {
+        KafkaPartitionMaintenance.CompactionState capture();
+    }
+
+    @FunctionalInterface
+    public interface CompactionTransactionCapture {
+        CompactionTransactionState capture();
+    }
+
+    public record CompactionConfiguration(
+            MaterializationPolicy outputPolicy,
+            long maxDecodedRecords,
+            int maxKeyBytes,
+            long maxInMemoryKeyBytes,
+            KafkaCompactionPartitionPass.WriteSettings writeSettings
+    ) {
+        public CompactionConfiguration {
+            Objects.requireNonNull(outputPolicy, "outputPolicy");
+            Objects.requireNonNull(writeSettings, "writeSettings");
+            if (maxDecodedRecords <= 0
+                    || maxKeyBytes <= 0
+                    || maxInMemoryKeyBytes <= 0) {
+                throw new IllegalArgumentException(
+                        "Kafka compaction capture limits must be positive");
+            }
+        }
+    }
+
+    public record CompactionTransactionState(
+            KafkaProducerTransactionState producerState,
+            Map<Long, LastRecord> activeProducerLastRecords
+    ) {
+        public CompactionTransactionState {
+            Objects.requireNonNull(producerState, "producerState");
+            activeProducerLastRecords =
+                    Map.copyOf(
+                            Objects.requireNonNull(
+                                    activeProducerLastRecords,
+                                    "activeProducerLastRecords"));
+        }
     }
 }

@@ -45,6 +45,7 @@ import java.nio.ByteBuffer
 import java.util.Optional
 import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Semaphore}
 import com.nereusstream.kafka.partition.KafkaPartitionStorage
+import com.nereusstream.kafka.retention.KafkaPartitionMaintenance
 import kafka.server.share.DelayedShareFetch
 import org.apache.kafka.clients.ClientResponse
 import org.apache.kafka.common.compress.Compression
@@ -4289,6 +4290,36 @@ class PartitionTest extends AbstractPartitionTest {
           invocation.getArgument[NereusUnifiedLog.MaintenanceAuthority](2)
         assertEquals(leaderEpoch, capturedEpoch)
         assertEquals(2L, capturedOffset)
+        val maintenanceCapture =
+          mock(classOf[NereusUnifiedLog.MaintenanceCapture])
+        val maintenanceState =
+          mock(classOf[KafkaPartitionMaintenance.Capture])
+        when(maintenanceCapture.capture()).thenReturn(maintenanceState)
+        assertSame(
+          maintenanceState,
+          publisher.capture(expectedStorage, capturedEpoch, maintenanceCapture))
+        val compactionCapture =
+          mock(classOf[NereusUnifiedLog.CompactionCapture])
+        val compactionState =
+          mock(classOf[KafkaPartitionMaintenance.CompactionState])
+        when(compactionCapture.capture()).thenReturn(compactionState)
+        assertSame(
+          compactionState,
+          publisher.captureCompaction(
+            expectedStorage,
+            capturedEpoch,
+            compactionCapture))
+        val transactionCapture =
+          mock(classOf[NereusUnifiedLog.CompactionTransactionCapture])
+        val transactionState =
+          mock(classOf[NereusUnifiedLog.CompactionTransactionState])
+        when(transactionCapture.capture()).thenReturn(transactionState)
+        assertSame(
+          transactionState,
+          publisher.captureCompactionTransactions(
+            expectedStorage,
+            capturedEpoch,
+            transactionCapture))
         publisher.publish(expectedStorage, capturedEpoch, capturedOffset)
         capturedOffset
       })

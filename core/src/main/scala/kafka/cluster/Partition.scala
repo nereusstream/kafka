@@ -1723,6 +1723,24 @@ class Partition(val topicPartition: TopicPartition,
         Objects.requireNonNull(capture, "capture").capture()
       }
 
+      override def captureCompaction(
+        expectedStorage: KafkaPartitionStorage,
+        expectedLeaderEpoch: Int,
+        capture: NereusUnifiedLog.CompactionCapture
+      ): KafkaPartitionMaintenance.CompactionState = inReadLock(leaderIsrUpdateLock) {
+        requireCurrentNereusLeader(expectedLog, expectedLeaderEpoch)
+        Objects.requireNonNull(capture, "capture").capture()
+      }
+
+      override def captureCompactionTransactions(
+        expectedStorage: KafkaPartitionStorage,
+        expectedLeaderEpoch: Int,
+        capture: NereusUnifiedLog.CompactionTransactionCapture
+      ): NereusUnifiedLog.CompactionTransactionState = inReadLock(leaderIsrUpdateLock) {
+        requireCurrentNereusLeader(expectedLog, expectedLeaderEpoch)
+        Objects.requireNonNull(capture, "capture").capture()
+      }
+
       override def publish(
         expectedStorage: KafkaPartitionStorage,
         expectedLeaderEpoch: Int,

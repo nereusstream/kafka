@@ -20,6 +20,7 @@ package kafka.server.nereus;
 import kafka.log.nereus.NereusListOffsetsScanConfig;
 
 import com.nereusstream.kafka.activation.KafkaBrokerCapabilitySpecification;
+import com.nereusstream.kafka.runtime.NereusKafkaCompactionRuntimeConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeConfiguration;
 
@@ -31,6 +32,7 @@ public record NereusKafkaMappedRuntimeConfiguration(
         KafkaBrokerCapabilitySpecification capability,
         NereusListOffsetsScanConfig listOffsets,
         NereusKafkaMaintenanceConfiguration maintenance,
+        NereusKafkaCompactionRuntimeConfiguration compaction,
         String objectProviderToken
 ) {
     public NereusKafkaMappedRuntimeConfiguration {
@@ -38,6 +40,7 @@ public record NereusKafkaMappedRuntimeConfiguration(
         Objects.requireNonNull(capability, "capability");
         Objects.requireNonNull(listOffsets, "listOffsets");
         Objects.requireNonNull(maintenance, "maintenance");
+        Objects.requireNonNull(compaction, "compaction");
         Objects.requireNonNull(objectProviderToken, "objectProviderToken");
         if (objectProviderToken.isBlank()) {
             throw new IllegalArgumentException("objectProviderToken must be nonblank");
