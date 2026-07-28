@@ -29,8 +29,8 @@ import org.apache.kafka.storage.internals.log.LogSegments;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.Objects;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Ephemeral local shell used only to satisfy stock UnifiedLog state machinery. Its segment files are cache artifacts,

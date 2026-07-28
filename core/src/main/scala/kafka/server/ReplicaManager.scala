@@ -19,7 +19,6 @@ package kafka.server
 import com.yammer.metrics.core.Meter
 import kafka.cluster.Partition
 import kafka.log.LogManager
-import kafka.log.nereus.NereusUnifiedLog
 import kafka.server.HostedPartition.Online
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.ReplicaManager.{AtMinIsrPartitionCountMetricName, FailedIsrUpdatesPerSecMetricName, IsrExpandsPerSecMetricName, IsrShrinksPerSecMetricName, LeaderCountMetricName, OfflineReplicaCountMetricName, PartitionCountMetricName, PartitionsWithLateTransactionsCountMetricName, ProducerIdCountMetricName, ReassigningPartitionsMetricName, UnderMinIsrPartitionCountMetricName, UnderReplicatedPartitionsMetricName, createLogReadResult, isListOffsetsTimestampUnsupported}
@@ -38,6 +37,7 @@ import org.apache.kafka.common.message.OffsetForLeaderEpochResponseData.{EpochEn
 import org.apache.kafka.common.message.{DescribeLogDirsResponseData, DescribeProducersResponseData}
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.network.ListenerName
+import org.apache.kafka.storage.internals.log.BrokerStorageManagedLog
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.record._
 import org.apache.kafka.common.replica.PartitionView.DefaultPartitionView
@@ -2389,10 +2389,10 @@ class ReplicaManager(val config: KafkaConfig,
       throw new IllegalArgumentException("maximumPartitions must be in [1, 100000]")
     val result = new util.ArrayList[Partition](Math.min(maximumPartitions, 1024))
     val leaders = leaderPartitionsIterator
-    while (leaders.hasNext && result.size() <= maximumPartitions) {
+    while (leaders.hasNext && result.size() < maximumPartitions) {
       val partition = leaders.next()
       partition.leaderLogIfLocal match {
-        case Some(_: NereusUnifiedLog) => result.add(partition)
+        case Some(_: BrokerStorageManagedLog) => result.add(partition)
         case _ =>
       }
     }

@@ -19,7 +19,6 @@ package kafka.cluster
 import java.net.InetAddress
 import com.yammer.metrics.core.Metric
 import kafka.log.LogManager
-import kafka.log.nereus.NereusUnifiedLog
 import kafka.server._
 import kafka.utils._
 import org.apache.kafka.common.errors.{ApiException, FencedLeaderEpochException, InconsistentTopicIdException, InvalidRequiredAcksException, InvalidTxnStateException, NotLeaderOrFollowerException, OffsetNotAvailableException, OffsetOutOfRangeException, PolicyViolationException, UnknownLeaderEpochException}
@@ -44,8 +43,6 @@ import java.lang.{Long => JLong}
 import java.nio.ByteBuffer
 import java.util.Optional
 import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Semaphore}
-import com.nereusstream.kafka.partition.KafkaPartitionStorage
-import com.nereusstream.kafka.retention.KafkaPartitionMaintenance
 import kafka.server.share.DelayedShareFetch
 import org.apache.kafka.clients.ClientResponse
 import org.apache.kafka.common.compress.Compression
@@ -64,7 +61,7 @@ import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, Unexpec
 import org.apache.kafka.server.util.{KafkaScheduler, MockTime}
 import org.apache.kafka.storage.internals.checkpoint.OffsetCheckpoints
 import org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache
-import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, EpochEntry, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LocalLog, LogAppendInfo, LogConfig, LogDirFailureChannel, LogLoader, LogOffsetMetadata, LogOffsetsListener, LogReadInfo, LogSegments, LogStartOffsetIncrementReason, OffsetResultHolder, ProducerStateManager, ProducerStateManagerConfig, RequiredAcksAwareAppend, UnifiedLog, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, BrokerStorageManagedLog, CleanerConfig, EpochEntry, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LocalLog, LogAppendInfo, LogConfig, LogDirFailureChannel, LogLoader, LogOffsetMetadata, LogOffsetsListener, LogReadInfo, LogSegments, LogStartOffsetIncrementReason, OffsetResultHolder, PartitionLeaderAuthority, ProducerStateManager, ProducerStateManagerConfig, RequiredAcksAwareAppend, UnifiedLog, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
@@ -4273,57 +4270,44 @@ class PartitionTest extends AbstractPartitionTest {
     val deletePolicyConfig = new LogConfig(util.Map.of(
       TopicConfig.CLEANUP_POLICY_CONFIG, "delete"
     ))
-    val nereusLog = mock(classOf[NereusUnifiedLog])
-    val expectedStorage = mock(classOf[KafkaPartitionStorage])
-    when(nereusLog.config).thenReturn(deletePolicyConfig)
-    when(nereusLog.logEndOffset).thenReturn(2L)
-    when(nereusLog.logStartOffset).thenReturn(0L)
-    when(nereusLog.highWatermark).thenReturn(2L)
-    when(nereusLog.deleteRecords(
+    val managedLog = mock(
+      classOf[UnifiedLog],
+      withSettings().extraInterfaces(classOf[BrokerStorageManagedLog]))
+    val managedStorageLog = managedLog.asInstanceOf[BrokerStorageManagedLog]
+    val publicationRan = new java.util.concurrent.atomic.AtomicBoolean()
+    when(managedLog.config).thenReturn(deletePolicyConfig)
+    when(managedLog.logEndOffset).thenReturn(2L)
+    when(managedLog.logStartOffset).thenReturn(0L)
+    when(managedLog.highWatermark).thenReturn(2L)
+    when(managedStorageLog.deleteRecords(
       anyInt(),
       anyLong(),
-      any(classOf[NereusUnifiedLog.MaintenanceAuthority])))
+      any(classOf[PartitionLeaderAuthority])))
       .thenAnswer(invocation => {
         val capturedEpoch = invocation.getArgument[Integer](0)
         val capturedOffset = invocation.getArgument[java.lang.Long](1)
         val publisher =
-          invocation.getArgument[NereusUnifiedLog.MaintenanceAuthority](2)
+          invocation.getArgument[PartitionLeaderAuthority](2)
         assertEquals(leaderEpoch, capturedEpoch)
         assertEquals(2L, capturedOffset)
-        val maintenanceCapture =
-          mock(classOf[NereusUnifiedLog.MaintenanceCapture])
-        val maintenanceState =
-          mock(classOf[KafkaPartitionMaintenance.Capture])
-        when(maintenanceCapture.capture()).thenReturn(maintenanceState)
+        val maintenanceState = new Object
         assertSame(
           maintenanceState,
-          publisher.capture(expectedStorage, capturedEpoch, maintenanceCapture))
-        val compactionCapture =
-          mock(classOf[NereusUnifiedLog.CompactionCapture])
-        val compactionState =
-          mock(classOf[KafkaPartitionMaintenance.CompactionState])
-        when(compactionCapture.capture()).thenReturn(compactionState)
+          publisher.capture(capturedEpoch, () => maintenanceState))
+        val compactionState = new Object
         assertSame(
           compactionState,
-          publisher.captureCompaction(
-            expectedStorage,
-            capturedEpoch,
-            compactionCapture))
-        val transactionCapture =
-          mock(classOf[NereusUnifiedLog.CompactionTransactionCapture])
-        val transactionState =
-          mock(classOf[NereusUnifiedLog.CompactionTransactionState])
-        when(transactionCapture.capture()).thenReturn(transactionState)
+          publisher.capture(capturedEpoch, () => compactionState))
+        val transactionState = new Object
         assertSame(
           transactionState,
-          publisher.captureCompactionTransactions(
-            expectedStorage,
-            capturedEpoch,
-            transactionCapture))
-        publisher.publish(expectedStorage, capturedEpoch, capturedOffset)
+          publisher.capture(capturedEpoch, () => transactionState))
+        publisher.publish(
+          capturedEpoch,
+          () => publicationRan.set(true))
         capturedOffset
       })
-    partition.setLog(nereusLog, false)
+    partition.setLog(managedLog, false)
 
     assertThrows(classOf[OffsetOutOfRangeException], () =>
       partition.deleteRecordsOnLeader(3L))
@@ -4331,8 +4315,8 @@ class PartitionTest extends AbstractPartitionTest {
 
     assertEquals(2L, result.requestedOffset)
     assertEquals(2L, result.lowWatermark)
-    verify(nereusLog).publishDurableLogStart(expectedStorage, leaderEpoch, 2L)
+    assertTrue(publicationRan.get())
     verify(delayedOperations).checkAndCompleteAll()
-    verify(nereusLog, never()).maybeIncrementLogStartOffset(anyLong(), any())
+    verify(managedLog, never()).maybeIncrementLogStartOffset(anyLong(), any())
   }
 }

@@ -22,7 +22,6 @@ import java.io.{File, IOException}
 import java.nio.file.{Files, NoSuchFileException}
 import java.util.concurrent._
 import java.util.concurrent.atomic.AtomicInteger
-import kafka.log.nereus.NereusUnifiedLog
 import kafka.server.{KafkaConfig, KafkaRaftServer}
 import kafka.utils.threadsafe
 import kafka.utils.{CoreUtils, Logging}
@@ -42,7 +41,7 @@ import org.apache.kafka.metadata.properties.{MetaProperties, MetaPropertiesEnsem
 import java.util.{Collections, Optional, OptionalLong, Properties}
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 import org.apache.kafka.server.util.{FileLock, Scheduler}
-import org.apache.kafka.storage.internals.log.{CleanerConfig, LogCleaner, LogConfig, LogDirFailureChannel, LogFileUtils, LogManager => JLogManager, LogOffsetsListener, ProducerStateManagerConfig, RemoteIndexCache, UnifiedLog}
+import org.apache.kafka.storage.internals.log.{BrokerStorageManagedLog, CleanerConfig, LogCleaner, LogConfig, LogDirFailureChannel, LogFileUtils, LogManager => JLogManager, LogOffsetsListener, ProducerStateManagerConfig, RemoteIndexCache, UnifiedLog}
 import org.apache.kafka.storage.internals.checkpoint.{CleanShutdownFileHandler, OffsetCheckpointFile}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 
@@ -1014,8 +1013,8 @@ class LogManager(logDirs: Seq[File],
     if (logs.nonEmpty) {
       logs.foreach { log =>
         val oldLogConfig = (log, metadataOffset) match {
-          case (nereusLog: NereusUnifiedLog, Some(offset)) =>
-            nereusLog.updateConfigAtMetadataOffset(newLogConfig, offset)
+          case (managedLog: BrokerStorageManagedLog, Some(offset)) =>
+            managedLog.updateConfigAtMetadataOffset(newLogConfig, offset)
           case _ =>
             log.updateConfig(newLogConfig)
         }

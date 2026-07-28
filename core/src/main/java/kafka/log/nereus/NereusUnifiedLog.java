@@ -29,9 +29,10 @@ import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.common.RequestLocal;
 import org.apache.kafka.server.storage.log.FetchIsolation;
 import org.apache.kafka.server.util.Scheduler;
-import org.apache.kafka.storage.internals.log.AppendOrigin;
 import org.apache.kafka.storage.internals.log.AbortedTxn;
+import org.apache.kafka.storage.internals.log.AppendOrigin;
 import org.apache.kafka.storage.internals.log.AsyncOffsetReader;
+import org.apache.kafka.storage.internals.log.BrokerStorageManagedLog;
 import org.apache.kafka.storage.internals.log.CleanedTransactionMetadata;
 import org.apache.kafka.storage.internals.log.FetchDataInfo;
 import org.apache.kafka.storage.internals.log.LastRecord;
@@ -43,6 +44,7 @@ import org.apache.kafka.storage.internals.log.LogOffsetsListener;
 import org.apache.kafka.storage.internals.log.LogSegments;
 import org.apache.kafka.storage.internals.log.LogStartOffsetIncrementReason;
 import org.apache.kafka.storage.internals.log.OffsetResultHolder;
+import org.apache.kafka.storage.internals.log.PartitionLeaderAuthority;
 import org.apache.kafka.storage.internals.log.ProducerStateManagerConfig;
 import org.apache.kafka.storage.internals.log.RequiredAcksAwareAppend;
 import org.apache.kafka.storage.internals.log.UnifiedLog;
@@ -98,7 +100,8 @@ import java.util.concurrent.TimeoutException;
  * <p>Stock validation and offset assignment stay in UnifiedLog. The final LocalLog append and read are redirected to
  * the exact recovered Nereus storage; the synthetic local segment remains empty and is never durable truth.
  */
-public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAwareAppend {
+public final class NereusUnifiedLog extends UnifiedLog
+        implements RequiredAcksAwareAppend, BrokerStorageManagedLog {
     private final Object nereusGuard = new Object();
     private final KafkaPartitionIdentity identity;
     private final Duration appendTimeout;
@@ -314,6 +317,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         }
     }
 
+    @Override
     public LogConfig updateConfigAtMetadataOffset(
             LogConfig newConfig,
             long metadataOffset
@@ -448,10 +452,11 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
      * <p>The supplied publisher reacquires the exact partition lock before exposing the durable
      * log start and waking delayed Fetch/DeleteRecords operations.
      */
+    @Override
     public long deleteRecords(
             int leaderEpoch,
             long normalizedOffset,
-            MaintenanceAuthority authority
+            PartitionLeaderAuthority authority
     ) {
         if (leaderEpoch < 0 || normalizedOffset < 0) {
             throw new IllegalArgumentException(
@@ -512,7 +517,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     /** Creates authority-fenced hooks for the product-owned periodic retention runtime. */
     public KafkaPartitionMaintenance.Hooks maintenanceHooks(
             int leaderEpoch,
-            MaintenanceAuthority authority
+            PartitionLeaderAuthority authority
     ) {
         Objects.requireNonNull(authority, "authority");
         KafkaPartitionStorage exactStorage;
@@ -536,7 +541,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
      */
     public KafkaCompactionPartitionPass.CaptureProvider compactionCaptureProvider(
             int leaderEpoch,
-            MaintenanceAuthority authority,
+            PartitionLeaderAuthority authority,
             CompactionConfiguration configuration
     ) {
         Objects.requireNonNull(authority, "authority");
@@ -601,7 +606,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private KafkaPartitionMaintenance.Hooks maintenanceHooks(
             KafkaPartitionStorage exactStorage,
             int leaderEpoch,
-            MaintenanceAuthority authority
+            PartitionLeaderAuthority authority
     ) {
         return new KafkaPartitionMaintenance.Hooks() {
             @Override
@@ -611,7 +616,6 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 try {
                     KafkaPartitionMaintenance.Capture captured =
                             authority.capture(
-                                    exactStorage,
                                     leaderEpoch,
                                     () -> {
                                         synchronized (nereusGuard) {
@@ -643,7 +647,12 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                         throw fenced(
                                 "Nereus durable trim completion changed partition authority");
                     }
-                    authority.publish(exactStorage, leaderEpoch, durableTrimOffset);
+                    authority.publish(
+                            leaderEpoch,
+                            () -> publishDurableLogStart(
+                                    exactStorage,
+                                    leaderEpoch,
+                                    durableTrimOffset));
                     return CompletableFuture.completedFuture(null);
                 } catch (Throwable failure) {
                     return CompletableFuture.failedFuture(failure);
@@ -655,7 +664,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private KafkaPartitionMaintenance.CompactionHooks compactionHooks(
             KafkaPartitionStorage exactStorage,
             int leaderEpoch,
-            MaintenanceAuthority authority,
+            PartitionLeaderAuthority authority,
             CompactionConfiguration configuration
     ) {
         return new KafkaPartitionMaintenance.CompactionHooks() {
@@ -665,8 +674,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             ) {
                 try {
                     KafkaPartitionMaintenance.CompactionState captured =
-                            authority.captureCompaction(
-                                    exactStorage,
+                            authority.capture(
                                     leaderEpoch,
                                     () -> {
                                         synchronized (nereusGuard) {
@@ -714,7 +722,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private KafkaCompactionPartitionPass.PassOneInputs scanCompactionPassOne(
             KafkaPartitionStorage exactStorage,
             int leaderEpoch,
-            MaintenanceAuthority authority,
+            PartitionLeaderAuthority authority,
             KafkaCheckpointSourceState currentSource,
             KafkaCompactionPlanner.Candidate candidate,
             KafkaPartitionMaintenance.CompactionState state,
@@ -790,12 +798,11 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private CompactionTransactionState captureCompactionTransactions(
             KafkaPartitionStorage exactStorage,
             int leaderEpoch,
-            MaintenanceAuthority authority,
+            PartitionLeaderAuthority authority,
             KafkaCheckpointSourceState source,
             KafkaPartitionMaintenance.CompactionState state
     ) {
-        return authority.captureCompactionTransactions(
-                exactStorage,
+        return authority.capture(
                 leaderEpoch,
                 () -> {
                     synchronized (nereusGuard) {
@@ -1472,44 +1479,6 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             committedStorage = exactStorage;
             batches = NereusCanonicalLogState.observe(records);
         }
-    }
-
-    /** Partition-lock authority supplied by the exact current ReplicaManager partition. */
-    public interface MaintenanceAuthority {
-        KafkaPartitionMaintenance.Capture capture(
-                KafkaPartitionStorage expectedStorage,
-                int expectedLeaderEpoch,
-                MaintenanceCapture capture);
-
-        KafkaPartitionMaintenance.CompactionState captureCompaction(
-                KafkaPartitionStorage expectedStorage,
-                int expectedLeaderEpoch,
-                CompactionCapture capture);
-
-        CompactionTransactionState captureCompactionTransactions(
-                KafkaPartitionStorage expectedStorage,
-                int expectedLeaderEpoch,
-                CompactionTransactionCapture capture);
-
-        void publish(
-                KafkaPartitionStorage expectedStorage,
-                int expectedLeaderEpoch,
-                long durableOffset);
-    }
-
-    @FunctionalInterface
-    public interface MaintenanceCapture {
-        KafkaPartitionMaintenance.Capture capture();
-    }
-
-    @FunctionalInterface
-    public interface CompactionCapture {
-        KafkaPartitionMaintenance.CompactionState capture();
-    }
-
-    @FunctionalInterface
-    public interface CompactionTransactionCapture {
-        CompactionTransactionState capture();
     }
 
     public record CompactionConfiguration(

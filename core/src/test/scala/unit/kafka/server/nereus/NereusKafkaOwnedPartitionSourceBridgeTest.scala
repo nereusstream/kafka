@@ -29,6 +29,7 @@ import kafka.cluster.Partition
 import kafka.log.nereus.NereusUnifiedLog
 import kafka.server.ReplicaManager
 import org.apache.kafka.server.config.NereusKafkaStorageConfig
+import org.apache.kafka.storage.internals.log.PartitionLeaderAuthority
 import org.junit.jupiter.api.Assertions.{assertEquals, assertSame, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
 import org.mockito.ArgumentCaptor
@@ -53,7 +54,7 @@ class NereusKafkaOwnedPartitionSourceBridgeTest {
     val replicaManager = mock(classOf[ReplicaManager])
     val partition = mock(classOf[Partition])
     val log = mock(classOf[NereusUnifiedLog])
-    val authority = mock(classOf[NereusUnifiedLog.MaintenanceAuthority])
+    val authority = mock(classOf[PartitionLeaderAuthority])
     val hooks = mock(classOf[KafkaPartitionMaintenance.Hooks])
     val compactionProvider =
       mock(classOf[KafkaCompactionPartitionPass.CaptureProvider])

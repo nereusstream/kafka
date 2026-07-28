@@ -56,7 +56,7 @@ import org.apache.kafka.server.config.{NereusKafkaConfigs, ReplicationConfigs, S
 import org.apache.kafka.server.common.{RequestLocal, TransactionVersion}
 import org.apache.kafka.server.util.{KafkaScheduler, MockTime}
 import org.apache.kafka.server.storage.log.FetchIsolation
-import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, LogConfig, LogDirFailureChannel, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, CleanerConfig, LogConfig, LogDirFailureChannel, PartitionLeaderAuthority, VerificationGuard}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertSame, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
@@ -66,6 +66,7 @@ import org.mockito.Mockito.{mock, verify, when}
 import java.nio.ByteBuffer
 import java.nio.file.Files
 import java.util.concurrent.{CompletableFuture, CompletionException, atomic}
+import java.util.function.Supplier
 import java.util.{Optional, OptionalLong, Properties}
 
 class NereusUnifiedLogFactoryTest {
@@ -395,48 +396,21 @@ class NereusUnifiedLogFactoryTest {
         43)
 
       val durableLogStartPublications = new atomic.AtomicInteger()
-      val maintenanceAuthority = new NereusUnifiedLog.MaintenanceAuthority {
-        override def capture(
-          expectedStorage: KafkaPartitionStorage,
+      val maintenanceAuthority = new PartitionLeaderAuthority {
+        override def capture[T](
           expectedLeaderEpoch: Int,
-          capture: NereusUnifiedLog.MaintenanceCapture
-        ): KafkaPartitionMaintenance.Capture = {
-          assertEquals(storage, expectedStorage)
+          action: Supplier[T]
+        ): T = {
           assertEquals(7, expectedLeaderEpoch)
-          capture.capture()
-        }
-
-        override def captureCompaction(
-          expectedStorage: KafkaPartitionStorage,
-          expectedLeaderEpoch: Int,
-          capture: NereusUnifiedLog.CompactionCapture
-        ): KafkaPartitionMaintenance.CompactionState = {
-          assertEquals(storage, expectedStorage)
-          assertEquals(7, expectedLeaderEpoch)
-          capture.capture()
-        }
-
-        override def captureCompactionTransactions(
-          expectedStorage: KafkaPartitionStorage,
-          expectedLeaderEpoch: Int,
-          capture: NereusUnifiedLog.CompactionTransactionCapture
-        ): NereusUnifiedLog.CompactionTransactionState = {
-          assertEquals(storage, expectedStorage)
-          assertEquals(7, expectedLeaderEpoch)
-          capture.capture()
+          action.get()
         }
 
         override def publish(
-          expectedStorage: KafkaPartitionStorage,
           expectedLeaderEpoch: Int,
-          durableOffset: Long
+          action: Runnable
         ): Unit = {
-          assertEquals(storage, expectedStorage)
           assertEquals(7, expectedLeaderEpoch)
-          nereusLog.publishDurableLogStart(
-            expectedStorage,
-            expectedLeaderEpoch,
-            durableOffset)
+          action.run()
           durableLogStartPublications.incrementAndGet()
         }
       }

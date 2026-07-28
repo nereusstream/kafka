@@ -20,10 +20,8 @@ import java.lang.{Long => JLong}
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.{Objects, Optional}
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
-import com.nereusstream.kafka.partition.KafkaPartitionStorage
-import com.nereusstream.kafka.retention.KafkaPartitionMaintenance
+import java.util.function.Supplier
 import kafka.log._
-import kafka.log.nereus.NereusUnifiedLog
 import kafka.server._
 import kafka.server.share.DelayedShareFetch
 import kafka.utils.CoreUtils.{inReadLock, inWriteLock}
@@ -44,7 +42,7 @@ import org.apache.kafka.metadata.{LeaderAndIsr, LeaderRecoveryState, MetadataCac
 import org.apache.kafka.server.common.{RequestLocal, TransactionVersion}
 import org.apache.kafka.server.log.remote.TopicPartitionLog
 import org.apache.kafka.server.log.remote.storage.RemoteLogManager
-import org.apache.kafka.storage.internals.log.{AppendOrigin, AsyncOffsetReader, FetchDataInfo, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LeaderHwChange, LogAppendInfo, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogReadInfo, LogStartOffsetIncrementReason, OffsetResultHolder, RequiredAcksAwareAppend, UnifiedLog, VerificationGuard}
+import org.apache.kafka.storage.internals.log.{AppendOrigin, AsyncOffsetReader, BrokerStorageManagedLog, FetchDataInfo, LeaderEpochAwareOffsetLookup, LeaderEpochAwareRecoveryState, LeaderHwChange, LogAppendInfo, LogOffsetMetadata, LogOffsetSnapshot, LogOffsetsListener, LogReadInfo, LogStartOffsetIncrementReason, OffsetResultHolder, PartitionLeaderAuthority, RequiredAcksAwareAppend, UnifiedLog, VerificationGuard}
 import org.apache.kafka.server.metrics.KafkaMetricsGroup
 import org.apache.kafka.server.partition.{AlterPartitionListener, AssignmentState, CommittedPartitionState, OngoingReassignmentState, PartitionListener, PartitionState, PendingExpandIsr, PendingPartitionChange, PendingShrinkIsr, SimpleAssignmentState}
 import org.apache.kafka.server.purgatory.{DelayedDeleteRecords, DelayedOperationPurgatory, TopicPartitionOperationKey}
@@ -1679,11 +1677,11 @@ class Partition(val topicPartition: TopicPartition,
 
           leaderLog match {
             // Nereus inject start: durable checkpoint-before-trim outside the partition lock
-            case nereusLog: NereusUnifiedLog =>
+            case managedLog: BrokerStorageManagedLog =>
               if (convertedOffset > leaderLog.highWatermark)
                 throw new OffsetOutOfRangeException(
                   s"The offset $convertedOffset for partition $topicPartition is greater than the high watermark ${leaderLog.highWatermark}")
-              Right((nereusLog, leaderEpoch, convertedOffset))
+              Right((leaderLog, managedLog, leaderEpoch, convertedOffset))
             // Nereus inject end: durable checkpoint-before-trim outside the partition lock
             case _ =>
               leaderLog.maybeIncrementLogStartOffset(convertedOffset, LogStartOffsetIncrementReason.ClientRecordDeletion)
@@ -1698,11 +1696,11 @@ class Partition(val topicPartition: TopicPartition,
 
     decision match {
       case Left(result) => result
-      case Right((nereusLog, capturedLeaderEpoch, convertedOffset)) =>
-        val durableLowWatermark = nereusLog.deleteRecords(
+      case Right((leaderLog, managedLog, capturedLeaderEpoch, convertedOffset)) =>
+        val durableLowWatermark = managedLog.deleteRecords(
           capturedLeaderEpoch,
           convertedOffset,
-          nereusMaintenanceAuthority(nereusLog))
+          nereusMaintenanceAuthority(leaderLog))
         LogDeleteRecordsResult(
           requestedOffset = convertedOffset,
           lowWatermark = durableLowWatermark)
@@ -1710,59 +1708,35 @@ class Partition(val topicPartition: TopicPartition,
   }
 
   private[kafka] def nereusMaintenanceAuthority(
-    expectedLog: NereusUnifiedLog
-  ): NereusUnifiedLog.MaintenanceAuthority = {
+    expectedLog: UnifiedLog
+  ): PartitionLeaderAuthority = {
     Objects.requireNonNull(expectedLog, "expectedLog")
-    new NereusUnifiedLog.MaintenanceAuthority {
-      override def capture(
-        expectedStorage: KafkaPartitionStorage,
+    new PartitionLeaderAuthority {
+      override def capture[T](
         expectedLeaderEpoch: Int,
-        capture: NereusUnifiedLog.MaintenanceCapture
-      ): KafkaPartitionMaintenance.Capture = inReadLock(leaderIsrUpdateLock) {
-        requireCurrentNereusLeader(expectedLog, expectedLeaderEpoch)
-        Objects.requireNonNull(capture, "capture").capture()
-      }
-
-      override def captureCompaction(
-        expectedStorage: KafkaPartitionStorage,
-        expectedLeaderEpoch: Int,
-        capture: NereusUnifiedLog.CompactionCapture
-      ): KafkaPartitionMaintenance.CompactionState = inReadLock(leaderIsrUpdateLock) {
-        requireCurrentNereusLeader(expectedLog, expectedLeaderEpoch)
-        Objects.requireNonNull(capture, "capture").capture()
-      }
-
-      override def captureCompactionTransactions(
-        expectedStorage: KafkaPartitionStorage,
-        expectedLeaderEpoch: Int,
-        capture: NereusUnifiedLog.CompactionTransactionCapture
-      ): NereusUnifiedLog.CompactionTransactionState = inReadLock(leaderIsrUpdateLock) {
-        requireCurrentNereusLeader(expectedLog, expectedLeaderEpoch)
-        Objects.requireNonNull(capture, "capture").capture()
+        action: Supplier[T]
+      ): T = inReadLock(leaderIsrUpdateLock) {
+        requireCurrentStorageLeader(expectedLog, expectedLeaderEpoch)
+        Objects.requireNonNull(action, "action").get()
       }
 
       override def publish(
-        expectedStorage: KafkaPartitionStorage,
         expectedLeaderEpoch: Int,
-        durableOffset: Long
+        action: Runnable
       ): Unit = inReadLock(leaderIsrUpdateLock) {
-        val current = requireCurrentNereusLeader(expectedLog, expectedLeaderEpoch)
-        current.publishDurableLogStart(
-          expectedStorage,
-          expectedLeaderEpoch,
-          durableOffset)
+        requireCurrentStorageLeader(expectedLog, expectedLeaderEpoch)
+        Objects.requireNonNull(action, "action").run()
         tryCompleteDelayedRequests()
       }
     }
   }
 
-  private def requireCurrentNereusLeader(
-    expectedLog: NereusUnifiedLog,
+  private def requireCurrentStorageLeader(
+    expectedLog: UnifiedLog,
     expectedLeaderEpoch: Int
-  ): NereusUnifiedLog = {
+  ): UnifiedLog = {
     leaderLogIfLocal match {
-      case Some(current: NereusUnifiedLog)
-          if (current eq expectedLog) && leaderEpoch == expectedLeaderEpoch =>
+      case Some(current) if (current eq expectedLog) && leaderEpoch == expectedLeaderEpoch =>
         current
       case _ =>
         throw new NotLeaderOrFollowerException(

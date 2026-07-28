@@ -22,8 +22,8 @@ import org.apache.kafka.metadata.KRaftMetadataCache;
 import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 import org.apache.kafka.server.util.KafkaScheduler;
 
-import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceContext;
 import com.nereusstream.kafka.runtime.NereusKafkaCompactionContext;
+import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalActivationContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeFactory;
