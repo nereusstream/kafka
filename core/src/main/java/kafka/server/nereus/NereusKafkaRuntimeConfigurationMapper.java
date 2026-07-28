@@ -67,7 +67,7 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Closed, deterministic mapping from the stock-owned 97-key snapshot to the executable Nereus provider graph.
+ * Closed, deterministic mapping from the stock-owned 100-key snapshot to the executable Nereus provider graph.
  *
  * <p>The mapper performs no provider, filesystem, network or scheduler I/O. Unsupported profiles/providers fail before
  * an owned resource is created.
@@ -206,12 +206,7 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 exact.rollout().shutdownDrainTimeout());
         Duration orphanGrace = multiplyExact(pendingProtection, 2);
         MaterializationConfig materialization =
-                MaterializationConfig.kafkaDefaults(
-                        exact.core().cacheDir()
-                                .orElseThrow()
-                                .resolve("materialization-staging")
-                                .toAbsolutePath()
-                                .normalize());
+                materializationConfiguration(exact);
         NereusKafkaObjectWalRuntimeConfiguration objectWal =
                 new NereusKafkaObjectWalRuntimeConfiguration(
                         runtime,
@@ -503,6 +498,12 @@ public final class NereusKafkaRuntimeConfigurationMapper {
             output.writeInt(compaction.compactionKeyMaxBytes());
             output.writeLong(compaction.compactionDecodeMaxUncompressedBytes());
             output.writeInt(compaction.compactionDecodeMaxRatio());
+            output.writeLong(
+                    compaction.materializationSourceRetirementGrace().toMillis());
+            output.writeLong(
+                    compaction.materializationAppendReplayGrace().toMillis());
+            output.writeLong(
+                    compaction.materializationMetadataAuditGrace().toMillis());
             output.writeBoolean(storage.rollout().activationRequired());
             output.writeBoolean(bookKeeper.isPresent());
             if (bookKeeper.isPresent()) {
@@ -525,6 +526,52 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 output.writeBoolean(configured.ledgerGc().dryRun());
             }
         });
+    }
+
+    private static MaterializationConfig materializationConfiguration(
+            NereusKafkaStorageConfig storage
+    ) {
+        MaterializationConfig defaults = MaterializationConfig.kafkaDefaults(
+                storage.core().cacheDir()
+                        .orElseThrow()
+                        .resolve("materialization-staging")
+                        .toAbsolutePath()
+                        .normalize());
+        NereusKafkaStorageConfig.RetentionCompaction policy =
+                storage.retentionCompaction();
+        return new MaterializationConfig(
+                defaults.committedPolicy(),
+                defaults.registryScanPageSize(),
+                defaults.registryScanInterval(),
+                defaults.plannerPageSize(),
+                defaults.taskScanPageSize(),
+                defaults.maxTasksPerPlan(),
+                defaults.maxConcurrentWorkers(),
+                defaults.maxConcurrentWorkersPerStream(),
+                defaults.sourceReadPageRecords(),
+                defaults.sourceReadPageBytes(),
+                defaults.stagingDirectory(),
+                defaults.maxStagingBytes(),
+                defaults.uploadChunkBytes(),
+                defaults.workerClaimDuration(),
+                defaults.workerClaimRenewInterval(),
+                defaults.maximumClockSkew(),
+                defaults.operationTimeout(),
+                defaults.closeTimeout(),
+                defaults.retryMinBackoff(),
+                defaults.retryMaxBackoff(),
+                defaults.maxTaskAttempts(),
+                defaults.lagThrottleRecords(),
+                defaults.lagRejectRecords(),
+                defaults.lagThrottleBytes(),
+                defaults.lagRejectBytes(),
+                defaults.lagRejectAge(),
+                defaults.lagThrottleDelay(),
+                policy.materializationSourceRetirementGrace(),
+                policy.materializationAppendReplayGrace(),
+                policy.materializationMetadataAuditGrace(),
+                defaults.recoveryCheckpointMaxEntries(),
+                defaults.recoveryCheckpointMaxBytes());
     }
 
     private static byte[] providerScopeSha256(

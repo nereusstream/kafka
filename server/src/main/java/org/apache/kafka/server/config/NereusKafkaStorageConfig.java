@@ -130,6 +130,18 @@ public record NereusKafkaStorageConfig(
                         config.getInt(NereusKafkaConfigs.REGISTRY_SCAN_PAGE_SIZE_CONFIG)),
                 new RetentionCompaction(
                         duration(config, NereusKafkaConfigs.RETENTION_CHECK_INTERVAL_MS_CONFIG),
+                        duration(
+                                config,
+                                NereusKafkaConfigs
+                                        .MATERIALIZATION_SOURCE_RETIREMENT_GRACE_MS_CONFIG),
+                        duration(
+                                config,
+                                NereusKafkaConfigs
+                                        .MATERIALIZATION_APPEND_REPLAY_GRACE_MS_CONFIG),
+                        duration(
+                                config,
+                                NereusKafkaConfigs
+                                        .MATERIALIZATION_METADATA_AUDIT_GRACE_MS_CONFIG),
                         config.getBoolean(NereusKafkaConfigs.COMPACTION_ENABLED_CONFIG),
                         config.getInt(NereusKafkaConfigs.COMPACTION_WORKER_THREADS_CONFIG),
                         config.getInt(NereusKafkaConfigs.COMPACTION_MAX_CONCURRENT_TASKS_CONFIG),
@@ -253,6 +265,12 @@ public record NereusKafkaStorageConfig(
         if (!retentionCompaction.compactionEnabled()) {
             throw invalid(NereusKafkaConfigs.COMPACTION_ENABLED_CONFIG,
                     "must remain true for the initial Nereus Kafka protocol");
+        }
+        if (retentionCompaction.materializationMetadataAuditGrace().compareTo(
+                retentionCompaction.materializationSourceRetirementGrace()) < 0) {
+            throw invalid(
+                    NereusKafkaConfigs.MATERIALIZATION_METADATA_AUDIT_GRACE_MS_CONFIG,
+                    "must not be shorter than the materialization source-retirement grace");
         }
         if (!rollout.activationRequired()) {
             throw invalid(NereusKafkaConfigs.ACTIVATION_REQUIRED_CONFIG,
@@ -501,6 +519,9 @@ public record NereusKafkaStorageConfig(
 
     public record RetentionCompaction(
             Duration retentionCheckInterval,
+            Duration materializationSourceRetirementGrace,
+            Duration materializationAppendReplayGrace,
+            Duration materializationMetadataAuditGrace,
             boolean compactionEnabled,
             int compactionWorkerThreads,
             int compactionMaxConcurrentTasks,
@@ -513,6 +534,16 @@ public record NereusKafkaStorageConfig(
             long compactionSpillMaxBytes
     ) {
         public RetentionCompaction {
+            Objects.requireNonNull(retentionCheckInterval, "retentionCheckInterval");
+            Objects.requireNonNull(
+                    materializationSourceRetirementGrace,
+                    "materializationSourceRetirementGrace");
+            Objects.requireNonNull(
+                    materializationAppendReplayGrace,
+                    "materializationAppendReplayGrace");
+            Objects.requireNonNull(
+                    materializationMetadataAuditGrace,
+                    "materializationMetadataAuditGrace");
             Objects.requireNonNull(compactionSpillDir, "compactionSpillDir");
         }
     }

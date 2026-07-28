@@ -266,6 +266,15 @@ public final class NereusKafkaConfigs {
     public static final String RETENTION_CHECK_INTERVAL_MS_CONFIG =
             "nereus.kafka.storage.retention.check.interval.ms";
     public static final long RETENTION_CHECK_INTERVAL_MS_DEFAULT = 300_000L;
+    public static final String MATERIALIZATION_SOURCE_RETIREMENT_GRACE_MS_CONFIG =
+            "nereus.kafka.storage.materialization.source.retirement.grace.ms";
+    public static final long MATERIALIZATION_SOURCE_RETIREMENT_GRACE_MS_DEFAULT = 3_600_000L;
+    public static final String MATERIALIZATION_APPEND_REPLAY_GRACE_MS_CONFIG =
+            "nereus.kafka.storage.materialization.append.replay.grace.ms";
+    public static final long MATERIALIZATION_APPEND_REPLAY_GRACE_MS_DEFAULT = 21_600_000L;
+    public static final String MATERIALIZATION_METADATA_AUDIT_GRACE_MS_CONFIG =
+            "nereus.kafka.storage.materialization.metadata.audit.grace.ms";
+    public static final long MATERIALIZATION_METADATA_AUDIT_GRACE_MS_DEFAULT = 86_400_000L;
     public static final String COMPACTION_ENABLED_CONFIG =
             "nereus.kafka.storage.compaction.enabled";
     public static final boolean COMPACTION_ENABLED_DEFAULT = true;
@@ -512,6 +521,18 @@ public final class NereusKafkaConfigs {
                     between(1, 1024), LOW, "Kafka binding registry scan page size.")
             .define(RETENTION_CHECK_INTERVAL_MS_CONFIG, LONG, RETENTION_CHECK_INTERVAL_MS_DEFAULT,
                     between(1_000L, 86_400_000L), LOW, "Kafka retention evaluation interval.")
+            .define(MATERIALIZATION_SOURCE_RETIREMENT_GRACE_MS_CONFIG, LONG,
+                    MATERIALIZATION_SOURCE_RETIREMENT_GRACE_MS_DEFAULT,
+                    between(1_000L, 2_592_000_000L), MEDIUM,
+                    "Grace before terminal materialization source references can retire.")
+            .define(MATERIALIZATION_APPEND_REPLAY_GRACE_MS_CONFIG, LONG,
+                    MATERIALIZATION_APPEND_REPLAY_GRACE_MS_DEFAULT,
+                    between(1_000L, 2_592_000_000L), MEDIUM,
+                    "Grace retaining terminal materialization append replay metadata.")
+            .define(MATERIALIZATION_METADATA_AUDIT_GRACE_MS_CONFIG, LONG,
+                    MATERIALIZATION_METADATA_AUDIT_GRACE_MS_DEFAULT,
+                    between(1_000L, 2_592_000_000L), MEDIUM,
+                    "Grace retaining terminal materialization audit metadata.")
             .define(COMPACTION_ENABLED_CONFIG, BOOLEAN, COMPACTION_ENABLED_DEFAULT, HIGH,
                     "Enable Kafka topic compaction materialization.")
             .define(COMPACTION_WORKER_THREADS_CONFIG, INT, COMPACTION_WORKER_THREADS_DEFAULT,

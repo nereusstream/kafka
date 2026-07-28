@@ -95,6 +95,15 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                 Path.of("/tmp/nereus-kafka-cache/materialization-staging"),
                 mapped.runtime().materialization().stagingDirectory());
         assertEquals(
+                Duration.ofHours(1),
+                mapped.runtime().materialization().sourceRetirementGrace());
+        assertEquals(
+                Duration.ofHours(6),
+                mapped.runtime().materialization().appendReplayGrace());
+        assertEquals(
+                Duration.ofHours(24),
+                mapped.runtime().materialization().metadataAuditGrace());
+        assertEquals(
                 1024L * 1024 * 1024,
                 mapped.maintenance().maxStagingBytes());
         assertEquals(
@@ -394,6 +403,9 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                         256),
                 new NereusKafkaStorageConfig.RetentionCompaction(
                         Duration.ofMinutes(5),
+                        Duration.ofHours(1),
+                        Duration.ofHours(6),
+                        Duration.ofHours(24),
                         true,
                         4,
                         8,

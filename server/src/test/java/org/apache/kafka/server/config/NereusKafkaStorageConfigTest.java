@@ -38,13 +38,22 @@ class NereusKafkaStorageConfigTest {
         NereusKafkaStorageConfig config = parse(Map.of());
 
         assertFalse(config.enabled());
-        assertEquals(97, NereusKafkaConfigs.CONFIG_DEF.names().size());
+        assertEquals(100, NereusKafkaConfigs.CONFIG_DEF.names().size());
         assertTrue(AbstractKafkaConfig.CONFIG_DEF.names().containsAll(NereusKafkaConfigs.CONFIG_DEF.names()));
         assertEquals(
                 NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT,
                 config.core().profile());
         assertEquals(Duration.ofSeconds(30), config.append().timeout());
         assertEquals(Duration.ofMinutes(15), config.lifecycle().recoveryTimeout());
+        assertEquals(
+                Duration.ofHours(1),
+                config.retentionCompaction().materializationSourceRetirementGrace());
+        assertEquals(
+                Duration.ofHours(6),
+                config.retentionCompaction().materializationAppendReplayGrace());
+        assertEquals(
+                Duration.ofHours(24),
+                config.retentionCompaction().materializationMetadataAuditGrace());
         assertTrue(config.core().cacheDir().isEmpty());
         assertTrue(config.retentionCompaction().compactionSpillDir().isEmpty());
         assertTrue(config.bookKeeper().isEmpty());
@@ -53,6 +62,15 @@ class NereusKafkaStorageConfigTest {
     @Test
     void enabledSnapshotRequiresExactProfileDependenciesAndDerivesSpillDirectory() {
         Map<String, Object> properties = enabledProperties();
+        properties.put(
+                NereusKafkaConfigs.MATERIALIZATION_SOURCE_RETIREMENT_GRACE_MS_CONFIG,
+                1_000L);
+        properties.put(
+                NereusKafkaConfigs.MATERIALIZATION_APPEND_REPLAY_GRACE_MS_CONFIG,
+                2_000L);
+        properties.put(
+                NereusKafkaConfigs.MATERIALIZATION_METADATA_AUDIT_GRACE_MS_CONFIG,
+                3_000L);
 
         NereusKafkaStorageConfig config = parse(properties);
 
@@ -65,6 +83,15 @@ class NereusKafkaStorageConfigTest {
         assertEquals(
                 cacheDir.resolve("spill"),
                 config.retentionCompaction().compactionSpillDir().orElseThrow());
+        assertEquals(
+                Duration.ofSeconds(1),
+                config.retentionCompaction().materializationSourceRetirementGrace());
+        assertEquals(
+                Duration.ofSeconds(2),
+                config.retentionCompaction().materializationAppendReplayGrace());
+        assertEquals(
+                Duration.ofSeconds(3),
+                config.retentionCompaction().materializationMetadataAuditGrace());
         assertFalse(config.bookKeeper().orElseThrow().ledgerGc().enabled());
         assertTrue(config.bookKeeper().orElseThrow().ledgerGc().dryRun());
     }
@@ -133,6 +160,17 @@ class NereusKafkaStorageConfigTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> parse(shortDrain));
+
+        Map<String, Object> shortMetadataAudit = enabledProperties();
+        shortMetadataAudit.put(
+                NereusKafkaConfigs.MATERIALIZATION_SOURCE_RETIREMENT_GRACE_MS_CONFIG,
+                2_000L);
+        shortMetadataAudit.put(
+                NereusKafkaConfigs.MATERIALIZATION_METADATA_AUDIT_GRACE_MS_CONFIG,
+                1_000L);
+        assertConfigFailure(
+                shortMetadataAudit,
+                NereusKafkaConfigs.MATERIALIZATION_METADATA_AUDIT_GRACE_MS_CONFIG);
     }
 
     @Test
