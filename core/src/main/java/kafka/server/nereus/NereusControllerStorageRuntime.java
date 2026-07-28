@@ -26,6 +26,8 @@ import org.apache.kafka.raft.LeaderAndEpoch;
 import org.apache.kafka.server.fault.FaultHandler;
 
 import com.nereusstream.api.NereusException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -47,6 +49,9 @@ import java.util.function.Supplier;
  * Durable contradictions are reported once per controller epoch and require a later leadership epoch before retry.
  */
 final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
+    private static final Logger LOG =
+            LoggerFactory.getLogger(NereusControllerStorageRuntime.class);
+
     private final int nodeId;
     private final Supplier<NereusKafkaControllerActivation> activationCreator;
     private final Supplier<ScheduledExecutorService> executorCreator;
@@ -60,6 +65,7 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
     private boolean pending;
     private boolean terminalFailure;
     private int controllerEpoch = -1;
+    private int reconciledControllerEpoch = -1;
     private NereusKafkaControllerActivation activation;
     private ScheduledExecutorService executor;
     private ScheduledFuture<?> scheduled;
@@ -248,6 +254,7 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
         Throwable failure =
                 suppliedFailure == null ? null : unwrap(suppliedFailure);
         boolean reportFailure = false;
+        int reconciledEpoch = -1;
         synchronized (this) {
             if (attempt != null) {
                 if (inFlight != attempt) {
@@ -259,6 +266,8 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
                 return;
             }
             if (failure == null) {
+                reconciledEpoch =
+                        recordReconciledControllerEpoch();
                 if (pending) {
                     requestAttempt(Duration.ZERO);
                 }
@@ -270,11 +279,32 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
                 reportFailure = true;
             }
         }
+        logReconciledControllerEpoch(reconciledEpoch);
         if (reportFailure) {
             faultHandler.handleFault(
                     "Nereus Kafka first activation failed durably",
                     failure);
         }
+    }
+
+    private int recordReconciledControllerEpoch() {
+        if (reconciledControllerEpoch == controllerEpoch) {
+            return -1;
+        }
+        reconciledControllerEpoch = controllerEpoch;
+        return controllerEpoch;
+    }
+
+    private void logReconciledControllerEpoch(
+            int reconciledEpoch
+    ) {
+        if (reconciledEpoch < 0) {
+            return;
+        }
+        LOG.info(
+                "Nereus Kafka storage activation reconciled by controller {} at epoch {}",
+                nodeId,
+                reconciledEpoch);
     }
 
     @Override
