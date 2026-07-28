@@ -19,9 +19,17 @@ package kafka.server.nereus;
 
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.metadata.KRaftMetadataCache;
+import org.apache.kafka.server.config.NereusKafkaBookKeeperConfig;
 import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 import org.apache.kafka.server.util.KafkaScheduler;
 
+import com.nereusstream.api.Checksum;
+import com.nereusstream.api.ChecksumType;
+import com.nereusstream.bookkeeper.BookKeeperBrokerReadiness;
+import com.nereusstream.bookkeeper.BookKeeperBrokerReadinessProvider;
+import com.nereusstream.bookkeeper.BookKeeperPasswordProvider;
+import com.nereusstream.bookkeeper.BookKeeperSecretRef;
+import com.nereusstream.kafka.runtime.NereusKafkaBookKeeperWalRuntimeContext;
 import com.nereusstream.kafka.runtime.NereusKafkaCompactionContext;
 import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceContext;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalActivationContext;
@@ -32,6 +40,11 @@ import com.nereusstream.objectstore.ObjectStoreProvider;
 import com.nereusstream.objectstore.ObjectStoreSecretResolver;
 import com.nereusstream.objectstore.S3CompatibleObjectStoreProvider;
 
+import org.apache.bookkeeper.client.BookKeeper;
+import org.apache.bookkeeper.conf.ClientConfiguration;
+
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -80,12 +93,19 @@ public final class NereusKafkaProductRuntimeCreator {
                 nereusBuild,
                 javaVersion);
         exactBridges.ownedPartitions().configureCompaction(storage, nereusBuild);
-        ObjectStoreProvider provider = switch (mapped.objectProviderToken()) {
-            case NereusKafkaRuntimeConfigurationMapper.S3_PROVIDER_TOKEN ->
-                new S3CompatibleObjectStoreProvider();
-            default -> throw new IllegalStateException(
-                    "mapped an unsupported Nereus object provider");
-        };
+        BookKeeper ownedBookKeeper = createBookKeeper(storage);
+        ObjectStoreProvider provider;
+        try {
+            provider = switch (mapped.objectProviderToken()) {
+                case NereusKafkaRuntimeConfigurationMapper.S3_PROVIDER_TOKEN ->
+                    new S3CompatibleObjectStoreProvider();
+                default -> throw new IllegalStateException(
+                        "mapped an unsupported Nereus object provider");
+            };
+        } catch (Throwable failure) {
+            closeAfterFailure(ownedBookKeeper, failure);
+            throw failure;
+        }
         NereusKafkaClock clock = new NereusKafkaClock(time);
         NereusKafkaObjectWalRuntimeContext context =
                 new NereusKafkaObjectWalRuntimeContext(
@@ -97,7 +117,8 @@ public final class NereusKafkaProductRuntimeCreator {
                                 exactBridges.recoveryStateFactory(),
                                 "recoveryStateFactory"),
                         clock,
-                        () -> CompletableFuture.completedFuture(null));
+                        () -> CompletableFuture.completedFuture(null),
+                        bookKeeperContext(storage, ownedBookKeeper));
         NereusKafkaObjectWalActivationContext activation =
                 new NereusKafkaObjectWalActivationContext(
                         mapped.capability(),
@@ -116,8 +137,130 @@ public final class NereusKafkaProductRuntimeCreator {
                         Optional.of(new NereusKafkaMaintenanceContext(
                                 mapped.maintenance(),
                                 exactBridges.ownedPartitions())));
-        return NereusKafkaObjectWalRuntimeFactory.createActivated(
-                mapped.runtime(), context, activation);
+        try {
+            NereusKafkaRuntime runtime =
+                    NereusKafkaObjectWalRuntimeFactory.createActivated(
+                            mapped.runtime(), context, activation);
+            return ownedBookKeeper == null
+                    ? runtime
+                    : new NereusKafkaOwnedProviderRuntime(runtime, ownedBookKeeper);
+        } catch (Throwable failure) {
+            closeAfterFailure(ownedBookKeeper, failure);
+            throw failure;
+        }
+    }
+
+    private static BookKeeper createBookKeeper(
+            NereusKafkaStorageConfig storage
+    ) {
+        if (storage.bookKeeper().isEmpty()) {
+            return null;
+        }
+        NereusKafkaBookKeeperConfig configured =
+                storage.bookKeeper().orElseThrow();
+        ClientConfiguration client = new ClientConfiguration()
+                .setMetadataServiceUri(
+                        storage.core().bookKeeperMetadataServiceUri()
+                                .orElseThrow()
+                                .toASCIIString())
+                .setClientConnectTimeoutMillis(
+                        Math.toIntExact(configured.operationTimeout().toMillis()))
+                .setAddEntryTimeout(ceilSeconds(configured.operationTimeout()))
+                .setReadEntryTimeout(ceilSeconds(configured.operationTimeout()));
+        try {
+            return BookKeeper.forConfig(client).build();
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(
+                    "interrupted while creating the BookKeeper client", failure);
+        } catch (Exception failure) {
+            throw new IllegalStateException(
+                    "failed to create the BookKeeper client", failure);
+        }
+    }
+
+    private static Optional<NereusKafkaBookKeeperWalRuntimeContext>
+            bookKeeperContext(
+                    NereusKafkaStorageConfig storage,
+                    BookKeeper client
+    ) {
+        if (client == null) {
+            return Optional.empty();
+        }
+        NereusKafkaBookKeeperConfig configured =
+                storage.bookKeeper().orElseThrow();
+        BookKeeperBrokerReadiness readiness = new BookKeeperBrokerReadiness(
+                configured.readinessEpoch(),
+                new Checksum(
+                        ChecksumType.SHA256,
+                        configured.readinessSha256()),
+                configured.persistentBrokerCount());
+        BookKeeperBrokerReadinessProvider readinessProvider =
+                new BookKeeperBrokerReadinessProvider() {
+                    @Override
+                    public CompletableFuture<BookKeeperBrokerReadiness>
+                            requireBookKeeperPrimaryWalReadiness() {
+                        return CompletableFuture.completedFuture(readiness);
+                    }
+
+                    @Override
+                    public Optional<BookKeeperBrokerReadiness>
+                            currentBookKeeperPrimaryWalReadiness() {
+                        return Optional.of(readiness);
+                    }
+                };
+        return Optional.of(new NereusKafkaBookKeeperWalRuntimeContext(
+                client,
+                readinessProvider,
+                passwordProvider(configured)));
+    }
+
+    private static BookKeeperPasswordProvider passwordProvider(
+            NereusKafkaBookKeeperConfig configured
+    ) {
+        String expectedReference =
+                configured.passwordFile().toUri().toASCIIString();
+        return reference -> {
+            BookKeeperSecretRef exact =
+                    Objects.requireNonNull(reference, "reference");
+            if (!exact.reference().equals(expectedReference)
+                    || !exact.identityVersion().equals(configured.passwordVersion())) {
+                throw new IllegalArgumentException(
+                        "BookKeeper password reference does not match the typed Kafka configuration");
+            }
+            try {
+                byte[] password = Files.readAllBytes(configured.passwordFile());
+                if (password.length > 64 * 1024) {
+                    java.util.Arrays.fill(password, (byte) 0);
+                    throw new IllegalArgumentException(
+                            "BookKeeper password file exceeds 64 KiB");
+                }
+                return password;
+            } catch (IOException failure) {
+                throw new IllegalStateException(
+                        "failed to read the configured BookKeeper password file", failure);
+            }
+        };
+    }
+
+    private static int ceilSeconds(Duration timeout) {
+        return Math.toIntExact(Math.max(
+                1L,
+                Math.addExact(timeout.toMillis(), 999L) / 1_000L));
+    }
+
+    private static void closeAfterFailure(
+            AutoCloseable resource,
+            Throwable failure
+    ) {
+        if (resource == null) {
+            return;
+        }
+        try {
+            resource.close();
+        } catch (Throwable closeFailure) {
+            failure.addSuppressed(closeFailure);
+        }
     }
 
     private static ObjectStoreSecretResolver emptySecretResolver() {

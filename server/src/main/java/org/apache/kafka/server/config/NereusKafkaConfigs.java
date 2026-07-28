@@ -62,6 +62,97 @@ public final class NereusKafkaConfigs {
             "nereus.kafka.storage.object.path.style.access";
     public static final String BOOKKEEPER_METADATA_SERVICE_URI_CONFIG =
             "nereus.kafka.storage.bookkeeper.metadata.service.uri";
+    public static final String BOOKKEEPER_DEPLOYMENT_ID_CONFIG =
+            "nereus.kafka.storage.bookkeeper.deployment.id";
+    public static final String BOOKKEEPER_CLUSTER_ALIAS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.cluster.alias";
+    public static final String BOOKKEEPER_PROVIDER_SCOPE_SHA256_CONFIG =
+            "nereus.kafka.storage.bookkeeper.provider.scope.sha256";
+    public static final String BOOKKEEPER_LEDGER_ID_PREFIX_BITS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.ledger.id.prefix.bits";
+    public static final int BOOKKEEPER_LEDGER_ID_PREFIX_BITS_DEFAULT = 12;
+    public static final String BOOKKEEPER_LEDGER_ID_PREFIX_VALUE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.ledger.id.prefix.value";
+    public static final String BOOKKEEPER_LEDGER_ID_RESERVATION_ID_CONFIG =
+            "nereus.kafka.storage.bookkeeper.ledger.id.reservation.id";
+    public static final String BOOKKEEPER_ENSEMBLE_SIZE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.ensemble.size";
+    public static final int BOOKKEEPER_ENSEMBLE_SIZE_DEFAULT = 2;
+    public static final String BOOKKEEPER_WRITE_QUORUM_SIZE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.write.quorum.size";
+    public static final int BOOKKEEPER_WRITE_QUORUM_SIZE_DEFAULT = 2;
+    public static final String BOOKKEEPER_ACK_QUORUM_SIZE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.ack.quorum.size";
+    public static final int BOOKKEEPER_ACK_QUORUM_SIZE_DEFAULT = 2;
+    public static final String BOOKKEEPER_DIGEST_TYPE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.digest.type";
+    public static final String BOOKKEEPER_DIGEST_TYPE_DEFAULT = "CRC32C";
+    public static final String BOOKKEEPER_PASSWORD_FILE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.password.file";
+    public static final String BOOKKEEPER_PASSWORD_VERSION_CONFIG =
+            "nereus.kafka.storage.bookkeeper.password.version";
+    public static final String BOOKKEEPER_MAX_ENTRIES_PER_LEDGER_CONFIG =
+            "nereus.kafka.storage.bookkeeper.max.entries.per.ledger";
+    public static final long BOOKKEEPER_MAX_ENTRIES_PER_LEDGER_DEFAULT = 100_000L;
+    public static final String BOOKKEEPER_MAX_BYTES_PER_LEDGER_CONFIG =
+            "nereus.kafka.storage.bookkeeper.max.bytes.per.ledger";
+    public static final long BOOKKEEPER_MAX_BYTES_PER_LEDGER_DEFAULT = 256L * MIB;
+    public static final String BOOKKEEPER_MAX_APPEND_RANGES_PER_LEDGER_CONFIG =
+            "nereus.kafka.storage.bookkeeper.max.append.ranges.per.ledger";
+    public static final int BOOKKEEPER_MAX_APPEND_RANGES_PER_LEDGER_DEFAULT = 1_000;
+    public static final String BOOKKEEPER_PROTECTION_SLOTS_PER_RANGE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.protection.slots.per.range";
+    public static final int BOOKKEEPER_PROTECTION_SLOTS_PER_RANGE_DEFAULT = 8;
+    public static final String BOOKKEEPER_MAX_READER_LEASES_PER_LEDGER_CONFIG =
+            "nereus.kafka.storage.bookkeeper.max.reader.leases.per.ledger";
+    public static final int BOOKKEEPER_MAX_READER_LEASES_PER_LEDGER_DEFAULT = 64;
+    public static final String BOOKKEEPER_MAX_UNCERTAIN_ALLOCATIONS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.max.uncertain.allocations";
+    public static final int BOOKKEEPER_MAX_UNCERTAIN_ALLOCATIONS_DEFAULT = 32;
+    public static final String BOOKKEEPER_MAX_LEDGER_AGE_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.max.ledger.age.ms";
+    public static final long BOOKKEEPER_MAX_LEDGER_AGE_MS_DEFAULT = 3_600_000L;
+    public static final String BOOKKEEPER_MAX_WRITES_INFLIGHT_CONFIG =
+            "nereus.kafka.storage.bookkeeper.max.writes.inflight";
+    public static final int BOOKKEEPER_MAX_WRITES_INFLIGHT_DEFAULT = 8;
+    public static final String BOOKKEEPER_MAX_READS_INFLIGHT_CONFIG =
+            "nereus.kafka.storage.bookkeeper.max.reads.inflight";
+    public static final int BOOKKEEPER_MAX_READS_INFLIGHT_DEFAULT = 8;
+    public static final String BOOKKEEPER_MAX_READ_BYTES_INFLIGHT_CONFIG =
+            "nereus.kafka.storage.bookkeeper.max.read.bytes.inflight";
+    public static final long BOOKKEEPER_MAX_READ_BYTES_INFLIGHT_DEFAULT = 64L * MIB;
+    public static final String BOOKKEEPER_OPERATION_TIMEOUT_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.operation.timeout.ms";
+    public static final long BOOKKEEPER_OPERATION_TIMEOUT_MS_DEFAULT = 30_000L;
+    public static final String BOOKKEEPER_ALLOCATION_TIMEOUT_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.allocation.timeout.ms";
+    public static final long BOOKKEEPER_ALLOCATION_TIMEOUT_MS_DEFAULT = 20_000L;
+    public static final String BOOKKEEPER_SEAL_TIMEOUT_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.seal.timeout.ms";
+    public static final long BOOKKEEPER_SEAL_TIMEOUT_MS_DEFAULT = 30_000L;
+    public static final String BOOKKEEPER_DELETE_TIMEOUT_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.delete.timeout.ms";
+    public static final long BOOKKEEPER_DELETE_TIMEOUT_MS_DEFAULT = 30_000L;
+    public static final String BOOKKEEPER_READER_LEASE_TTL_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.reader.lease.ttl.ms";
+    public static final long BOOKKEEPER_READER_LEASE_TTL_MS_DEFAULT = 120_000L;
+    public static final String BOOKKEEPER_READER_LEASE_RENEW_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.reader.lease.renew.ms";
+    public static final long BOOKKEEPER_READER_LEASE_RENEW_MS_DEFAULT = 30_000L;
+    public static final String BOOKKEEPER_RETENTION_SCAN_INTERVAL_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.retention.scan.interval.ms";
+    public static final long BOOKKEEPER_RETENTION_SCAN_INTERVAL_MS_DEFAULT = 60_000L;
+    public static final String BOOKKEEPER_RETENTION_PAGE_SIZE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.retention.page.size";
+    public static final int BOOKKEEPER_RETENTION_PAGE_SIZE_DEFAULT = 256;
+    public static final String BOOKKEEPER_READINESS_EPOCH_CONFIG =
+            "nereus.kafka.storage.bookkeeper.readiness.epoch";
+    public static final long BOOKKEEPER_READINESS_EPOCH_DEFAULT = 1L;
+    public static final String BOOKKEEPER_READINESS_SHA256_CONFIG =
+            "nereus.kafka.storage.bookkeeper.readiness.sha256";
+    public static final String BOOKKEEPER_PERSISTENT_BROKER_COUNT_CONFIG =
+            "nereus.kafka.storage.bookkeeper.persistent.broker.count";
+    public static final int BOOKKEEPER_PERSISTENT_BROKER_COUNT_DEFAULT = 1;
     public static final String CACHE_DIR_CONFIG = "nereus.kafka.storage.cache.dir";
 
     public static final String APPEND_TIMEOUT_MS_CONFIG = "nereus.kafka.storage.append.timeout.ms";
@@ -234,6 +325,94 @@ public final class NereusKafkaConfigs {
                     "Use provider-specific path-style object-store access.")
             .define(BOOKKEEPER_METADATA_SERVICE_URI_CONFIG, STRING, null, HIGH,
                     "BookKeeper metadata service URI required by BookKeeper profiles.")
+            .define(BOOKKEEPER_DEPLOYMENT_ID_CONFIG, STRING, null, HIGH,
+                    "Deployment identity owning the pre-provisioned BookKeeper ledger-id namespace.")
+            .define(BOOKKEEPER_CLUSTER_ALIAS_CONFIG, STRING, null, HIGH,
+                    "Durable BookKeeper cluster alias stored in physical read targets.")
+            .define(BOOKKEEPER_PROVIDER_SCOPE_SHA256_CONFIG, STRING, null, HIGH,
+                    "Lowercase SHA-256 of the canonical BookKeeper provider scope.")
+            .define(BOOKKEEPER_LEDGER_ID_PREFIX_BITS_CONFIG, INT,
+                    BOOKKEEPER_LEDGER_ID_PREFIX_BITS_DEFAULT, between(8, 24), HIGH,
+                    "Positive-63-bit BookKeeper ledger-id namespace prefix width.")
+            .define(BOOKKEEPER_LEDGER_ID_PREFIX_VALUE_CONFIG, LONG, null, HIGH,
+                    "Exact pre-provisioned BookKeeper ledger-id namespace prefix value.")
+            .define(BOOKKEEPER_LEDGER_ID_RESERVATION_ID_CONFIG, STRING, null, HIGH,
+                    "Immutable operator reservation identity for the BookKeeper ledger-id namespace.")
+            .define(BOOKKEEPER_ENSEMBLE_SIZE_CONFIG, INT, BOOKKEEPER_ENSEMBLE_SIZE_DEFAULT,
+                    atLeast(1), HIGH, "BookKeeper ledger ensemble size.")
+            .define(BOOKKEEPER_WRITE_QUORUM_SIZE_CONFIG, INT, BOOKKEEPER_WRITE_QUORUM_SIZE_DEFAULT,
+                    atLeast(1), HIGH, "BookKeeper ledger write quorum size.")
+            .define(BOOKKEEPER_ACK_QUORUM_SIZE_CONFIG, INT, BOOKKEEPER_ACK_QUORUM_SIZE_DEFAULT,
+                    atLeast(1), HIGH, "BookKeeper ledger ack quorum size.")
+            .define(BOOKKEEPER_DIGEST_TYPE_CONFIG, STRING, BOOKKEEPER_DIGEST_TYPE_DEFAULT,
+                    ConfigDef.ValidString.in("CRC32", "CRC32C", "MAC"), HIGH,
+                    "Immutable BookKeeper ledger digest type.")
+            .define(BOOKKEEPER_PASSWORD_FILE_CONFIG, STRING, null, HIGH,
+                    "Absolute file containing the BookKeeper ledger password; the path is a secret reference.")
+            .define(BOOKKEEPER_PASSWORD_VERSION_CONFIG, STRING, null, HIGH,
+                    "Non-secret immutable version identity for the BookKeeper password file.")
+            .define(BOOKKEEPER_MAX_ENTRIES_PER_LEDGER_CONFIG, LONG,
+                    BOOKKEEPER_MAX_ENTRIES_PER_LEDGER_DEFAULT, atLeast(1L), MEDIUM,
+                    "Maximum logical entries admitted to one BookKeeper ledger.")
+            .define(BOOKKEEPER_MAX_BYTES_PER_LEDGER_CONFIG, LONG,
+                    BOOKKEEPER_MAX_BYTES_PER_LEDGER_DEFAULT, between(MIB, TIB), MEDIUM,
+                    "Maximum logical bytes admitted to one BookKeeper ledger.")
+            .define(BOOKKEEPER_MAX_APPEND_RANGES_PER_LEDGER_CONFIG, INT,
+                    BOOKKEEPER_MAX_APPEND_RANGES_PER_LEDGER_DEFAULT, between(1, 65_536), MEDIUM,
+                    "Maximum protected append ranges admitted to one BookKeeper ledger.")
+            .define(BOOKKEEPER_PROTECTION_SLOTS_PER_RANGE_CONFIG, INT,
+                    BOOKKEEPER_PROTECTION_SLOTS_PER_RANGE_DEFAULT, between(4, 64), MEDIUM,
+                    "Fixed protection slots reserved for each BookKeeper append range.")
+            .define(BOOKKEEPER_MAX_READER_LEASES_PER_LEDGER_CONFIG, INT,
+                    BOOKKEEPER_MAX_READER_LEASES_PER_LEDGER_DEFAULT, between(1, 65_536), MEDIUM,
+                    "Maximum concurrent durable reader leases per BookKeeper ledger.")
+            .define(BOOKKEEPER_MAX_UNCERTAIN_ALLOCATIONS_CONFIG, INT,
+                    BOOKKEEPER_MAX_UNCERTAIN_ALLOCATIONS_DEFAULT, between(1, 65_536), MEDIUM,
+                    "Fixed durable uncertain-allocation slot count.")
+            .define(BOOKKEEPER_MAX_LEDGER_AGE_MS_CONFIG, LONG,
+                    BOOKKEEPER_MAX_LEDGER_AGE_MS_DEFAULT, atLeast(1_000L), MEDIUM,
+                    "Maximum writer ledger age in milliseconds.")
+            .define(BOOKKEEPER_MAX_WRITES_INFLIGHT_CONFIG, INT,
+                    BOOKKEEPER_MAX_WRITES_INFLIGHT_DEFAULT, between(1, 65_536), MEDIUM,
+                    "Maximum BookKeeper writes in flight.")
+            .define(BOOKKEEPER_MAX_READS_INFLIGHT_CONFIG, INT,
+                    BOOKKEEPER_MAX_READS_INFLIGHT_DEFAULT, between(1, 65_536), MEDIUM,
+                    "Maximum BookKeeper reads in flight.")
+            .define(BOOKKEEPER_MAX_READ_BYTES_INFLIGHT_CONFIG, LONG,
+                    BOOKKEEPER_MAX_READ_BYTES_INFLIGHT_DEFAULT, between(1L, 32L * GIB), MEDIUM,
+                    "Maximum BookKeeper read bytes retained in flight.")
+            .define(BOOKKEEPER_OPERATION_TIMEOUT_MS_CONFIG, LONG,
+                    BOOKKEEPER_OPERATION_TIMEOUT_MS_DEFAULT, between(1_000L, 300_000L), MEDIUM,
+                    "BookKeeper metadata and data operation timeout.")
+            .define(BOOKKEEPER_ALLOCATION_TIMEOUT_MS_CONFIG, LONG,
+                    BOOKKEEPER_ALLOCATION_TIMEOUT_MS_DEFAULT, between(1_000L, 300_000L), MEDIUM,
+                    "BookKeeper ledger allocation timeout.")
+            .define(BOOKKEEPER_SEAL_TIMEOUT_MS_CONFIG, LONG,
+                    BOOKKEEPER_SEAL_TIMEOUT_MS_DEFAULT, between(1_000L, 300_000L), MEDIUM,
+                    "BookKeeper ledger seal timeout.")
+            .define(BOOKKEEPER_DELETE_TIMEOUT_MS_CONFIG, LONG,
+                    BOOKKEEPER_DELETE_TIMEOUT_MS_DEFAULT, between(1_000L, 300_000L), MEDIUM,
+                    "BookKeeper ledger delete timeout.")
+            .define(BOOKKEEPER_READER_LEASE_TTL_MS_CONFIG, LONG,
+                    BOOKKEEPER_READER_LEASE_TTL_MS_DEFAULT, atLeast(1_000L), MEDIUM,
+                    "BookKeeper durable reader lease TTL.")
+            .define(BOOKKEEPER_READER_LEASE_RENEW_MS_CONFIG, LONG,
+                    BOOKKEEPER_READER_LEASE_RENEW_MS_DEFAULT, atLeast(1_000L), MEDIUM,
+                    "BookKeeper durable reader lease renewal interval.")
+            .define(BOOKKEEPER_RETENTION_SCAN_INTERVAL_MS_CONFIG, LONG,
+                    BOOKKEEPER_RETENTION_SCAN_INTERVAL_MS_DEFAULT, atLeast(1_000L), LOW,
+                    "BookKeeper retention scan interval.")
+            .define(BOOKKEEPER_RETENTION_PAGE_SIZE_CONFIG, INT,
+                    BOOKKEEPER_RETENTION_PAGE_SIZE_DEFAULT, between(1, 1_024), MEDIUM,
+                    "BookKeeper retention metadata page size.")
+            .define(BOOKKEEPER_READINESS_EPOCH_CONFIG, LONG,
+                    BOOKKEEPER_READINESS_EPOCH_DEFAULT, atLeast(1L), HIGH,
+                    "Exact pre-provisioned BookKeeper broker-readiness epoch.")
+            .define(BOOKKEEPER_READINESS_SHA256_CONFIG, STRING, null, HIGH,
+                    "Exact lowercase SHA-256 of the pre-provisioned BookKeeper broker set.")
+            .define(BOOKKEEPER_PERSISTENT_BROKER_COUNT_CONFIG, INT,
+                    BOOKKEEPER_PERSISTENT_BROKER_COUNT_DEFAULT, atLeast(1), HIGH,
+                    "Persistent broker count bound to the BookKeeper readiness identity.")
             .define(CACHE_DIR_CONFIG, STRING, null, HIGH,
                     "Dedicated ephemeral Nereus cache directory.")
             .define(APPEND_TIMEOUT_MS_CONFIG, LONG, APPEND_TIMEOUT_MS_DEFAULT,

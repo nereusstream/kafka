@@ -1141,6 +1141,15 @@ project(':core') {
     // Nereus inject start: exact product-owned adapter boundary
     if (nereusDevelopmentEnabled) {
       implementation "com.nereusstream:nereus-kafka-adapter:${nereusDevelopmentVersion.get()}"
+      implementation("com.nereusstream:nereus-bookkeeper:${nereusDevelopmentVersion.get()}") {
+        // BookKeeper publishes these Java archives with NAR packaging. Resolve the same
+        // archives explicitly as JARs so Kafka's -Werror compiler does not reject the
+        // otherwise valid classes solely because their classpath entries end in .nar.
+        exclude group: 'org.apache.bookkeeper', module: 'circe-checksum'
+        exclude group: 'org.apache.bookkeeper', module: 'cpu-affinity'
+      }
+      implementation "org.apache.bookkeeper:circe-checksum:4.18.0@jar"
+      implementation "org.apache.bookkeeper:cpu-affinity:4.18.0@jar"
       implementation "com.nereusstream:nereus-core:${nereusDevelopmentVersion.get()}"
       implementation "com.nereusstream:nereus-materialization:${nereusDevelopmentVersion.get()}"
       implementation "com.nereusstream:nereus-metadata-oxia:${nereusDevelopmentVersion.get()}"

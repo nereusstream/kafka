@@ -89,7 +89,9 @@
     <allow pkg="org.apache.kafka" />
     <!-- Nereus inject start: exact adapter-backed broker runtime -->
     <subpackage name="nereus">
+      <allow pkg="org.apache.bookkeeper" />
       <allow pkg="com.nereusstream.api" />
+      <allow pkg="com.nereusstream.bookkeeper" />
       <allow pkg="com.nereusstream.core" />
       <allow pkg="com.nereusstream.kafka.activation" />
       <allow pkg="com.nereusstream.kafka.checkpoint" />

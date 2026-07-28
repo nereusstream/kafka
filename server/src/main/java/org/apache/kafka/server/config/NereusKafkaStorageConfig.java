@@ -35,8 +35,29 @@ public record NereusKafkaStorageConfig(
         Fetch fetch,
         Lifecycle lifecycle,
         RetentionCompaction retentionCompaction,
-        Rollout rollout
+        Rollout rollout,
+        Optional<NereusKafkaBookKeeperConfig> bookKeeper
 ) {
+    public NereusKafkaStorageConfig(
+            boolean enabled,
+            Core core,
+            Append append,
+            Fetch fetch,
+            Lifecycle lifecycle,
+            RetentionCompaction retentionCompaction,
+            Rollout rollout
+    ) {
+        this(
+                enabled,
+                core,
+                append,
+                fetch,
+                lifecycle,
+                retentionCompaction,
+                rollout,
+                Optional.empty());
+    }
+
     public NereusKafkaStorageConfig {
         Objects.requireNonNull(core, "core");
         Objects.requireNonNull(append, "append");
@@ -44,8 +65,15 @@ public record NereusKafkaStorageConfig(
         Objects.requireNonNull(lifecycle, "lifecycle");
         Objects.requireNonNull(retentionCompaction, "retentionCompaction");
         Objects.requireNonNull(rollout, "rollout");
+        bookKeeper = Objects.requireNonNull(bookKeeper, "bookKeeper");
         if (enabled) {
-            validateEnabled(core, append, fetch, retentionCompaction, rollout);
+            validateEnabled(
+                    core,
+                    append,
+                    fetch,
+                    retentionCompaction,
+                    rollout,
+                    bookKeeper);
         }
     }
 
@@ -118,7 +146,11 @@ public record NereusKafkaStorageConfig(
                         duration(config, NereusKafkaConfigs.CAPABILITY_HEARTBEAT_MS_CONFIG),
                         duration(config, NereusKafkaConfigs.CAPABILITY_EXPIRY_MS_CONFIG),
                         duration(config, NereusKafkaConfigs.SHUTDOWN_DRAIN_TIMEOUT_MS_CONFIG),
-                        duration(config, NereusKafkaConfigs.SHUTDOWN_CHECKPOINT_TIMEOUT_MS_CONFIG)));
+                        duration(config, NereusKafkaConfigs.SHUTDOWN_CHECKPOINT_TIMEOUT_MS_CONFIG)),
+                config.getBoolean(NereusKafkaConfigs.ENABLED_CONFIG)
+                                && profile(config).usesBookKeeper()
+                        ? Optional.of(bookKeeper(config))
+                        : Optional.empty());
     }
 
     private static void validateEnabled(
@@ -126,24 +158,73 @@ public record NereusKafkaStorageConfig(
             Append append,
             Fetch fetch,
             RetentionCompaction retentionCompaction,
-            Rollout rollout) {
-        validateProviders(core);
+            Rollout rollout,
+            Optional<NereusKafkaBookKeeperConfig> bookKeeper) {
+        validateProviders(core, bookKeeper);
         validateBufferRelationships(append, fetch);
         validateRollout(retentionCompaction, rollout);
+        bookKeeper.ifPresent(exact -> validateBookKeeper(exact, append, fetch, rollout));
     }
 
-    private static void validateProviders(Core core) {
+    private static void validateProviders(
+            Core core,
+            Optional<NereusKafkaBookKeeperConfig> bookKeeper) {
         requirePresent(core.cluster(), NereusKafkaConfigs.CLUSTER_CONFIG);
         requirePresent(core.oxiaServiceAddress(), NereusKafkaConfigs.OXIA_SERVICE_ADDRESS_CONFIG);
         requirePresent(core.cacheDir(), NereusKafkaConfigs.CACHE_DIR_CONFIG);
+        requirePresent(core.objectProvider(), NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG);
+        requirePresent(core.objectBucket(), NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
         if (core.profile().usesBookKeeper()) {
             requirePresent(
                     core.bookKeeperMetadataServiceUri(),
                     NereusKafkaConfigs.BOOKKEEPER_METADATA_SERVICE_URI_CONFIG);
+            if (bookKeeper.isEmpty()) {
+                throw invalid(
+                        NereusKafkaConfigs.BOOKKEEPER_DEPLOYMENT_ID_CONFIG,
+                        "complete BookKeeper configuration is required by the selected profile");
+            }
+        } else if (bookKeeper.isPresent()) {
+            throw invalid(
+                    NereusKafkaConfigs.PROFILE_CONFIG,
+                    "BookKeeper configuration cannot be installed for an Object-only profile");
         }
-        if (core.profile().usesObjectStorage()) {
-            requirePresent(core.objectProvider(), NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG);
-            requirePresent(core.objectBucket(), NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
+    }
+
+    private static void validateBookKeeper(
+            NereusKafkaBookKeeperConfig bookKeeper,
+            Append append,
+            Fetch fetch,
+            Rollout rollout) {
+        if (bookKeeper.operationTimeout().compareTo(append.timeout()) > 0
+                || bookKeeper.operationTimeout().compareTo(fetch.timeout()) > 0
+                || bookKeeper.operationTimeout().compareTo(rollout.shutdownDrainTimeout()) > 0) {
+            throw invalid(
+                    NereusKafkaConfigs.BOOKKEEPER_OPERATION_TIMEOUT_MS_CONFIG,
+                    "must fit append, fetch, and shutdown-drain deadlines");
+        }
+        if (bookKeeper.allocationTimeout().compareTo(append.timeout()) > 0) {
+            throw invalid(
+                    NereusKafkaConfigs.BOOKKEEPER_ALLOCATION_TIMEOUT_MS_CONFIG,
+                    "must fit the append deadline");
+        }
+        if (bookKeeper.sealTimeout().compareTo(rollout.shutdownDrainTimeout()) > 0
+                || bookKeeper.deleteTimeout().compareTo(rollout.shutdownDrainTimeout()) > 0) {
+            throw invalid(
+                    NereusKafkaConfigs.BOOKKEEPER_SEAL_TIMEOUT_MS_CONFIG,
+                    "seal and delete timeouts must fit the shutdown-drain deadline");
+        }
+        long appendCapacity = Math.addExact(
+                append.executorThreads(), append.executorQueueCapacity());
+        if (bookKeeper.maxWritesInFlight() > appendCapacity) {
+            throw invalid(
+                    NereusKafkaConfigs.BOOKKEEPER_MAX_WRITES_INFLIGHT_CONFIG,
+                    "cannot exceed the bounded append executor capacity");
+        }
+        if (bookKeeper.maxReadsInFlight() > fetch.executorThreads()
+                || bookKeeper.maxReadBytesInFlight() > fetch.inflightBytes()) {
+            throw invalid(
+                    NereusKafkaConfigs.BOOKKEEPER_MAX_READS_INFLIGHT_CONFIG,
+                    "BookKeeper read limits cannot exceed the Fetch executor and byte budgets");
         }
     }
 
@@ -221,6 +302,74 @@ public record NereusKafkaStorageConfig(
                 throw new ConfigException(name, value, "must be an absolute URI");
             }
         });
+    }
+
+    private static Profile profile(AbstractConfig config) {
+        return Profile.valueOf(config.getString(NereusKafkaConfigs.PROFILE_CONFIG));
+    }
+
+    private static NereusKafkaBookKeeperConfig bookKeeper(AbstractConfig config) {
+        return new NereusKafkaBookKeeperConfig(
+                requiredConfiguredText(config, NereusKafkaConfigs.BOOKKEEPER_DEPLOYMENT_ID_CONFIG),
+                requiredConfiguredText(config, NereusKafkaConfigs.BOOKKEEPER_CLUSTER_ALIAS_CONFIG),
+                requiredConfiguredText(
+                        config,
+                        NereusKafkaConfigs.BOOKKEEPER_PROVIDER_SCOPE_SHA256_CONFIG),
+                config.getInt(NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_PREFIX_BITS_CONFIG),
+                requiredLong(
+                        config,
+                        NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_PREFIX_VALUE_CONFIG),
+                requiredConfiguredText(
+                        config,
+                        NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_RESERVATION_ID_CONFIG),
+                config.getInt(NereusKafkaConfigs.BOOKKEEPER_ENSEMBLE_SIZE_CONFIG),
+                config.getInt(NereusKafkaConfigs.BOOKKEEPER_WRITE_QUORUM_SIZE_CONFIG),
+                config.getInt(NereusKafkaConfigs.BOOKKEEPER_ACK_QUORUM_SIZE_CONFIG),
+                requiredConfiguredText(config, NereusKafkaConfigs.BOOKKEEPER_DIGEST_TYPE_CONFIG),
+                optionalPath(config, NereusKafkaConfigs.BOOKKEEPER_PASSWORD_FILE_CONFIG)
+                        .orElseThrow(() -> invalid(
+                                NereusKafkaConfigs.BOOKKEEPER_PASSWORD_FILE_CONFIG,
+                                "must be configured by a BookKeeper profile")),
+                requiredConfiguredText(
+                        config,
+                        NereusKafkaConfigs.BOOKKEEPER_PASSWORD_VERSION_CONFIG),
+                config.getLong(NereusKafkaConfigs.BOOKKEEPER_MAX_ENTRIES_PER_LEDGER_CONFIG),
+                config.getLong(NereusKafkaConfigs.BOOKKEEPER_MAX_BYTES_PER_LEDGER_CONFIG),
+                config.getInt(
+                        NereusKafkaConfigs.BOOKKEEPER_MAX_APPEND_RANGES_PER_LEDGER_CONFIG),
+                config.getInt(NereusKafkaConfigs.BOOKKEEPER_PROTECTION_SLOTS_PER_RANGE_CONFIG),
+                config.getInt(
+                        NereusKafkaConfigs.BOOKKEEPER_MAX_READER_LEASES_PER_LEDGER_CONFIG),
+                config.getInt(
+                        NereusKafkaConfigs.BOOKKEEPER_MAX_UNCERTAIN_ALLOCATIONS_CONFIG),
+                duration(config, NereusKafkaConfigs.BOOKKEEPER_MAX_LEDGER_AGE_MS_CONFIG),
+                config.getInt(NereusKafkaConfigs.BOOKKEEPER_MAX_WRITES_INFLIGHT_CONFIG),
+                config.getInt(NereusKafkaConfigs.BOOKKEEPER_MAX_READS_INFLIGHT_CONFIG),
+                config.getLong(NereusKafkaConfigs.BOOKKEEPER_MAX_READ_BYTES_INFLIGHT_CONFIG),
+                duration(config, NereusKafkaConfigs.BOOKKEEPER_OPERATION_TIMEOUT_MS_CONFIG),
+                duration(config, NereusKafkaConfigs.BOOKKEEPER_ALLOCATION_TIMEOUT_MS_CONFIG),
+                duration(config, NereusKafkaConfigs.BOOKKEEPER_SEAL_TIMEOUT_MS_CONFIG),
+                duration(config, NereusKafkaConfigs.BOOKKEEPER_DELETE_TIMEOUT_MS_CONFIG),
+                duration(config, NereusKafkaConfigs.BOOKKEEPER_READER_LEASE_TTL_MS_CONFIG),
+                duration(config, NereusKafkaConfigs.BOOKKEEPER_READER_LEASE_RENEW_MS_CONFIG),
+                duration(
+                        config,
+                        NereusKafkaConfigs.BOOKKEEPER_RETENTION_SCAN_INTERVAL_MS_CONFIG),
+                config.getInt(NereusKafkaConfigs.BOOKKEEPER_RETENTION_PAGE_SIZE_CONFIG),
+                config.getLong(NereusKafkaConfigs.BOOKKEEPER_READINESS_EPOCH_CONFIG),
+                requiredConfiguredText(
+                        config,
+                        NereusKafkaConfigs.BOOKKEEPER_READINESS_SHA256_CONFIG),
+                config.getInt(
+                        NereusKafkaConfigs.BOOKKEEPER_PERSISTENT_BROKER_COUNT_CONFIG));
+    }
+
+    private static long requiredLong(AbstractConfig config, String name) {
+        Long value = config.getLong(name);
+        if (value == null) {
+            throw invalid(name, "must be configured by a BookKeeper profile");
+        }
+        return value;
     }
 
     private static Duration multiply(Duration value, int multiplier) {

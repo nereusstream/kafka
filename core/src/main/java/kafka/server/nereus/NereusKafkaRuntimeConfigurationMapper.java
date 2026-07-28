@@ -20,6 +20,7 @@ package kafka.server.nereus;
 import kafka.log.nereus.NereusListOffsetsScanConfig;
 
 import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.server.config.NereusKafkaBookKeeperConfig;
 import org.apache.kafka.server.config.NereusKafkaConfigs;
 import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 
@@ -28,11 +29,15 @@ import com.nereusstream.api.ChecksumType;
 import com.nereusstream.api.ReadIsolation;
 import com.nereusstream.api.ReadOptions;
 import com.nereusstream.api.StorageProfile;
+import com.nereusstream.bookkeeper.BookKeeperDigestType;
+import com.nereusstream.bookkeeper.BookKeeperSecretRef;
+import com.nereusstream.bookkeeper.BookKeeperWalConfiguration;
 import com.nereusstream.core.StreamStorageConfig;
 import com.nereusstream.kafka.activation.KafkaBrokerCapabilitySpecification;
 import com.nereusstream.kafka.activation.KafkaStorageActivationPolicy;
 import com.nereusstream.kafka.compaction.KafkaCompactionPartitionPass;
 import com.nereusstream.kafka.compaction.KafkaCompactionTwoPassExecutor;
+import com.nereusstream.kafka.runtime.NereusKafkaBookKeeperWalRuntimeConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaCompactionRuntimeConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeConfiguration;
@@ -137,7 +142,10 @@ public final class NereusKafkaRuntimeConfigurationMapper {
         Duration operationTtl = maximum(
                 exact.lifecycle().recoveryTimeout(),
                 exact.append().sessionTtl());
-        Set<StorageProfile> executableProfiles = Set.of(StorageProfile.OBJECT_WAL_SYNC_OBJECT);
+        Optional<NereusKafkaBookKeeperWalRuntimeConfiguration> bookKeeper =
+                bookKeeperConfiguration(exact);
+        Set<StorageProfile> executableProfiles = executableProfiles(exact);
+        StorageProfile defaultProfile = defaultProfile(exact);
         NereusKafkaRuntimeConfiguration runtime = new NereusKafkaRuntimeConfiguration(
                 cluster,
                 exactKafkaClusterId,
@@ -204,11 +212,18 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                         pendingProtection,
                         MAXIMUM_CLOCK_SKEW,
                         orphanGrace,
-                        exact.lifecycle().executorThreads());
+                        exact.lifecycle().executorThreads(),
+                        bookKeeper);
 
-        byte[] configurationDigest = configurationCompatibilitySha256(exact);
+        byte[] configurationDigest = configurationCompatibilitySha256(exact, bookKeeper);
         byte[] providerDigest = providerScopeSha256(
-                exact, exactKafkaClusterId, providerToken, endpoint, region, prefix);
+                exact,
+                exactKafkaClusterId,
+                providerToken,
+                endpoint,
+                region,
+                prefix,
+                bookKeeper);
         KafkaBrokerCapabilitySpecification capability =
                 new KafkaBrokerCapabilitySpecification(
                         exactKafkaClusterId,
@@ -218,9 +233,9 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                         nonblank(nereusBuild, "nereusBuild"),
                         nonblank(javaVersion, "javaVersion"),
                         executableProfiles,
-                        StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        defaultProfile,
                         configurationDigest,
-                        codeCapabilitySha256(),
+                        codeCapabilitySha256(executableProfiles),
                         providerDigest,
                         exact.rollout().capabilityHeartbeat(),
                         exact.rollout().capabilityExpiry());
@@ -264,14 +279,15 @@ public final class NereusKafkaRuntimeConfigurationMapper {
         Duration retryInterval = minimum(
                 exact.rollout().capabilityHeartbeat(),
                 Duration.ofSeconds(1));
+        Set<StorageProfile> executableProfiles = executableProfiles(exact);
         return new NereusKafkaControllerRuntimeConfiguration(
                 nereusCluster,
                 exactKafkaClusterId,
                 oxiaConfiguration(exact, oxiaAddress, providerTimeout),
                 new KafkaStorageActivationPolicy(
                         exactKafkaClusterId,
-                        Set.of(StorageProfile.OBJECT_WAL_SYNC_OBJECT),
-                        StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        executableProfiles,
+                        defaultProfile(exact),
                         exact.rollout().capabilityExpiry()),
                 retryInterval);
     }
@@ -445,15 +461,20 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                     "cannot map a disabled Nereus Kafka storage configuration");
         }
         if (storage.core().profile()
-                != NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT) {
+                != NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT
+                && storage.core().profile()
+                != NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY) {
             throw new ConfigException(
                     NereusKafkaConfigs.PROFILE_CONFIG,
                     storage.core().profile().name(),
-                    "only OBJECT_WAL_SYNC_OBJECT has a production provider runtime");
+                    "only OBJECT_WAL_SYNC_OBJECT and BOOKKEEPER_WAL_ONLY have production provider runtimes");
         }
     }
 
-    private static byte[] configurationCompatibilitySha256(NereusKafkaStorageConfig storage) {
+    private static byte[] configurationCompatibilitySha256(
+            NereusKafkaStorageConfig storage,
+            Optional<NereusKafkaBookKeeperWalRuntimeConfiguration> bookKeeper
+    ) {
         return digest(CONFIG_DIGEST_DOMAIN, output -> {
             NereusKafkaStorageConfig.Append append = storage.append();
             NereusKafkaStorageConfig.Fetch fetch = storage.fetch();
@@ -482,6 +503,20 @@ public final class NereusKafkaRuntimeConfigurationMapper {
             output.writeLong(compaction.compactionDecodeMaxUncompressedBytes());
             output.writeInt(compaction.compactionDecodeMaxRatio());
             output.writeBoolean(storage.rollout().activationRequired());
+            output.writeBoolean(bookKeeper.isPresent());
+            if (bookKeeper.isPresent()) {
+                NereusKafkaBookKeeperWalRuntimeConfiguration exact =
+                        bookKeeper.orElseThrow();
+                writeText(output, exact.deploymentId());
+                writeText(
+                        output,
+                        exact.wal().configurationBindingSha256().value());
+                NereusKafkaBookKeeperConfig configured =
+                        storage.bookKeeper().orElseThrow();
+                output.writeLong(configured.readinessEpoch());
+                writeText(output, configured.readinessSha256());
+                output.writeInt(configured.persistentBrokerCount());
+            }
         });
     }
 
@@ -491,7 +526,8 @@ public final class NereusKafkaRuntimeConfigurationMapper {
             String provider,
             URI endpoint,
             String region,
-            String prefix
+            String prefix,
+            Optional<NereusKafkaBookKeeperWalRuntimeConfiguration> bookKeeper
     ) {
         return digest(PROVIDER_DIGEST_DOMAIN, output -> {
             writeText(output, storage.core().cluster().orElseThrow());
@@ -504,10 +540,23 @@ public final class NereusKafkaRuntimeConfigurationMapper {
             writeText(output, storage.core().objectBucket().orElseThrow());
             writeText(output, prefix);
             output.writeBoolean(storage.core().objectPathStyleAccess());
+            output.writeBoolean(bookKeeper.isPresent());
+            if (bookKeeper.isPresent()) {
+                writeText(
+                        output,
+                        storage.core().bookKeeperMetadataServiceUri()
+                                .orElseThrow()
+                                .toASCIIString());
+                writeText(
+                        output,
+                        bookKeeper.orElseThrow().wal().providerScopeSha256());
+            }
         });
     }
 
-    private static byte[] codeCapabilitySha256() {
+    private static byte[] codeCapabilitySha256(
+            Set<StorageProfile> executableProfiles
+    ) {
         return digest(CODE_DIGEST_DOMAIN, output -> {
             output.writeInt(KafkaStorageProtocolActivationRecord.PROTOCOL_VERSION);
             output.writeInt(KafkaStorageProtocolActivationRecord.API_VERSION);
@@ -519,8 +568,76 @@ public final class NereusKafkaRuntimeConfigurationMapper {
             output.writeInt(KafkaStorageProtocolActivationRecord.CHECKPOINT_VERSION);
             output.writeInt(KafkaStorageProtocolActivationRecord.COMPACTION_STRATEGY_VERSION);
             output.writeInt(KafkaStorageProtocolActivationRecord.KAFKA_FEATURE_LEVEL);
-            writeText(output, StorageProfile.OBJECT_WAL_SYNC_OBJECT.name());
+            output.writeInt(executableProfiles.size());
+            for (StorageProfile profile : executableProfiles.stream()
+                    .sorted(java.util.Comparator.comparing(Enum::name))
+                    .toList()) {
+                writeText(output, profile.name());
+            }
         });
+    }
+
+    private static Optional<NereusKafkaBookKeeperWalRuntimeConfiguration>
+            bookKeeperConfiguration(NereusKafkaStorageConfig storage) {
+        if (storage.core().profile()
+                != NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY) {
+            return Optional.empty();
+        }
+        NereusKafkaBookKeeperConfig exact =
+                storage.bookKeeper().orElseThrow();
+        BookKeeperWalConfiguration wal = new BookKeeperWalConfiguration(
+                exact.clusterAlias(),
+                exact.providerScopeSha256(),
+                exact.ledgerIdPrefixBits(),
+                exact.ledgerIdPrefixValue(),
+                exact.ledgerIdNamespaceReservationId(),
+                exact.ensembleSize(),
+                exact.writeQuorumSize(),
+                exact.ackQuorumSize(),
+                BookKeeperDigestType.valueOf(exact.digestType()),
+                new BookKeeperSecretRef(
+                        exact.passwordFile().toUri().toASCIIString(),
+                        exact.passwordVersion()),
+                exact.maxEntriesPerLedger(),
+                exact.maxBytesPerLedger(),
+                exact.maxAppendRangesPerLedger(),
+                exact.protectionSlotsPerRange(),
+                exact.maxReaderLeasesPerLedger(),
+                exact.maxUncertainAllocations(),
+                exact.maxLedgerAge(),
+                exact.maxWritesInFlight(),
+                exact.maxReadsInFlight(),
+                exact.maxReadBytesInFlight(),
+                exact.operationTimeout(),
+                exact.allocationTimeout(),
+                exact.sealTimeout(),
+                exact.deleteTimeout(),
+                exact.readerLeaseTtl(),
+                exact.readerLeaseRenewInterval(),
+                exact.retentionScanInterval(),
+                exact.retentionPageSize());
+        return Optional.of(new NereusKafkaBookKeeperWalRuntimeConfiguration(
+                exact.deploymentId(), wal));
+    }
+
+    private static Set<StorageProfile> executableProfiles(
+            NereusKafkaStorageConfig storage
+    ) {
+        return storage.core().profile()
+                        == NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY
+                ? Set.of(
+                        StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        StorageProfile.BOOKKEEPER_WAL_ONLY)
+                : Set.of(StorageProfile.OBJECT_WAL_SYNC_OBJECT);
+    }
+
+    private static StorageProfile defaultProfile(
+            NereusKafkaStorageConfig storage
+    ) {
+        return storage.core().profile()
+                        == NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY
+                ? StorageProfile.BOOKKEEPER_WAL_ONLY
+                : StorageProfile.OBJECT_WAL_SYNC_OBJECT;
     }
 
     private static String canonicalProvider(String value) {

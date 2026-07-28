@@ -18,6 +18,7 @@
 package kafka.server.nereus;
 
 import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.server.config.NereusKafkaBookKeeperConfig;
 import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 
 import com.nereusstream.api.ChecksumType;
@@ -165,6 +166,41 @@ class NereusKafkaRuntimeConfigurationMapperTest {
     }
 
     @Test
+    void mapsExactBookKeeperWalOnlyRuntimeWithoutProviderIo() {
+        NereusKafkaStorageConfig config = configuration(
+                NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY,
+                "s3");
+
+        NereusKafkaMappedRuntimeConfiguration mapped = map(config);
+        NereusKafkaControllerRuntimeConfiguration controller =
+                mapper.mapController(config, "kafka-cluster-a");
+
+        assertEquals(
+                java.util.Set.of(
+                        StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        StorageProfile.BOOKKEEPER_WAL_ONLY),
+                mapped.runtime().runtime().executableProfiles());
+        assertTrue(mapped.runtime().bookKeeper().isPresent());
+        assertEquals(
+                "kafka-deployment-a",
+                mapped.runtime().bookKeeper().orElseThrow().deploymentId());
+        assertEquals(
+                "11".repeat(32),
+                mapped.runtime().bookKeeper().orElseThrow().wal().providerScopeSha256());
+        assertEquals(
+                StorageProfile.BOOKKEEPER_WAL_ONLY.name(),
+                mapped.capability().defaultStorageProfile());
+        assertEquals(
+                java.util.List.of(
+                        StorageProfile.BOOKKEEPER_WAL_ONLY.name(),
+                        StorageProfile.OBJECT_WAL_SYNC_OBJECT.name()),
+                controller.activationPolicy().allowedStorageProfiles());
+        assertEquals(
+                StorageProfile.BOOKKEEPER_WAL_ONLY.name(),
+                controller.activationPolicy().defaultStorageProfile());
+    }
+
+    @Test
     void mapsControllerActivationWithoutBrokerIdentityOrProviderIo() {
         NereusKafkaStorageConfig config = configuration(
                 NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT,
@@ -199,7 +235,7 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                         NereusKafkaStorageConfig.Profile.OBJECT_WAL_ASYNC_OBJECT,
                         "s3")));
 
-        assertTrue(failure.getMessage().contains("OBJECT_WAL_SYNC_OBJECT"));
+        assertTrue(failure.getMessage().contains("BOOKKEEPER_WAL_ONLY"));
     }
 
     @Test
@@ -302,6 +338,46 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                         Duration.ofSeconds(5),
                         Duration.ofSeconds(30),
                         Duration.ofMinutes(2),
-                        Duration.ofMinutes(1)));
+                        Duration.ofMinutes(1)),
+                profile.usesBookKeeper()
+                        ? Optional.of(bookKeeper())
+                        : Optional.empty());
+    }
+
+    private static NereusKafkaBookKeeperConfig bookKeeper() {
+        return new NereusKafkaBookKeeperConfig(
+                "kafka-deployment-a",
+                "nereus-a",
+                "11".repeat(32),
+                12,
+                0x801L,
+                "reservation-a",
+                2,
+                2,
+                2,
+                "CRC32C",
+                Path.of("/tmp/nereus-kafka-bookkeeper-password"),
+                "v1",
+                100_000,
+                256L * 1024 * 1024,
+                1_000,
+                8,
+                64,
+                32,
+                Duration.ofHours(1),
+                8,
+                8,
+                64L * 1024 * 1024,
+                Duration.ofSeconds(20),
+                Duration.ofSeconds(20),
+                Duration.ofSeconds(30),
+                Duration.ofSeconds(30),
+                Duration.ofMinutes(2),
+                Duration.ofSeconds(30),
+                Duration.ofMinutes(1),
+                256,
+                1,
+                "55".repeat(32),
+                1);
     }
 }
