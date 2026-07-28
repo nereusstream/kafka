@@ -133,6 +133,46 @@ class NereusTopicDeltaLifecycleTest {
   }
 
   @Test
+  def testLocalReplicaRemovalResignsWithoutDeletingSharedBinding(): Unit = {
+    val topicId = Uuid.randomUuid()
+    val topicPartition = new TopicPartition("events", 0)
+    val (_, initialImage) = createLeader(
+      topicPartition, topicId, leaderEpoch = 5, metadataOffset = 10)
+    val delta = new MetadataDelta(initialImage)
+    delta.replay(new PartitionChangeRecord()
+      .setTopicId(topicId)
+      .setPartitionId(0)
+      .setReplicas(java.util.List.of(2))
+      .setIsr(java.util.List.of(2))
+      .setLeader(2))
+    val image = delta.apply(new MetadataProvenance(11, 1, 1000, true))
+    assertTrue(delta.topicsDelta().localChanges(brokerId).deletes().contains(topicPartition))
+    val partitionLifecycle = mock(classOf[NereusListOffsetsLifecycle])
+    val resigned = new CompletableFuture[Void]
+    when(partitionLifecycle.resign(
+      any(classOf[KafkaPartitionIdentity]),
+      anyInt(),
+      any(classOf[Duration])))
+      .thenReturn(resigned)
+    val lifecycle = newLifecycle(mock(classOf[ReplicaManager]), partitionLifecycle, brokerEpoch = 9)
+    val callbacks = mutable.ArrayBuffer.empty[(TopicPartition, Option[Int])]
+
+    val applied = lifecycle.applyAfterReplicaManager(
+      delta.topicsDelta(), image, (_, _) => (), (tp, epoch) => callbacks += tp -> epoch)
+
+    val identityCaptor = ArgumentCaptor.forClass(classOf[KafkaPartitionIdentity])
+    verify(partitionLifecycle).resign(identityCaptor.capture(),
+      org.mockito.ArgumentMatchers.eq(6), same(timeout))
+    assertEquals(topicId.toString, identityCaptor.getValue.topicId())
+    verify(partitionLifecycle, never()).delete(
+      any(classOf[KafkaPartitionIdentity]), anyLong(), any(classOf[Duration]))
+    assertTrue(callbacks.isEmpty)
+    resigned.complete(null)
+    applied.join()
+    assertEquals(Seq(topicPartition -> Some(6)), callbacks.toSeq)
+  }
+
+  @Test
   def testDeleteUsesPreviousTopicIdAndReportsEpochlessResignation(): Unit = {
     val topicId = Uuid.randomUuid()
     val topicPartition = new TopicPartition("events", 0)

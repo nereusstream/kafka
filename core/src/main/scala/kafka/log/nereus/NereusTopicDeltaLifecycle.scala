@@ -116,9 +116,15 @@ final class NereusTopicDeltaLifecycle(
     // Delete must precede a same-name/topic-partition recreation carried in the same metadata delta.
     changes.deletes().asScala.foreach { topicPartition =>
       append(topicPartition) {
-        val identity = deletedIdentity(delta, topicPartition)
-        partitionLifecycle.delete(identity, metadataOffset, operationTimeout)
-          .thenRun(() => onResigned(topicPartition, None))
+        val previousIdentity = deletedIdentity(delta, topicPartition)
+        retainedLeaderEpoch(newImage, topicPartition, previousIdentity) match {
+          case Some(observedLeaderEpoch) =>
+            partitionLifecycle.resign(previousIdentity, observedLeaderEpoch, operationTimeout)
+              .thenRun(() => onResigned(topicPartition, Some(observedLeaderEpoch)))
+          case None =>
+            partitionLifecycle.delete(previousIdentity, metadataOffset, operationTimeout)
+              .thenRun(() => onResigned(topicPartition, None))
+        }
       }
     }
 
@@ -178,6 +184,20 @@ final class NereusTopicDeltaLifecycle(
       throw invariant("Deleted Nereus partition is absent from the previous KRaft metadata image")
     }
     identity(topicPartition, topic.id().toString)
+  }
+
+  private def retainedLeaderEpoch(
+    newImage: MetadataImage,
+    topicPartition: TopicPartition,
+    previousIdentity: KafkaPartitionIdentity
+  ): Option[Int] = {
+    val currentTopic = newImage.topics().getTopic(topicPartition.topic())
+    if (currentTopic == null || currentTopic.id().toString != previousIdentity.topicId()) {
+      None
+    } else {
+      Option(currentTopic.partitions().get(topicPartition.partition()))
+        .map(_.leaderEpoch)
+    }
   }
 
   private def identity(topicPartition: TopicPartition, topicId: String): KafkaPartitionIdentity =
