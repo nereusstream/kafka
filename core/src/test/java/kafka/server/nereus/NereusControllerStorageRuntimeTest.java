@@ -17,9 +17,9 @@
 
 package kafka.server.nereus;
 
+import org.apache.kafka.image.FeaturesImage;
 import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
-import org.apache.kafka.image.FeaturesImage;
 import org.apache.kafka.image.loader.LoaderManifest;
 import org.apache.kafka.raft.LeaderAndEpoch;
 import org.apache.kafka.server.common.MetadataVersion;
