@@ -17,9 +17,10 @@
 
 package kafka
 
-import java.util.Properties
+import java.util.{Objects, Properties}
 import joptsimple.OptionParser
 import kafka.server.{KafkaConfig, KafkaRaftServer, Server}
+import kafka.server.storage.BrokerStorageRuntimeFactory
 import kafka.utils.Implicits._
 import kafka.utils.Logging
 import org.apache.kafka.common.utils.{Exit, Java, LoggingSignalHandler, OperatingSystem, Time, Utils}
@@ -61,18 +62,34 @@ object Kafka extends Logging {
     props
   }
 
-  private def buildServer(props: Properties): Server = {
+  private def buildServer(
+    props: Properties,
+    brokerStorageRuntimeFactory: BrokerStorageRuntimeFactory
+  ): Server = {
     val config = KafkaConfig.fromProps(props, doLog = false)
     new KafkaRaftServer(
       config,
       Time.SYSTEM,
+      brokerStorageRuntimeFactory,
     )
   }
 
   def main(args: Array[String]): Unit = {
+    run(args, BrokerStorageRuntimeFactory.Disabled)
+  }
+
+  /**
+   * Shared stock lifecycle for an explicitly selected broker-storage runtime. The Nereus launcher calls this method with
+   * its statically linked production factory; the stock entry point above remains artifact-independent and disabled.
+   */
+  private[kafka] def run(
+    args: Array[String],
+    brokerStorageRuntimeFactory: BrokerStorageRuntimeFactory
+  ): Unit = {
+    Objects.requireNonNull(brokerStorageRuntimeFactory, "brokerStorageRuntimeFactory")
     try {
       val serverProps = getPropsFromArgs(args)
-      val server = buildServer(serverProps)
+      val server = buildServer(serverProps, brokerStorageRuntimeFactory)
 
       try {
         if (!OperatingSystem.IS_WINDOWS && !Java.isIbmJdk)
