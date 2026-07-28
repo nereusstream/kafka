@@ -45,6 +45,7 @@ class NereusBrokerStorageAppendExecutorTest {
     val expectedSecond = exactBytes(secondRecords)
 
     val first = executor.submit(partition, firstRecords, owned => {
+      assertFalse(owned.buffer().isReadOnly)
       firstStarted.countDown()
       assertEquals(true, releaseFirst.await(5, TimeUnit.SECONDS))
       observed.add(1)

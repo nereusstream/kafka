@@ -35,7 +35,7 @@ import kafka.server.KafkaConfig
 import kafka.server.storage.BrokerStorageRuntimeContext
 import kafka.utils.TestUtils
 
-import org.apache.kafka.common.{TopicPartition, Uuid}
+import org.apache.kafka.common.{DirectoryId, TopicPartition, Uuid}
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.errors.KafkaStorageException
 import org.apache.kafka.common.metrics.Metrics
@@ -52,6 +52,7 @@ import org.apache.kafka.coordinator.group.GroupCoordinatorConfig
 import org.apache.kafka.coordinator.share.ShareCoordinatorConfig
 import org.apache.kafka.coordinator.transaction.TransactionLogConfig
 import org.apache.kafka.metadata.{KRaftMetadataCache, MockConfigRepository}
+import org.apache.kafka.metadata.properties.{MetaProperties, MetaPropertiesEnsemble, PropertiesUtils}
 import org.apache.kafka.server.config.{NereusKafkaConfigs, ReplicationConfigs, ServerLogConfigs}
 import org.apache.kafka.server.common.{RequestLocal, TransactionVersion}
 import org.apache.kafka.server.util.{KafkaScheduler, MockTime}
@@ -102,6 +103,14 @@ class NereusUnifiedLogFactoryTest {
       logManager.startup(Set("stale-local"))
       assertTrue(logManager.allLogs.isEmpty)
       assertEquals(Seq(expectedRoot), logManager.liveLogDirs)
+      assertEquals(1, logManager.directoryIdsSet.size)
+      val directoryId = logManager.directoryIdsSet.head
+      assertFalse(DirectoryId.reserved(directoryId))
+      val cacheIdentity = new MetaProperties.Builder(PropertiesUtils.readPropertiesFile(
+        expectedRoot.toPath.resolve(MetaPropertiesEnsemble.META_PROPERTIES_NAME).toString)).build()
+      assertEquals("cluster-id", cacheIdentity.clusterId().orElseThrow())
+      assertEquals(0, cacheIdentity.nodeId().orElseThrow())
+      assertEquals(directoryId, cacheIdentity.directoryId().orElseThrow())
 
       val topicId = Uuid.randomUuid()
       val log = logManager.getOrCreateLog(

@@ -35,6 +35,12 @@ trait UnifiedLogFactory {
   def logDirectories(configuredLogDirectories: collection.Seq[File]): collection.Seq[File] =
     configuredLogDirectories
 
+  /**
+   * Prepare the exact directories returned by [[logDirectories]] before LogManager validates them and loads their
+   * directory IDs. The stock factory is inert because kafka-storage has already formatted its configured directories.
+   */
+  def prepareLogDirectories(selectedLogDirectories: collection.Seq[File]): Unit = ()
+
   def initialOfflineDirectories(
     configuredInitialOfflineDirectories: collection.Seq[File],
     selectedLogDirectories: collection.Seq[File]

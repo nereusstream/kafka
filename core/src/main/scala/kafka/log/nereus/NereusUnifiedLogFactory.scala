@@ -22,10 +22,12 @@ import com.nereusstream.kafka.partition.KafkaPartitionIdentity
 import kafka.log.{UnifiedLogFactory, UnifiedLogOpenContext}
 import kafka.server.storage.BrokerStorageRuntimeContext
 
-import org.apache.kafka.common.Uuid
+import org.apache.kafka.common.{DirectoryId, Uuid}
+import org.apache.kafka.metadata.properties.{MetaProperties, MetaPropertiesEnsemble, MetaPropertiesVersion, PropertiesUtils}
 import org.apache.kafka.storage.internals.log.UnifiedLog
 
 import java.io.File
+import java.nio.file.Files
 import java.util.Objects
 
 /** Selects one ephemeral cache root and creates only fail-closed Nereus UnifiedLog shells. */
@@ -41,6 +43,40 @@ final class NereusUnifiedLogFactory(context: BrokerStorageRuntimeContext) extend
   override def logDirectories(
     configuredLogDirectories: collection.Seq[File]
   ): collection.Seq[File] = Seq(cacheRoot)
+
+  override def prepareLogDirectories(
+    selectedLogDirectories: collection.Seq[File]
+  ): Unit = {
+    if (selectedLogDirectories != Seq(cacheRoot)) {
+      throw invariant("Nereus log directory preparation must target the selected broker cache root")
+    }
+    val root = cacheRoot.toPath
+    val metaProperties = root.resolve(MetaPropertiesEnsemble.META_PROPERTIES_NAME)
+    try {
+      Files.createDirectories(root)
+      if (Files.exists(metaProperties)) {
+        validateCacheIdentity(
+          new MetaProperties.Builder(
+            PropertiesUtils.readPropertiesFile(metaProperties.toString)).build())
+      } else {
+        val identity = new MetaProperties.Builder()
+          .setVersion(MetaPropertiesVersion.V1)
+          .setClusterId(context.clusterId)
+          .setNodeId(context.config.brokerId)
+          .setDirectoryId(DirectoryId.random())
+          .build()
+        PropertiesUtils.writePropertiesFile(identity.toProperties, metaProperties.toString, true)
+      }
+    } catch {
+      case failure: NereusException => throw failure
+      case failure: Exception =>
+        throw new NereusException(
+          ErrorCode.METADATA_UNAVAILABLE,
+          false,
+          s"failed to prepare Nereus Kafka cache directory identity at $metaProperties",
+          failure)
+    }
+  }
 
   override def initialOfflineDirectories(
     configuredInitialOfflineDirectories: collection.Seq[File],
@@ -93,4 +129,19 @@ final class NereusUnifiedLogFactory(context: BrokerStorageRuntimeContext) extend
 
   private def invariant(message: String): NereusException =
     new NereusException(ErrorCode.METADATA_INVARIANT_VIOLATION, false, message)
+
+  private def validateCacheIdentity(identity: MetaProperties): Unit = {
+    if (identity.version() != MetaPropertiesVersion.V1) {
+      throw invariant("Nereus Kafka cache meta.properties must use KRaft version 1")
+    }
+    if (identity.clusterId().isEmpty || identity.clusterId().get() != context.clusterId) {
+      throw invariant("Nereus Kafka cache meta.properties has a different cluster ID")
+    }
+    if (identity.nodeId().isEmpty || identity.nodeId().getAsInt != context.config.brokerId) {
+      throw invariant("Nereus Kafka cache meta.properties has a different node ID")
+    }
+    if (identity.directoryId().isEmpty || DirectoryId.reserved(identity.directoryId().get())) {
+      throw invariant("Nereus Kafka cache meta.properties requires a non-reserved directory ID")
+    }
+  }
 }

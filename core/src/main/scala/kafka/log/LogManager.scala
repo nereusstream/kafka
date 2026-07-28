@@ -1602,6 +1602,7 @@ object LogManager {
     // Nereus inject start: select stock log directories or the authoritative-storage cache root
     val selectedLogDirectories = unifiedLogFactory.logDirectories(
       config.logDirs.asScala.map(new File(_).getAbsoluteFile).toSeq)
+    unifiedLogFactory.prepareLogDirectories(selectedLogDirectories)
     val selectedInitialOfflineDirectories = unifiedLogFactory.initialOfflineDirectories(
       initialOfflineDirs.map(new File(_).getAbsoluteFile),
       selectedLogDirectories)
