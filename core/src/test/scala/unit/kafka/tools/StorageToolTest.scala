@@ -201,6 +201,30 @@ Found problem:
     properties.setProperty(
       NereusKafkaConfigs.BOOKKEEPER_METADATA_SERVICE_URI_CONFIG,
       "bk://127.0.0.1/ledgers")
+    properties.setProperty(
+      NereusKafkaConfigs.BOOKKEEPER_DEPLOYMENT_ID_CONFIG,
+      "kafka-storage-tool-deployment")
+    properties.setProperty(
+      NereusKafkaConfigs.BOOKKEEPER_CLUSTER_ALIAS_CONFIG,
+      "nereus-cluster")
+    properties.setProperty(
+      NereusKafkaConfigs.BOOKKEEPER_PROVIDER_SCOPE_SHA256_CONFIG,
+      "11" * 32)
+    properties.setProperty(
+      NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_PREFIX_VALUE_CONFIG,
+      "2049")
+    properties.setProperty(
+      NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_RESERVATION_ID_CONFIG,
+      "kafka-storage-tool-reservation")
+    properties.setProperty(
+      NereusKafkaConfigs.BOOKKEEPER_PASSWORD_FILE_CONFIG,
+      "/tmp/nereus-kafka-storage-tool-bookkeeper-password")
+    properties.setProperty(
+      NereusKafkaConfigs.BOOKKEEPER_PASSWORD_VERSION_CONFIG,
+      "v1")
+    properties.setProperty(
+      NereusKafkaConfigs.BOOKKEEPER_READINESS_SHA256_CONFIG,
+      "55" * 32)
     properties.setProperty(NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG, "s3")
     properties.setProperty(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG, "nereus-kafka")
     properties.setProperty(
