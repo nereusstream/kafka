@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 import java.net.URI;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -171,6 +172,27 @@ class NereusKafkaRuntimeConfigurationMapperTest {
     }
 
     @Test
+    void includesBookKeeperGcPolicyInCompatibilityDigest() {
+        NereusKafkaStorageConfig safe = configuration(
+                NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY,
+                "s3");
+        NereusKafkaStorageConfig tuned = configuration(
+                NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY,
+                "s3",
+                Optional.of(bookKeeper(new NereusKafkaBookKeeperConfig.LedgerGc(
+                        2,
+                        Duration.ofSeconds(30),
+                        Duration.ofMinutes(5),
+                        Duration.ofDays(7),
+                        false,
+                        true))));
+
+        assertFalse(Arrays.equals(
+                map(safe).capability().initialRecord(1).configCompatibilitySha256(),
+                map(tuned).capability().initialRecord(1).configCompatibilitySha256()));
+    }
+
+    @Test
     void mapsExactBookKeeperWalOnlyRuntimeWithoutProviderIo() {
         NereusKafkaStorageConfig config = configuration(
                 NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY,
@@ -195,6 +217,10 @@ class NereusKafkaRuntimeConfigurationMapperTest {
         assertEquals(
                 "11".repeat(32),
                 mapped.runtime().bookKeeper().orElseThrow().wal().providerScopeSha256());
+        assertFalse(
+                mapped.runtime().bookKeeper().orElseThrow().ledgerGc().enabled());
+        assertTrue(
+                mapped.runtime().bookKeeper().orElseThrow().ledgerGc().dryRun());
         assertEquals(
                 StorageProfile.BOOKKEEPER_WAL_ONLY.name(),
                 mapped.capability().defaultStorageProfile());
@@ -307,6 +333,19 @@ class NereusKafkaRuntimeConfigurationMapperTest {
             NereusKafkaStorageConfig.Profile profile,
             String provider
     ) {
+        return configuration(
+                profile,
+                provider,
+                profile.usesBookKeeper()
+                        ? Optional.of(bookKeeper())
+                        : Optional.empty());
+    }
+
+    private static NereusKafkaStorageConfig configuration(
+            NereusKafkaStorageConfig.Profile profile,
+            String provider,
+            Optional<NereusKafkaBookKeeperConfig> bookKeeper
+    ) {
         return new NereusKafkaStorageConfig(
                 true,
                 new NereusKafkaStorageConfig.Core(
@@ -372,12 +411,16 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                         Duration.ofSeconds(30),
                         Duration.ofMinutes(2),
                         Duration.ofMinutes(1)),
-                profile.usesBookKeeper()
-                        ? Optional.of(bookKeeper())
-                        : Optional.empty());
+                bookKeeper);
     }
 
     private static NereusKafkaBookKeeperConfig bookKeeper() {
+        return bookKeeper(NereusKafkaBookKeeperConfig.LedgerGc.safeDefault());
+    }
+
+    private static NereusKafkaBookKeeperConfig bookKeeper(
+            NereusKafkaBookKeeperConfig.LedgerGc ledgerGc
+    ) {
         return new NereusKafkaBookKeeperConfig(
                 "kafka-deployment-a",
                 "nereus-a",
@@ -411,6 +454,7 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                 256,
                 1,
                 "55".repeat(32),
-                1);
+                1,
+                ledgerGc);
     }
 }

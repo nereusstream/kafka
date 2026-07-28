@@ -38,7 +38,7 @@ class NereusKafkaStorageConfigTest {
         NereusKafkaStorageConfig config = parse(Map.of());
 
         assertFalse(config.enabled());
-        assertEquals(91, NereusKafkaConfigs.CONFIG_DEF.names().size());
+        assertEquals(97, NereusKafkaConfigs.CONFIG_DEF.names().size());
         assertTrue(AbstractKafkaConfig.CONFIG_DEF.names().containsAll(NereusKafkaConfigs.CONFIG_DEF.names()));
         assertEquals(
                 NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT,
@@ -47,6 +47,7 @@ class NereusKafkaStorageConfigTest {
         assertEquals(Duration.ofMinutes(15), config.lifecycle().recoveryTimeout());
         assertTrue(config.core().cacheDir().isEmpty());
         assertTrue(config.retentionCompaction().compactionSpillDir().isEmpty());
+        assertTrue(config.bookKeeper().isEmpty());
     }
 
     @Test
@@ -64,6 +65,8 @@ class NereusKafkaStorageConfigTest {
         assertEquals(
                 cacheDir.resolve("spill"),
                 config.retentionCompaction().compactionSpillDir().orElseThrow());
+        assertFalse(config.bookKeeper().orElseThrow().ledgerGc().enabled());
+        assertTrue(config.bookKeeper().orElseThrow().ledgerGc().dryRun());
     }
 
     @Test
@@ -116,6 +119,20 @@ class NereusKafkaStorageConfigTest {
         shutdown.put(NereusKafkaConfigs.SHUTDOWN_DRAIN_TIMEOUT_MS_CONFIG, 10_000L);
         shutdown.put(NereusKafkaConfigs.SHUTDOWN_CHECKPOINT_TIMEOUT_MS_CONFIG, 20_000L);
         assertConfigFailure(shutdown, NereusKafkaConfigs.SHUTDOWN_CHECKPOINT_TIMEOUT_MS_CONFIG);
+
+        Map<String, Object> disabledMutation = enabledProperties();
+        disabledMutation.put(NereusKafkaConfigs.BOOKKEEPER_GC_DRY_RUN_CONFIG, false);
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> parse(disabledMutation));
+
+        Map<String, Object> shortDrain = enabledProperties();
+        shortDrain.put(NereusKafkaConfigs.BOOKKEEPER_GC_ENABLED_CONFIG, true);
+        shortDrain.put(NereusKafkaConfigs.BOOKKEEPER_GC_DRY_RUN_CONFIG, false);
+        shortDrain.put(NereusKafkaConfigs.BOOKKEEPER_GC_DRAIN_GRACE_MS_CONFIG, 120_000L);
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> parse(shortDrain));
     }
 
     @Test

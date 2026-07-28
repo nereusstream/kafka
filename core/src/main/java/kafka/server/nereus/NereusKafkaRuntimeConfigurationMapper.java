@@ -30,6 +30,7 @@ import com.nereusstream.api.ReadIsolation;
 import com.nereusstream.api.ReadOptions;
 import com.nereusstream.api.StorageProfile;
 import com.nereusstream.bookkeeper.BookKeeperDigestType;
+import com.nereusstream.bookkeeper.BookKeeperLedgerGcConfiguration;
 import com.nereusstream.bookkeeper.BookKeeperSecretRef;
 import com.nereusstream.bookkeeper.BookKeeperWalConfiguration;
 import com.nereusstream.core.StreamStorageConfig;
@@ -66,7 +67,7 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Closed, deterministic mapping from the stock-owned 91-key snapshot to the executable Nereus provider graph.
+ * Closed, deterministic mapping from the stock-owned 97-key snapshot to the executable Nereus provider graph.
  *
  * <p>The mapper performs no provider, filesystem, network or scheduler I/O. Unsupported profiles/providers fail before
  * an owned resource is created.
@@ -516,6 +517,12 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 output.writeLong(configured.readinessEpoch());
                 writeText(output, configured.readinessSha256());
                 output.writeInt(configured.persistentBrokerCount());
+                output.writeInt(configured.ledgerGc().maxConcurrentDeletes());
+                output.writeLong(configured.ledgerGc().maxClockSkew().toMillis());
+                output.writeLong(configured.ledgerGc().drainGrace().toMillis());
+                output.writeLong(configured.ledgerGc().lateCreateAuditGrace().toMillis());
+                output.writeBoolean(configured.ledgerGc().enabled());
+                output.writeBoolean(configured.ledgerGc().dryRun());
             }
         });
     }
@@ -615,8 +622,17 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 exact.readerLeaseRenewInterval(),
                 exact.retentionScanInterval(),
                 exact.retentionPageSize());
+        NereusKafkaBookKeeperConfig.LedgerGc ledgerGc = exact.ledgerGc();
         return Optional.of(new NereusKafkaBookKeeperWalRuntimeConfiguration(
-                exact.deploymentId(), wal));
+                exact.deploymentId(),
+                wal,
+                new BookKeeperLedgerGcConfiguration(
+                        ledgerGc.maxConcurrentDeletes(),
+                        ledgerGc.maxClockSkew(),
+                        ledgerGc.drainGrace(),
+                        ledgerGc.lateCreateAuditGrace(),
+                        ledgerGc.enabled(),
+                        ledgerGc.dryRun())));
     }
 
     private static Set<StorageProfile> executableProfiles(

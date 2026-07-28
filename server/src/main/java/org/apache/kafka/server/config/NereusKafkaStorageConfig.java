@@ -361,7 +361,27 @@ public record NereusKafkaStorageConfig(
                         config,
                         NereusKafkaConfigs.BOOKKEEPER_READINESS_SHA256_CONFIG),
                 config.getInt(
-                        NereusKafkaConfigs.BOOKKEEPER_PERSISTENT_BROKER_COUNT_CONFIG));
+                        NereusKafkaConfigs.BOOKKEEPER_PERSISTENT_BROKER_COUNT_CONFIG),
+                new NereusKafkaBookKeeperConfig.LedgerGc(
+                        config.getInt(
+                                NereusKafkaConfigs
+                                        .BOOKKEEPER_GC_MAX_CONCURRENT_DELETES_CONFIG),
+                        duration(
+                                config,
+                                NereusKafkaConfigs
+                                        .BOOKKEEPER_GC_MAX_CLOCK_SKEW_MS_CONFIG),
+                        duration(
+                                config,
+                                NereusKafkaConfigs
+                                        .BOOKKEEPER_GC_DRAIN_GRACE_MS_CONFIG),
+                        duration(
+                                config,
+                                NereusKafkaConfigs
+                                        .BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_CONFIG),
+                        config.getBoolean(
+                                NereusKafkaConfigs.BOOKKEEPER_GC_ENABLED_CONFIG),
+                        config.getBoolean(
+                                NereusKafkaConfigs.BOOKKEEPER_GC_DRY_RUN_CONFIG)));
     }
 
     private static long requiredLong(AbstractConfig config, String name) {

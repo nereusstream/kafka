@@ -145,6 +145,25 @@ public final class NereusKafkaConfigs {
     public static final String BOOKKEEPER_RETENTION_PAGE_SIZE_CONFIG =
             "nereus.kafka.storage.bookkeeper.retention.page.size";
     public static final int BOOKKEEPER_RETENTION_PAGE_SIZE_DEFAULT = 256;
+    public static final String BOOKKEEPER_GC_ENABLED_CONFIG =
+            "nereus.kafka.storage.bookkeeper.gc.enabled";
+    public static final boolean BOOKKEEPER_GC_ENABLED_DEFAULT = false;
+    public static final String BOOKKEEPER_GC_DRY_RUN_CONFIG =
+            "nereus.kafka.storage.bookkeeper.gc.dry.run";
+    public static final boolean BOOKKEEPER_GC_DRY_RUN_DEFAULT = true;
+    public static final String BOOKKEEPER_GC_MAX_CONCURRENT_DELETES_CONFIG =
+            "nereus.kafka.storage.bookkeeper.gc.max.concurrent.deletes";
+    public static final int BOOKKEEPER_GC_MAX_CONCURRENT_DELETES_DEFAULT = 1;
+    public static final String BOOKKEEPER_GC_MAX_CLOCK_SKEW_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.gc.max.clock.skew.ms";
+    public static final long BOOKKEEPER_GC_MAX_CLOCK_SKEW_MS_DEFAULT = 30_000L;
+    public static final String BOOKKEEPER_GC_DRAIN_GRACE_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.gc.drain.grace.ms";
+    public static final long BOOKKEEPER_GC_DRAIN_GRACE_MS_DEFAULT = 300_000L;
+    public static final String BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.gc.late.create.audit.grace.ms";
+    public static final long BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_DEFAULT =
+            7L * 24L * 60L * 60L * 1_000L;
     public static final String BOOKKEEPER_READINESS_EPOCH_CONFIG =
             "nereus.kafka.storage.bookkeeper.readiness.epoch";
     public static final long BOOKKEEPER_READINESS_EPOCH_DEFAULT = 1L;
@@ -405,6 +424,24 @@ public final class NereusKafkaConfigs {
             .define(BOOKKEEPER_RETENTION_PAGE_SIZE_CONFIG, INT,
                     BOOKKEEPER_RETENTION_PAGE_SIZE_DEFAULT, between(1, 1_024), MEDIUM,
                     "BookKeeper retention metadata page size.")
+            .define(BOOKKEEPER_GC_ENABLED_CONFIG, BOOLEAN,
+                    BOOKKEEPER_GC_ENABLED_DEFAULT, HIGH,
+                    "Enable authority-gated whole-ledger BookKeeper collection.")
+            .define(BOOKKEEPER_GC_DRY_RUN_CONFIG, BOOLEAN,
+                    BOOKKEEPER_GC_DRY_RUN_DEFAULT, HIGH,
+                    "Keep BookKeeper ledger collection in non-mutating dry-run mode.")
+            .define(BOOKKEEPER_GC_MAX_CONCURRENT_DELETES_CONFIG, INT,
+                    BOOKKEEPER_GC_MAX_CONCURRENT_DELETES_DEFAULT, between(1, 64), MEDIUM,
+                    "Maximum concurrent BookKeeper provider deletes.")
+            .define(BOOKKEEPER_GC_MAX_CLOCK_SKEW_MS_CONFIG, LONG,
+                    BOOKKEEPER_GC_MAX_CLOCK_SKEW_MS_DEFAULT, between(0L, 300_000L), MEDIUM,
+                    "Maximum clock skew admitted by BookKeeper ledger GC.")
+            .define(BOOKKEEPER_GC_DRAIN_GRACE_MS_CONFIG, LONG,
+                    BOOKKEEPER_GC_DRAIN_GRACE_MS_DEFAULT, atLeast(1_000L), MEDIUM,
+                    "Drain grace before a marked BookKeeper ledger can be deleted.")
+            .define(BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_CONFIG, LONG,
+                    BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_DEFAULT, atLeast(1_000L), MEDIUM,
+                    "Audit separation between two provider-absence observations.")
             .define(BOOKKEEPER_READINESS_EPOCH_CONFIG, LONG,
                     BOOKKEEPER_READINESS_EPOCH_DEFAULT, atLeast(1L), HIGH,
                     "Exact pre-provisioned BookKeeper broker-readiness epoch.")

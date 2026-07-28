@@ -55,7 +55,8 @@ public record NereusKafkaBookKeeperConfig(
         int retentionPageSize,
         long readinessEpoch,
         String readinessSha256,
-        int persistentBrokerCount
+        int persistentBrokerCount,
+        LedgerGc ledgerGc
 ) {
     public NereusKafkaBookKeeperConfig {
         deploymentId = nonblank(deploymentId, "deploymentId");
@@ -77,6 +78,7 @@ public record NereusKafkaBookKeeperConfig(
         Objects.requireNonNull(readerLeaseTtl, "readerLeaseTtl");
         Objects.requireNonNull(readerLeaseRenewInterval, "readerLeaseRenewInterval");
         Objects.requireNonNull(retentionScanInterval, "retentionScanInterval");
+        ledgerGc = Objects.requireNonNull(ledgerGc, "ledgerGc");
         readinessSha256 = sha256(readinessSha256, "readinessSha256");
         if (ledgerIdPrefixBits < 8 || ledgerIdPrefixBits > 24) {
             throw new IllegalArgumentException("ledgerIdPrefixBits must be in [8,24]");
@@ -104,6 +106,66 @@ public record NereusKafkaBookKeeperConfig(
         if ((long) persistentBrokerCount + 1L > maxReaderLeasesPerLedger) {
             throw new IllegalArgumentException(
                     "BookKeeper reader leases cannot cover the broker set plus restart overlap");
+        }
+        ledgerGc.validateAgainst(readerLeaseTtl);
+    }
+
+    /** Local rollout controls; durable metadata and activation remain the deletion authority. */
+    public record LedgerGc(
+            int maxConcurrentDeletes,
+            Duration maxClockSkew,
+            Duration drainGrace,
+            Duration lateCreateAuditGrace,
+            boolean enabled,
+            boolean dryRun
+    ) {
+        public LedgerGc {
+            if (maxConcurrentDeletes <= 0) {
+                throw new IllegalArgumentException(
+                        "BookKeeper GC maxConcurrentDeletes must be positive");
+            }
+            maxClockSkew = nonNegative(maxClockSkew, "maxClockSkew");
+            drainGrace = positive(drainGrace, "drainGrace");
+            lateCreateAuditGrace = positive(
+                    lateCreateAuditGrace,
+                    "lateCreateAuditGrace");
+            if (!enabled && !dryRun) {
+                throw new IllegalArgumentException(
+                        "disabled BookKeeper GC must remain dry-run");
+            }
+        }
+
+        public static LedgerGc safeDefault() {
+            return new LedgerGc(
+                    1,
+                    Duration.ofSeconds(30),
+                    Duration.ofMinutes(5),
+                    Duration.ofDays(7),
+                    false,
+                    true);
+        }
+
+        private void validateAgainst(Duration readerLeaseTtl) {
+            if (drainGrace.compareTo(readerLeaseTtl.plus(maxClockSkew)) < 0) {
+                throw new IllegalArgumentException(
+                        "BookKeeper GC drain grace must cover reader lease TTL plus clock skew");
+            }
+        }
+
+        private static Duration positive(Duration value, String name) {
+            Duration exact = Objects.requireNonNull(value, name);
+            if (exact.isZero() || exact.isNegative()) {
+                throw new IllegalArgumentException(name + " must be positive");
+            }
+            return exact;
+        }
+
+        private static Duration nonNegative(Duration value, String name) {
+            Duration exact = Objects.requireNonNull(value, name);
+            if (exact.isNegative()) {
+                throw new IllegalArgumentException(name + " must be non-negative");
+            }
+            return exact;
         }
     }
 
