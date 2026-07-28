@@ -223,7 +223,9 @@ class ControllerServer(
         startupDeadline, time)
       val controllerNodes = QuorumConfig.voterConnectionsToNodes(voterConnections)
       val quorumFeatures = new QuorumFeatures(config.nodeId,
-        QuorumFeatures.defaultSupportedFeatureMap(config.unstableFeatureVersionsEnabled),
+        QuorumFeatures.defaultSupportedFeatureMap(
+          config.unstableFeatureVersionsEnabled,
+          config.nereusKafkaStorageConfig.enabled()),
         controllerNodes.asScala.map(node => Integer.valueOf(node.id())).asJava)
 
       val delegationTokenManagerConfigs = new DelegationTokenManagerConfigs(config)
@@ -325,7 +327,9 @@ class ControllerServer(
         clusterId,
         time,
         s"controller-${config.nodeId}-",
-        QuorumFeatures.defaultSupportedFeatureMap(config.unstableFeatureVersionsEnabled),
+        QuorumFeatures.defaultSupportedFeatureMap(
+          config.unstableFeatureVersionsEnabled,
+          config.nereusKafkaStorageConfig.enabled()),
         incarnationId,
         listenerInfo)
 

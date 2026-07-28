@@ -56,6 +56,7 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
     private boolean started;
     private boolean closed;
     private boolean localController;
+    private boolean featureEnabled;
     private boolean pending;
     private boolean terminalFailure;
     private int controllerEpoch = -1;
@@ -125,7 +126,7 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
             executor = createdExecutor;
             activation = createdActivation;
             started = true;
-            if (localController) {
+            if (localController && featureEnabled) {
                 requestAttempt(Duration.ZERO);
             }
             return CompletableFuture.completedFuture(null);
@@ -154,7 +155,7 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
             controllerEpoch = exact.epoch();
             terminalFailure = false;
         }
-        if (started) {
+        if (started && featureEnabled) {
             requestAttempt(Duration.ZERO);
         }
     }
@@ -168,6 +169,12 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
         Objects.requireNonNull(delta, "delta");
         Objects.requireNonNull(newImage, "newImage");
         Objects.requireNonNull(manifest, "manifest");
+        featureEnabled = newImage.features().isNereusStorageEnabled();
+        if (!featureEnabled) {
+            pending = false;
+            cancelScheduled();
+            return;
+        }
         if (started && localController) {
             requestAttempt(Duration.ZERO);
         }
@@ -177,6 +184,7 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
         if (closed
                 || !started
                 || !localController
+                || !featureEnabled
                 || terminalFailure) {
             return;
         }
@@ -197,6 +205,7 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
             if (closed
                     || !started
                     || !localController
+                    || !featureEnabled
                     || terminalFailure) {
                 return;
             }
@@ -246,7 +255,7 @@ final class NereusControllerStorageRuntime implements ControllerStorageRuntime {
                 }
                 inFlight = null;
             }
-            if (closed || !started || !localController) {
+            if (closed || !started || !localController || !featureEnabled) {
                 return;
             }
             if (failure == null) {

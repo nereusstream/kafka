@@ -48,6 +48,7 @@ public enum Feature {
     ELIGIBLE_LEADER_REPLICAS_VERSION(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.values(), EligibleLeaderReplicasVersion.LATEST_PRODUCTION),
     SHARE_VERSION(ShareVersion.FEATURE_NAME, ShareVersion.values(), ShareVersion.LATEST_PRODUCTION),
     STREAMS_VERSION(StreamsVersion.FEATURE_NAME, StreamsVersion.values(), StreamsVersion.LATEST_PRODUCTION),
+    NEREUS_STORAGE_VERSION(NereusStorageVersion.FEATURE_NAME, NereusStorageVersion.values(), NereusStorageVersion.LATEST_PRODUCTION),
 
     /**
      * Features defined only for unit tests and are not used in production.
@@ -68,6 +69,12 @@ public enum Feature {
     public static final List<Feature> TEST_AND_PRODUCTION_FEATURES;
 
     public static final List<Feature> PRODUCTION_FEATURES;
+
+    /**
+     * Production-ready features that require an explicit product-mode opt-in and must not be
+     * bootstrapped or advertised by stock Kafka defaults.
+     */
+    public static final List<Feature> EXPLICIT_PRODUCTION_FEATURES;
 
     public static final List<String> PRODUCTION_FEATURE_NAMES;
     private final String name;
@@ -91,18 +98,24 @@ public enum Feature {
         FEATURES = Arrays.copyOf(enumValues, enumValues.length);
 
         TEST_AND_PRODUCTION_FEATURES = Arrays.stream(FEATURES).filter(feature ->
+            !feature.name.equals(NEREUS_STORAGE_VERSION.featureName()) &&
             !feature.name.startsWith("unit." + TestFeatureVersion.FEATURE_NAME)
         ).toList();
 
         PRODUCTION_FEATURES = Arrays.stream(FEATURES).filter(feature ->
             !feature.name.equals(TEST_VERSION.featureName()) &&
+            !feature.name.equals(NEREUS_STORAGE_VERSION.featureName()) &&
             !feature.name.startsWith("unit." + TestFeatureVersion.FEATURE_NAME)
         ).toList();
+        EXPLICIT_PRODUCTION_FEATURES = List.of(NEREUS_STORAGE_VERSION);
         PRODUCTION_FEATURE_NAMES = PRODUCTION_FEATURES.stream().map(feature ->
                 feature.name).toList();
 
         validateDefaultValueAndLatestProductionValue(TEST_VERSION);
         for (Feature feature : PRODUCTION_FEATURES) {
+            validateDefaultValueAndLatestProductionValue(feature);
+        }
+        for (Feature feature : EXPLICIT_PRODUCTION_FEATURES) {
             validateDefaultValueAndLatestProductionValue(feature);
         }
     }

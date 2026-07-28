@@ -36,19 +36,21 @@ private[server] object NereusKafkaConfigValidator {
   def validate(config: KafkaConfig, storage: NereusKafkaStorageConfig): Unit = {
     if (!storage.enabled()) return
 
-    requireBrokerRole(config)
-    requireSingleReplicaSemantics(config)
-    requireConflictingStorageDisabled(config)
-    requireRequestLimits(config, storage)
+    requireKRaftRole(config)
+    if (config.processRoles.contains(ProcessRole.BrokerRole)) {
+      requireSingleReplicaSemantics(config)
+      requireConflictingStorageDisabled(config)
+      requireRequestLimits(config, storage)
+    }
     requireDedicatedDirectories(config, storage)
   }
 
-  private def requireBrokerRole(config: KafkaConfig): Unit = {
+  private def requireKRaftRole(config: KafkaConfig): Unit = {
     requireCondition(
-      config.processRoles.contains(ProcessRole.BrokerRole),
+      config.processRoles.nonEmpty,
       NereusKafkaConfigs.ENABLED_CONFIG,
       true,
-      "requires the broker process role")
+      "requires a KRaft broker or controller process role")
   }
 
   private def requireSingleReplicaSemantics(config: KafkaConfig): Unit = {

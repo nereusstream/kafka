@@ -20,6 +20,7 @@ package org.apache.kafka.controller;
 import org.apache.kafka.metadata.VersionRange;
 import org.apache.kafka.server.common.Feature;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -88,6 +89,18 @@ public class QuorumFeaturesTest {
         for (VersionRange range : quorumFeatures.values()) {
             assertNotEquals(0, range.max());
         }
+    }
+
+    @Test
+    public void testNereusStorageSupportIsAdvertisedOnlyWhenEnabled() {
+        assertFalse(QuorumFeatures.defaultSupportedFeatureMap(false).
+            containsKey(NereusStorageVersion.FEATURE_NAME));
+        assertEquals(
+            VersionRange.of(
+                NereusStorageVersion.NSV_0.featureLevel(),
+                NereusStorageVersion.NSV_1.featureLevel()),
+            QuorumFeatures.defaultSupportedFeatureMap(false, true).
+                get(NereusStorageVersion.FEATURE_NAME));
     }
 
     @Test

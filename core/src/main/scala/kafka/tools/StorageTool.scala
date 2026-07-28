@@ -27,7 +27,7 @@ import net.sourceforge.argparse4j.inf.{ArgumentParserException, Namespace, Subpa
 import net.sourceforge.argparse4j.internal.HelpScreenException
 import org.apache.kafka.common.Uuid
 import org.apache.kafka.common.utils.{Exit, Utils}
-import org.apache.kafka.server.common.{Feature, MetadataVersion}
+import org.apache.kafka.server.common.{Feature, MetadataVersion, NereusStorageVersion}
 import org.apache.kafka.metadata.properties.{MetaProperties, MetaPropertiesEnsemble, MetaPropertiesVersion, PropertiesUtils}
 import org.apache.kafka.metadata.storage.{Formatter, FormatterException}
 import org.apache.kafka.raft.{DynamicVoters, QuorumConfig}
@@ -138,10 +138,22 @@ object StorageTool extends Logging {
       }
     })
 
-    Option(namespace.getList[String]("feature")).foreach(
-      featureNamesAndLevels(_).foreachEntry {
-        (k, v) => formatter.setFeatureLevel(k, v)
-      })
+    val configuredFeatureLevels = Option(namespace.getList[String]("feature")).
+      map(featureNamesAndLevels).
+      getOrElse(Map.empty)
+    if (configuredFeatureLevels.contains(NereusStorageVersion.FEATURE_NAME)) {
+      if (!config.nereusKafkaStorageConfig.enabled()) {
+        throw new TerseFailure(
+          s"${NereusStorageVersion.FEATURE_NAME} may only be formatted when " +
+            s"${org.apache.kafka.server.config.NereusKafkaConfigs.ENABLED_CONFIG}=true")
+      }
+      val supportedFeatures = new util.ArrayList[Feature](Feature.PRODUCTION_FEATURES)
+      supportedFeatures.add(Feature.NEREUS_STORAGE_VERSION)
+      formatter.setSupportedFeatures(supportedFeatures)
+    }
+    configuredFeatureLevels.foreachEntry {
+      (k, v) => formatter.setFeatureLevel(k, v)
+    }
     val initialControllers = namespace.getString("initial_controllers")
     val isStandalone = namespace.getBoolean("standalone")
     val staticVotersEmpty = config.quorumConfig.voters().isEmpty

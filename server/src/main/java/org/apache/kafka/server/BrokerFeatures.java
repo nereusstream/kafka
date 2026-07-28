@@ -21,6 +21,7 @@ import org.apache.kafka.common.feature.SupportedVersionRange;
 import org.apache.kafka.metadata.VersionRange;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,7 +48,16 @@ public class BrokerFeatures {
     }
 
     public static BrokerFeatures createDefault(boolean unstableFeatureVersionsEnabled) {
-        return new BrokerFeatures(defaultSupportedFeatures(unstableFeatureVersionsEnabled));
+        return createDefault(unstableFeatureVersionsEnabled, false);
+    }
+
+    public static BrokerFeatures createDefault(
+        boolean unstableFeatureVersionsEnabled,
+        boolean nereusStorageEnabled
+    ) {
+        return new BrokerFeatures(defaultSupportedFeatures(
+            unstableFeatureVersionsEnabled,
+            nereusStorageEnabled));
     }
     
     // only for testing
@@ -65,6 +75,13 @@ public class BrokerFeatures {
     }
 
     public static Features<SupportedVersionRange> defaultSupportedFeatures(boolean unstableFeatureVersionsEnabled) {
+        return defaultSupportedFeatures(unstableFeatureVersionsEnabled, false);
+    }
+
+    public static Features<SupportedVersionRange> defaultSupportedFeatures(
+        boolean unstableFeatureVersionsEnabled,
+        boolean nereusStorageEnabled
+    ) {
         Map<String, SupportedVersionRange> features = new HashMap<>();
         features.put(MetadataVersion.FEATURE_NAME,
                 new SupportedVersionRange(
@@ -77,6 +94,13 @@ public class BrokerFeatures {
                 features.put(feature.featureName(), new SupportedVersionRange(feature.minimumProduction(), (short) maxVersion));
             }
         });
+        if (nereusStorageEnabled) {
+            features.put(
+                NereusStorageVersion.FEATURE_NAME,
+                new SupportedVersionRange(
+                    NereusStorageVersion.NSV_0.featureLevel(),
+                    NereusStorageVersion.LATEST_PRODUCTION.featureLevel()));
+        }
         return Features.supportedFeatures(features);
     }
 

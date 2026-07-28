@@ -33,6 +33,7 @@ import org.apache.kafka.metadata.RecordTestUtils;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 import org.apache.kafka.server.config.ConfigSynonym;
 import org.apache.kafka.server.policy.AlterConfigPolicy;
 import org.apache.kafka.server.policy.AlterConfigPolicy.RequestMetadata;
@@ -517,6 +518,52 @@ public class ConfigurationControlManagerTest {
         } else {
             assertEquals(Errors.NONE, result.response().error());
         }
+    }
+
+    @Test
+    public void testRejectNonSingletonMinIsrWhenNereusStorageEnabled() {
+        FeatureControlManager featureManager =
+            new FeatureControlManager.Builder().
+                setQuorumFeatures(new QuorumFeatures(
+                    0,
+                    QuorumFeatures.defaultSupportedFeatureMap(true, true),
+                    List.of())).
+                build();
+        featureManager.replay(new FeatureLevelRecord().
+            setName(MetadataVersion.FEATURE_NAME).
+            setFeatureLevel(MetadataVersion.LATEST_PRODUCTION.featureLevel()));
+        featureManager.replay(new FeatureLevelRecord().
+            setName(NereusStorageVersion.FEATURE_NAME).
+            setFeatureLevel(NereusStorageVersion.NSV_1.featureLevel()));
+        ConfigurationControlManager manager =
+            new ConfigurationControlManager.Builder().
+                setFeatureControl(featureManager).
+                setKafkaConfigSchema(SCHEMA).
+                build();
+
+        ControllerResult<ApiError> invalid =
+            manager.incrementalAlterConfig(
+                MYTOPIC,
+                toMap(entry(
+                    TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG,
+                    entry(SET, "2"))),
+                true);
+        assertEquals(Errors.INVALID_CONFIG, invalid.response().error());
+        assertEquals(
+            TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG +
+                " must remain 1 while nereus.storage.version is enabled.",
+            invalid.response().message());
+        assertEquals(List.of(), invalid.records());
+
+        ControllerResult<ApiError> valid =
+            manager.incrementalAlterConfig(
+                MYTOPIC,
+                toMap(entry(
+                    TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG,
+                    entry(SET, "1"))),
+                true);
+        assertEquals(Errors.NONE, valid.response().error());
+        assertEquals(1, valid.records().size());
     }
 
     @ParameterizedTest

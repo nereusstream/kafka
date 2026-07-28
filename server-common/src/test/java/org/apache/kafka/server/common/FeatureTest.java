@@ -27,10 +27,25 @@ import static org.apache.kafka.server.common.Feature.validateDefaultValueAndLate
 import static org.apache.kafka.server.common.Feature.validateVersion;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class FeatureTest {
+    @Test
+    public void testNereusStorageFeatureRequiresExplicitOptIn() {
+        assertSame(
+            Feature.NEREUS_STORAGE_VERSION,
+            Feature.featureFromName(NereusStorageVersion.FEATURE_NAME));
+        assertFalse(Feature.PRODUCTION_FEATURES.contains(
+            Feature.NEREUS_STORAGE_VERSION));
+        assertTrue(Feature.EXPLICIT_PRODUCTION_FEATURES.contains(
+            Feature.NEREUS_STORAGE_VERSION));
+        assertFalse(Feature.PRODUCTION_FEATURE_NAMES.contains(
+            NereusStorageVersion.FEATURE_NAME));
+    }
+
     @ParameterizedTest
     @EnumSource(value = Feature.class, names = {
         "UNIT_TEST_VERSION_0",

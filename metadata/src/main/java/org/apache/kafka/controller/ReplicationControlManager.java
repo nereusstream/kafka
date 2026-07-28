@@ -710,6 +710,17 @@ public class ReplicationControlManager {
                                  List<ApiMessageAndVersion> configRecords,
                                  boolean authorizedToReturnConfigs) {
         Map<String, String> creationConfigs = translateCreationConfigs(topic.configs());
+        if (featureControl.isNereusStorageFeatureEnabled()) {
+            ConfigEntry minIsr = configurationControl.
+                computeEffectiveTopicConfigs(creationConfigs).
+                get(MIN_IN_SYNC_REPLICAS_CONFIG);
+            if (minIsr == null || !"1".equals(minIsr.value())) {
+                return new ApiError(
+                    Errors.INVALID_CONFIG,
+                    MIN_IN_SYNC_REPLICAS_CONFIG +
+                        " must resolve to 1 when nereus.storage.version is enabled.");
+            }
+        }
         Map<Integer, PartitionRegistration> newParts = new HashMap<>();
         if (!topic.assignments().isEmpty()) {
             if (topic.replicationFactor() != -1) {
@@ -724,6 +735,13 @@ public class ReplicationControlManager {
             }
             OptionalInt replicationFactor = OptionalInt.empty();
             for (CreatableReplicaAssignment assignment : topic.assignments()) {
+                if (featureControl.isNereusStorageFeatureEnabled() &&
+                        assignment.brokerIds().size() != 1) {
+                    return new ApiError(
+                        Errors.INVALID_REPLICA_ASSIGNMENT,
+                        "Manual partition assignments must contain exactly one broker " +
+                            "when nereus.storage.version is enabled.");
+                }
                 if (newParts.containsKey(assignment.partitionIndex())) {
                     return new ApiError(Errors.INVALID_REPLICA_ASSIGNMENT,
                         "Found multiple manual partition assignments for partition " +
@@ -768,6 +786,13 @@ public class ReplicationControlManager {
                 defaultNumPartitions : topic.numPartitions();
             short replicationFactor = topic.replicationFactor() == -1 ?
                 defaultReplicationFactor : topic.replicationFactor();
+            if (featureControl.isNereusStorageFeatureEnabled() &&
+                    replicationFactor != 1) {
+                return new ApiError(
+                    Errors.INVALID_REPLICATION_FACTOR,
+                    "Replication factor must resolve to 1 when " +
+                        "nereus.storage.version is enabled.");
+            }
             try {
                 TopicAssignment topicAssignment = clusterControl.replicaPlacer().place(new PlacementSpec(
                     0,
@@ -1287,6 +1312,15 @@ public class ReplicationControlManager {
 
         int[] newIsr = partitionData.newIsrWithEpochs().stream()
             .mapToInt(BrokerState::brokerId).toArray();
+
+        if (featureControl.isNereusStorageFeatureEnabled() &&
+                (newIsr.length != 1 || newIsr[0] != partition.leader)) {
+            log.error("Rejecting AlterPartition request from node {} for {}-{} because " +
+                    "nereus.storage.version requires the ISR to be exactly [{}], but got {}.",
+                brokerId, topic.name, partitionId, partition.leader,
+                partitionData.newIsrWithEpochs());
+            return INVALID_REQUEST;
+        }
 
         if (!Replicas.validateIsr(partition.replicas, newIsr)) {
             log.error("Rejecting AlterPartition request from node {} for {}-{} because " +
@@ -1878,6 +1912,12 @@ public class ReplicationControlManager {
                 Short.MAX_VALUE);
         }
         short replicationFactor = (short) partitionInfo.replicas.length;
+        if (featureControl.isNereusStorageFeatureEnabled() &&
+                replicationFactor != 1) {
+            throw new InvalidReplicationFactorException(
+                "Existing topic replication factor must be 1 when " +
+                    "nereus.storage.version is enabled.");
+        }
         int startPartitionId = topicInfo.parts.size();
 
         List<PartitionAssignment> partitionAssignments;
@@ -1887,6 +1927,12 @@ public class ReplicationControlManager {
             isrs = new ArrayList<>();
             for (int i = 0; i < topic.assignments().size(); i++) {
                 List<Integer> replicas = topic.assignments().get(i).brokerIds();
+                if (featureControl.isNereusStorageFeatureEnabled() &&
+                        replicas.size() != 1) {
+                    throw new InvalidReplicaAssignmentException(
+                        "New partition assignments must contain exactly one broker " +
+                            "when nereus.storage.version is enabled.");
+                }
                 PartitionAssignment partitionAssignment = new PartitionAssignment(replicas, clusterDescriber);
                 validateManualPartitionAssignment(partitionAssignment, OptionalInt.of(replicationFactor));
                 partitionAssignments.add(partitionAssignment);
@@ -2117,6 +2163,12 @@ public class ReplicationControlManager {
         if (target.replicas() == null) {
             record = cancelPartitionReassignment(topicName, tp, part);
         } else {
+            if (featureControl.isNereusStorageFeatureEnabled() &&
+                    target.replicas().size() != 1) {
+                throw new InvalidReplicaAssignmentException(
+                    "Partition reassignment targets must contain exactly one broker " +
+                        "when nereus.storage.version is enabled.");
+            }
             record = changePartitionReassignment(tp, part, target, allowRFChange);
         }
         record.ifPresent(records::add);
@@ -2247,14 +2299,41 @@ public class ReplicationControlManager {
     }
 
     ControllerResult<AssignReplicasToDirsResponseData> handleAssignReplicasToDirs(AssignReplicasToDirsRequestData request) {
-        if (!featureControl.metadataVersionOrThrow().isDirectoryAssignmentSupported()) {
-            throw new UnsupportedVersionException("Directory assignment is not supported yet.");
+        boolean nereusStorageEnabled =
+            featureControl.isNereusStorageFeatureEnabled();
+        if (!nereusStorageEnabled &&
+                !featureControl.metadataVersionOrThrow().
+                    isDirectoryAssignmentSupported()) {
+            throw new UnsupportedVersionException(
+                "Directory assignment is not supported yet.");
         }
         int brokerId = request.brokerId();
         clusterControl.checkBrokerEpoch(brokerId, request.brokerEpoch());
         BrokerRegistration brokerRegistration = clusterControl.brokerRegistrations().get(brokerId);
         if (brokerRegistration == null) {
             throw new BrokerIdNotRegisteredException("Broker ID " + brokerId + " is not currently registered");
+        }
+        if (nereusStorageEnabled) {
+            AssignReplicasToDirsResponseData response = new AssignReplicasToDirsResponseData();
+            for (AssignReplicasToDirsRequestData.DirectoryData reqDir : request.directories()) {
+                AssignReplicasToDirsResponseData.DirectoryData resDir =
+                    new AssignReplicasToDirsResponseData.DirectoryData().setId(reqDir.id());
+                for (AssignReplicasToDirsRequestData.TopicData reqTopic : reqDir.topics()) {
+                    AssignReplicasToDirsResponseData.TopicData resTopic =
+                        new AssignReplicasToDirsResponseData.TopicData().
+                            setTopicId(reqTopic.topicId());
+                    for (AssignReplicasToDirsRequestData.PartitionData reqPartition :
+                            reqTopic.partitions()) {
+                        resTopic.partitions().add(
+                            new AssignReplicasToDirsResponseData.PartitionData().
+                                setPartitionIndex(reqPartition.partitionIndex()).
+                                setErrorCode(Errors.UNSUPPORTED_VERSION.code()));
+                    }
+                    resDir.topics().add(resTopic);
+                }
+                response.directories().add(resDir);
+            }
+            return ControllerResult.atomicOf(List.of(), response);
         }
         List<ApiMessageAndVersion> records = new ArrayList<>();
         AssignReplicasToDirsResponseData response = new AssignReplicasToDirsResponseData();

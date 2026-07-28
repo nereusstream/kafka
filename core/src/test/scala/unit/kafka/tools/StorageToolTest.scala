@@ -27,13 +27,13 @@ import kafka.utils.TestUtils
 import net.sourceforge.argparse4j.inf.ArgumentParserException
 import org.apache.kafka.common.metadata.UserScramCredentialRecord
 import org.apache.kafka.common.utils.Utils
-import org.apache.kafka.server.common.{Feature, MetadataVersion}
+import org.apache.kafka.server.common.{Feature, MetadataVersion, NereusStorageVersion}
 import org.apache.kafka.metadata.bootstrap.BootstrapDirectory
 import org.apache.kafka.metadata.properties.{MetaPropertiesEnsemble, PropertiesUtils}
 import org.apache.kafka.metadata.storage.FormatterException
 import org.apache.kafka.network.SocketServerConfigs
 import org.apache.kafka.raft.{KRaftConfigs, MetadataLogConfig, QuorumConfig}
-import org.apache.kafka.server.config.{ServerConfigs, ServerLogConfigs}
+import org.apache.kafka.server.config.{NereusKafkaConfigs, ServerConfigs, ServerLogConfigs}
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
 import org.junit.jupiter.api.{Test, Timeout}
 import org.junit.jupiter.params.ParameterizedTest
@@ -184,6 +184,30 @@ Found problem:
   defaultDynamicQuorumProperties.setProperty("advertised.listeners", "CONTROLLER://127.0.0.1:9093")
   defaultDynamicQuorumProperties.setProperty(ServerConfigs.UNSTABLE_API_VERSIONS_ENABLE_CONFIG, "true")
   defaultDynamicQuorumProperties.setProperty(ServerConfigs.UNSTABLE_FEATURE_VERSIONS_ENABLE_CONFIG , "true")
+
+  private def nereusControllerProperties(logDir: String): Properties = {
+    val properties = new Properties()
+    properties.setProperty("process.roles", "controller")
+    properties.setProperty("node.id", "0")
+    properties.setProperty("controller.listener.names", "CONTROLLER")
+    properties.setProperty("controller.quorum.voters", "0@localhost:9093")
+    properties.setProperty("listeners", "CONTROLLER://:9093")
+    properties.setProperty("log.dirs", logDir)
+    properties.setProperty(NereusKafkaConfigs.ENABLED_CONFIG, "true")
+    properties.setProperty(NereusKafkaConfigs.CLUSTER_CONFIG, "nereus-cluster")
+    properties.setProperty(
+      NereusKafkaConfigs.OXIA_SERVICE_ADDRESS_CONFIG,
+      "oxia://127.0.0.1:6648")
+    properties.setProperty(
+      NereusKafkaConfigs.BOOKKEEPER_METADATA_SERVICE_URI_CONFIG,
+      "bk://127.0.0.1/ledgers")
+    properties.setProperty(NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG, "s3")
+    properties.setProperty(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG, "nereus-kafka")
+    properties.setProperty(
+      NereusKafkaConfigs.CACHE_DIR_CONFIG,
+      "/tmp/nereus-kafka-storage-tool-cache")
+    properties
+  }
 
   private def runFormatCommand(
     stream: ByteArrayOutputStream,
@@ -410,6 +434,41 @@ Found problem:
     // Verify that the format command completed successfully with features
     assertTrue(stream.toString().contains("Formatting metadata directory"),
       "Failed to find formatting message in output: " + stream.toString())
+  }
+
+  @Test
+  def testFormatNereusStorageFeatureRequiresEnabledMode(): Unit = {
+    val availableDir = TestUtils.tempDir()
+    val disabled = new Properties()
+    disabled.putAll(defaultStaticQuorumProperties)
+    disabled.setProperty("log.dirs", availableDir.toString)
+
+    val failure = assertThrows(
+      classOf[TerseFailure],
+      () => runFormatCommand(
+        new ByteArrayOutputStream(),
+        disabled,
+        Seq("--feature", s"${NereusStorageVersion.FEATURE_NAME}=1")))
+    assertTrue(failure.getMessage.contains(NereusKafkaConfigs.ENABLED_CONFIG))
+  }
+
+  @Test
+  def testFormatExplicitNereusStorageFeature(): Unit = {
+    val availableDir = TestUtils.tempDir()
+    val properties = nereusControllerProperties(availableDir.toString)
+    val stream = new ByteArrayOutputStream()
+
+    assertEquals(
+      0,
+      runFormatCommand(
+        stream,
+        properties,
+        Seq("--feature", s"${NereusStorageVersion.FEATURE_NAME}=1")))
+    val bootstrapMetadata =
+      new BootstrapDirectory(availableDir.toString).read
+    assertEquals(
+      NereusStorageVersion.NSV_1.featureLevel(),
+      bootstrapMetadata.featureLevel(NereusStorageVersion.FEATURE_NAME))
   }
 
   @Test

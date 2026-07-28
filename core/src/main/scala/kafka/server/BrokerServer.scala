@@ -171,7 +171,9 @@ class BrokerServer(
 
   var brokerRegistrationTracker: BrokerRegistrationTracker = _
 
-  val brokerFeatures: BrokerFeatures = BrokerFeatures.createDefault(config.unstableFeatureVersionsEnabled)
+  val brokerFeatures: BrokerFeatures = BrokerFeatures.createDefault(
+    config.unstableFeatureVersionsEnabled,
+    config.nereusKafkaStorageConfig.enabled())
 
   def kafkaYammerMetrics: KafkaYammerMetrics = KafkaYammerMetrics.INSTANCE
 

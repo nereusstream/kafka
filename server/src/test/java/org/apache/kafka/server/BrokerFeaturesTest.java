@@ -19,6 +19,7 @@ package org.apache.kafka.server;
 import org.apache.kafka.common.feature.Features;
 import org.apache.kafka.common.feature.SupportedVersionRange;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -117,5 +118,18 @@ public class BrokerFeaturesTest {
         brokerFeatures.supportedFeatures().features()
                 .values()
                 .forEach(supportedVersionRange -> assertNotEquals(0, supportedVersionRange.max()));
+    }
+
+    @Test
+    public void testNereusStorageSupportIsAdvertisedOnlyWhenEnabled() {
+        assertFalse(BrokerFeatures.createDefault(false).
+            supportedFeatures().features().
+            containsKey(NereusStorageVersion.FEATURE_NAME));
+        assertEquals(
+            new SupportedVersionRange(
+                NereusStorageVersion.NSV_0.featureLevel(),
+                NereusStorageVersion.NSV_1.featureLevel()),
+            BrokerFeatures.createDefault(false, true).
+                supportedFeatures().get(NereusStorageVersion.FEATURE_NAME));
     }
 }

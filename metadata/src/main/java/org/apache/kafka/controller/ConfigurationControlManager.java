@@ -332,7 +332,9 @@ public class ConfigurationControlManager {
         }
         for (ApiMessageAndVersion newRecord : recordsExplicitlyAltered) {
             ConfigRecord configRecord = (ConfigRecord) newRecord.message();
-            if (isDisallowedBrokerMinIsrTransition(configRecord)) {
+            if (isDisallowedNereusMinIsrTransition(configRecord)) {
+                return DISALLOWED_NEREUS_MIN_ISR_TRANSITION_ERROR;
+            } else if (isDisallowedBrokerMinIsrTransition(configRecord)) {
                 return DISALLOWED_BROKER_MIN_ISR_TRANSITION_ERROR;
             } else if (isDisallowedClusterMinIsrTransition(configRecord)) {
                 return DISALLOWED_CLUSTER_MIN_ISR_REMOVAL_ERROR;
@@ -349,7 +351,9 @@ public class ConfigurationControlManager {
         }
         for (ApiMessageAndVersion recordImplicitlyDeleted : recordsImplicitlyDeleted) {
             ConfigRecord configRecord = (ConfigRecord) recordImplicitlyDeleted.message();
-            if (isDisallowedBrokerMinIsrTransition(configRecord)) {
+            if (isDisallowedNereusMinIsrTransition(configRecord)) {
+                return DISALLOWED_NEREUS_MIN_ISR_TRANSITION_ERROR;
+            } else if (isDisallowedBrokerMinIsrTransition(configRecord)) {
                 return DISALLOWED_BROKER_MIN_ISR_TRANSITION_ERROR;
             } else if (isDisallowedClusterMinIsrTransition(configRecord)) {
                 return DISALLOWED_CLUSTER_MIN_ISR_REMOVAL_ERROR;
@@ -389,6 +393,17 @@ public class ConfigurationControlManager {
     private static final ApiError DISALLOWED_CONFIG_VALUE_SIZE_ERROR =
         new ApiError(INVALID_CONFIG, "The configuration value cannot be added because " +
             "it exceeds the maximum value size of " + Short.MAX_VALUE + " bytes.");
+
+    private static final ApiError DISALLOWED_NEREUS_MIN_ISR_TRANSITION_ERROR =
+        new ApiError(INVALID_CONFIG, MIN_IN_SYNC_REPLICAS_CONFIG +
+            " must remain 1 while nereus.storage.version is enabled.");
+
+    boolean isDisallowedNereusMinIsrTransition(ConfigRecord configRecord) {
+        return featureControl.isNereusStorageFeatureEnabled() &&
+            configRecord.name().equals(MIN_IN_SYNC_REPLICAS_CONFIG) &&
+            configRecord.value() != null &&
+            !configRecord.value().equals("1");
+    }
 
     boolean isDisallowedBrokerMinIsrTransition(ConfigRecord configRecord) {
         if (configRecord.name().equals(MIN_IN_SYNC_REPLICAS_CONFIG) &&

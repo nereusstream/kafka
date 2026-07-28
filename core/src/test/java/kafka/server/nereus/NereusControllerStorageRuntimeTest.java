@@ -19,8 +19,11 @@ package kafka.server.nereus;
 
 import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.image.FeaturesImage;
 import org.apache.kafka.image.loader.LoaderManifest;
 import org.apache.kafka.raft.LeaderAndEpoch;
+import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 import org.apache.kafka.server.fault.FaultHandler;
 
 import com.nereusstream.api.ErrorCode;
@@ -29,6 +32,7 @@ import com.nereusstream.api.NereusException;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -70,6 +74,7 @@ class NereusControllerStorageRuntimeTest {
                 });
 
         runtime.start().toCompletableFuture().join();
+        publishEnabledMetadata(runtime);
         runtime.onControllerChange(leader(NODE_ID, 3));
 
         assertTrue(first.await(5, TimeUnit.SECONDS));
@@ -99,6 +104,7 @@ class NereusControllerStorageRuntimeTest {
                         new RuntimeException(message, failure));
 
         runtime.start().toCompletableFuture().join();
+        publishEnabledMetadata(runtime);
         runtime.onControllerChange(leader(NODE_ID, 4));
         assertTrue(first.await(5, TimeUnit.SECONDS));
         runtime.onControllerChange(leader(NODE_ID + 1, 5));
@@ -130,16 +136,11 @@ class NereusControllerStorageRuntimeTest {
                         new RuntimeException(message, failure));
 
         runtime.start().toCompletableFuture().join();
+        publishEnabledMetadata(runtime);
         runtime.onControllerChange(leader(NODE_ID, 6));
         assertTrue(firstStarted.await(5, TimeUnit.SECONDS));
-        runtime.onMetadataUpdate(
-                mock(MetadataDelta.class),
-                mock(MetadataImage.class),
-                mock(LoaderManifest.class));
-        runtime.onMetadataUpdate(
-                mock(MetadataDelta.class),
-                mock(MetadataImage.class),
-                mock(LoaderManifest.class));
+        publishEnabledMetadata(runtime);
+        publishEnabledMetadata(runtime);
         assertEquals(1, attempts.get());
 
         firstAttempt.complete(null);
@@ -176,6 +177,7 @@ class NereusControllerStorageRuntimeTest {
                 handler);
 
         runtime.start().toCompletableFuture().join();
+        publishEnabledMetadata(runtime);
         runtime.onControllerChange(leader(NODE_ID, 7));
         assertTrue(firstFault.await(5, TimeUnit.SECONDS));
         publishMetadata(runtime);
@@ -189,6 +191,32 @@ class NereusControllerStorageRuntimeTest {
         assertTrue(secondFault.await(5, TimeUnit.SECONDS));
         assertEquals(2, attempts.get());
         assertEquals(2, faults.get());
+        runtime.close();
+    }
+
+    @Test
+    void waitsForDurableNereusFeatureBeforeActivation() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        CountDownLatch activated = new CountDownLatch(1);
+        TestActivation activation = new TestActivation(() -> {
+            attempts.incrementAndGet();
+            activated.countDown();
+            return CompletableFuture.completedFuture(null);
+        });
+        NereusControllerStorageRuntime runtime = runtime(
+            activation,
+            Duration.ofMillis(20),
+            (message, failure) -> new RuntimeException(message, failure));
+
+        runtime.start().toCompletableFuture().join();
+        runtime.onControllerChange(leader(NODE_ID, 10));
+        publishDisabledMetadata(runtime);
+        Thread.sleep(100);
+        assertEquals(0, attempts.get());
+
+        publishEnabledMetadata(runtime);
+        assertTrue(activated.await(5, TimeUnit.SECONDS));
+        assertEquals(1, attempts.get());
         runtime.close();
     }
 
@@ -211,9 +239,46 @@ class NereusControllerStorageRuntimeTest {
     private static void publishMetadata(
             NereusControllerStorageRuntime runtime
     ) {
+        publishEnabledMetadata(runtime);
+    }
+
+    private static void publishEnabledMetadata(
+            NereusControllerStorageRuntime runtime
+    ) {
+        publishMetadata(runtime, true);
+    }
+
+    private static void publishDisabledMetadata(
+            NereusControllerStorageRuntime runtime
+    ) {
+        publishMetadata(runtime, false);
+    }
+
+    private static void publishMetadata(
+            NereusControllerStorageRuntime runtime,
+            boolean enabled
+    ) {
+        FeaturesImage features = new FeaturesImage(
+            enabled
+                ? Map.of(
+                    NereusStorageVersion.FEATURE_NAME,
+                    NereusStorageVersion.NSV_1.featureLevel())
+                : Map.of(),
+            MetadataVersion.latestTesting());
+        MetadataImage image = new MetadataImage(
+            MetadataImage.EMPTY.provenance(),
+            features,
+            MetadataImage.EMPTY.cluster(),
+            MetadataImage.EMPTY.topics(),
+            MetadataImage.EMPTY.configs(),
+            MetadataImage.EMPTY.clientQuotas(),
+            MetadataImage.EMPTY.producerIds(),
+            MetadataImage.EMPTY.acls(),
+            MetadataImage.EMPTY.scram(),
+            MetadataImage.EMPTY.delegationTokens());
         runtime.onMetadataUpdate(
                 mock(MetadataDelta.class),
-                mock(MetadataImage.class),
+                image,
                 mock(LoaderManifest.class));
     }
 

@@ -23,6 +23,7 @@ import org.apache.kafka.coordinator.group.GroupCoordinatorConfig
 import org.apache.kafka.coordinator.share.ShareCoordinatorConfig
 import org.apache.kafka.coordinator.transaction.TransactionLogConfig
 import org.apache.kafka.network.SocketServerConfigs
+import org.apache.kafka.server.ProcessRole
 import org.apache.kafka.server.config.{NereusKafkaConfigs, ReplicationConfigs, ServerConfigs, ServerLogConfigs}
 import org.apache.kafka.storage.internals.log.CleanerConfig
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertThrows, assertTrue}
@@ -50,6 +51,21 @@ class NereusKafkaConfigValidatorTest {
     assertEquals("nereus-cluster", config.nereusKafkaStorageConfig.core().cluster().orElseThrow())
     assertEquals(1, config.defaultReplicationFactor)
     assertFalse(config.remoteLogManagerConfig.isRemoteStorageSystemEnabled)
+  }
+
+  @Test
+  def testEnabledModeSupportsDedicatedControllerRole(): Unit = {
+    val properties = enabledProperties()
+    properties.put("process.roles", "controller")
+    properties.put("controller.quorum.voters", "0@localhost:9093")
+    properties.put("controller.listener.names", "CONTROLLER")
+    properties.put("listeners", "CONTROLLER://:9093")
+    properties.put("advertised.listeners", "CONTROLLER://127.0.0.1:9093")
+
+    val config = KafkaConfig.fromProps(properties, false)
+
+    assertTrue(config.nereusKafkaStorageConfig.enabled())
+    assertEquals(Set(ProcessRole.ControllerRole), config.processRoles)
   }
 
   @Test

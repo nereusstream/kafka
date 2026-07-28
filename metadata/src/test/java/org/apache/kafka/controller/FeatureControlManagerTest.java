@@ -30,6 +30,7 @@ import org.apache.kafka.server.common.Feature;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.server.common.MetadataVersionTestUtils;
+import org.apache.kafka.server.common.NereusStorageVersion;
 import org.apache.kafka.server.common.TestFeatureVersion;
 import org.apache.kafka.server.common.TransactionVersion;
 import org.apache.kafka.timeline.SnapshotRegistry;
@@ -127,6 +128,39 @@ public class FeatureControlManagerTest {
                 setName(TestFeatureVersion.FEATURE_NAME).setFeatureLevel((short) 1),
                 (short) 0));
         assertEquals(expectedMessages, result.records());
+    }
+
+    @Test
+    public void testUpdateNereusStorageFeature() {
+        FeatureControlManager manager =
+            new FeatureControlManager.Builder().
+                setQuorumFeatures(features(
+                    NereusStorageVersion.FEATURE_NAME,
+                    NereusStorageVersion.NSV_0.featureLevel(),
+                    NereusStorageVersion.NSV_1.featureLevel())).
+                build();
+        manager.replay(new FeatureLevelRecord().
+            setName(MetadataVersion.FEATURE_NAME).
+            setFeatureLevel(MetadataVersion.MINIMUM_VERSION.featureLevel()));
+
+        ControllerResult<ApiError> result = manager.updateFeatures(
+            updateMap(
+                NereusStorageVersion.FEATURE_NAME,
+                NereusStorageVersion.NSV_1.featureLevel()),
+            Map.of(),
+            false,
+            0);
+        assertEquals(ApiError.NONE, result.response());
+        assertEquals(
+            List.of(new ApiMessageAndVersion(
+                new FeatureLevelRecord().
+                    setName(NereusStorageVersion.FEATURE_NAME).
+                    setFeatureLevel(
+                        NereusStorageVersion.NSV_1.featureLevel()),
+                (short) 0)),
+            result.records());
+        RecordTestUtils.replayAll(manager, result.records());
+        assertTrue(manager.isNereusStorageFeatureEnabled());
     }
 
     @Test

@@ -23,6 +23,7 @@ import org.apache.kafka.image.writer.ImageWriter;
 import org.apache.kafka.image.writer.ImageWriterOptions;
 import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 
 import java.util.Collections;
 import java.util.Map;
@@ -80,6 +81,13 @@ public final class FeaturesImage {
     public boolean isElrEnabled() {
         return finalizedVersions.getOrDefault(EligibleLeaderReplicasVersion.FEATURE_NAME, EligibleLeaderReplicasVersion.ELRV_0.featureLevel())
             >= EligibleLeaderReplicasVersion.ELRV_1.featureLevel();
+    }
+
+    public boolean isNereusStorageEnabled() {
+        return finalizedVersions.getOrDefault(
+            NereusStorageVersion.FEATURE_NAME,
+            NereusStorageVersion.NSV_0.featureLevel())
+            >= NereusStorageVersion.NSV_1.featureLevel();
     }
 
     public void write(ImageWriter writer, ImageWriterOptions options) {

@@ -20,6 +20,7 @@ package org.apache.kafka.controller;
 import org.apache.kafka.metadata.VersionRange;
 import org.apache.kafka.server.common.Feature;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -55,6 +56,13 @@ public final class QuorumFeatures {
     }
 
     public static Map<String, VersionRange> defaultSupportedFeatureMap(boolean enableUnstable) {
+        return defaultSupportedFeatureMap(enableUnstable, false);
+    }
+
+    public static Map<String, VersionRange> defaultSupportedFeatureMap(
+        boolean enableUnstable,
+        boolean nereusStorageEnabled
+    ) {
         Map<String, VersionRange> features = new HashMap<>(1);
         features.put(MetadataVersion.FEATURE_NAME, VersionRange.of(
                 MetadataVersion.MINIMUM_VERSION.featureLevel(),
@@ -66,6 +74,13 @@ public final class QuorumFeatures {
             if (maxVersion > 0) {
                 features.put(feature.featureName(), VersionRange.of(feature.minimumProduction(), maxVersion));
             }
+        }
+        if (nereusStorageEnabled) {
+            features.put(
+                NereusStorageVersion.FEATURE_NAME,
+                VersionRange.of(
+                    NereusStorageVersion.NSV_0.featureLevel(),
+                    NereusStorageVersion.LATEST_PRODUCTION.featureLevel()));
         }
         return features;
     }
