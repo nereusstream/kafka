@@ -2162,16 +2162,60 @@ public class ReplicationControlManager {
         Optional<ApiMessageAndVersion> record;
         if (target.replicas() == null) {
             record = cancelPartitionReassignment(topicName, tp, part);
-        } else {
-            if (featureControl.isNereusStorageFeatureEnabled() &&
-                    target.replicas().size() != 1) {
+        } else if (featureControl.isNereusStorageFeatureEnabled()) {
+            if (target.replicas().size() != 1) {
                 throw new InvalidReplicaAssignmentException(
                     "Partition reassignment targets must contain exactly one broker " +
                         "when nereus.storage.version is enabled.");
             }
+            record = changeNereusPartitionReassignment(
+                tp, part, target, allowRFChange);
+        } else {
             record = changePartitionReassignment(tp, part, target, allowRFChange);
         }
         record.ifPresent(records::add);
+    }
+
+    Optional<ApiMessageAndVersion> changeNereusPartitionReassignment(
+        TopicIdPartition tp,
+        PartitionRegistration part,
+        ReassignablePartition target,
+        boolean allowRFChange
+    ) {
+        if (part.replicas.length != 1 || isReassignmentInProgress(part)) {
+            throw new InvalidReplicaAssignmentException(
+                "Existing partitions must have one stable replica before a Nereus " +
+                    "shared-storage reassignment.");
+        }
+        PartitionAssignment targetAssignment =
+            new PartitionAssignment(target.replicas(), clusterDescriber);
+        validateManualPartitionAssignment(targetAssignment, OptionalInt.of(1));
+        if (!allowRFChange) {
+            validatePartitionReplicationFactorUnchanged(part, target);
+        }
+        int targetBroker = target.replicas().get(0);
+        if (!clusterControl.isActive(targetBroker)) {
+            throw new InvalidReplicaAssignmentException(
+                "Nereus shared-storage reassignment target broker " +
+                    targetBroker + " must be active.");
+        }
+
+        PartitionChangeBuilder builder = new PartitionChangeBuilder(
+            part,
+            tp.topicId(),
+            tp.partitionId(),
+            clusterControl::isActive,
+            featureControl.metadataVersionOrThrow(),
+            getTopicEffectiveMinIsr(topics.get(tp.topicId()).name)
+        );
+        builder.setEligibleLeaderReplicasEnabled(
+            featureControl.isElrFeatureEnabled());
+        builder.setTargetReplicas(target.replicas());
+        builder.setTargetIsr(target.replicas());
+        builder.setTargetRemoving(List.of());
+        builder.setTargetAdding(List.of());
+        builder.setElection(PartitionChangeBuilder.Election.PREFERRED);
+        return builder.setDefaultDirProvider(clusterDescriber).build();
     }
 
     Optional<ApiMessageAndVersion> cancelPartitionReassignment(String topicName,

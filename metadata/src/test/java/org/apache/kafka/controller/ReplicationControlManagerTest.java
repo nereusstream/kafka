@@ -823,6 +823,58 @@ public class ReplicationControlManagerTest {
     }
 
     @Test
+    public void testNereusStorageFeatureAtomicallyHandsOffSingletonReplica() {
+        ReplicationControlTestContext ctx =
+            new ReplicationControlTestContext.Builder().
+                setIsNereusStorageEnabled(true).
+                build();
+        ctx.registerBrokers(0, 1);
+        ctx.unfenceBrokers(0, 1);
+        Uuid topicId = ctx.createTestTopic(
+            "shared-storage-handoff",
+            new int[][] {new int[] {0}},
+            NONE.code()).topicId();
+        PartitionRegistration before =
+            ctx.replicationControl.getPartition(topicId, 0);
+
+        ControllerResult<AlterPartitionReassignmentsResponseData> result =
+            ctx.replicationControl.alterPartitionReassignments(
+                new AlterPartitionReassignmentsRequestData().
+                    setTopics(List.of(new ReassignableTopic().
+                        setName("shared-storage-handoff").
+                        setPartitions(List.of(new ReassignablePartition().
+                            setPartitionIndex(0).
+                            setReplicas(List.of(1)))))));
+
+        assertEquals(
+            NONE.code(),
+            result.response().responses().get(0).partitions().get(0).
+                errorCode());
+        assertEquals(1, result.records().size());
+        PartitionChangeRecord handoff =
+            (PartitionChangeRecord) result.records().get(0).message();
+        assertEquals(List.of(1), handoff.replicas());
+        assertEquals(List.of(1), handoff.isr());
+        assertEquals(1, handoff.leader());
+        assertNull(handoff.removingReplicas());
+        assertNull(handoff.addingReplicas());
+
+        ctx.replay(result.records());
+        PartitionRegistration after =
+            ctx.replicationControl.getPartition(topicId, 0);
+        assertArrayEquals(new int[] {1}, after.replicas);
+        assertArrayEquals(new int[] {1}, after.isr);
+        assertArrayEquals(new int[] {}, after.removingReplicas);
+        assertArrayEquals(new int[] {}, after.addingReplicas);
+        assertEquals(1, after.leader);
+        assertEquals(before.leaderEpoch + 1, after.leaderEpoch);
+        assertEquals(
+            NONE_REASSIGNING,
+            ctx.replicationControl.listPartitionReassignments(
+                null, Long.MAX_VALUE));
+    }
+
+    @Test
     public void testCreateTopicsWithMutationQuotaExceeded() {
         ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().build();
         ReplicationControlManager replicationControl = ctx.replicationControl;
