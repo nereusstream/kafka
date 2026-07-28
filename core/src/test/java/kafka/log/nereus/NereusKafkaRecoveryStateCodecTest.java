@@ -31,6 +31,7 @@ import com.nereusstream.api.Checksum;
 import com.nereusstream.api.ChecksumType;
 import com.nereusstream.api.ErrorCode;
 import com.nereusstream.api.NereusException;
+import com.nereusstream.api.StreamId;
 import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointState;
 import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointStateCodecV1;
 import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
@@ -40,6 +41,7 @@ import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
 import com.nereusstream.kafka.checkpoint.KafkaVirtualSegmentState;
 import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.recovery.KafkaReplayBatch;
+import com.nereusstream.objectstore.kafka.checkpoint.KafkaCheckpointHeader;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -143,9 +145,9 @@ class NereusKafkaRecoveryStateCodecTest {
                         new KafkaDerivedIndexState(0, 0, List.of(), List.of()));
         checkpointCodec.hydrateCheckpoint(
                 checkpointState,
+                header(0, 0),
                 new KafkaCanonicalCheckpointStateCodecV1()
-                        .encodeSections(genesis),
-                0);
+                        .encodeSections(genesis));
         checkpointCodec.validateRecoveredState(
                 checkpointState, source(0, 0, 7));
         assertEquals(empty, checkpointState.producerTransactionState());
@@ -234,9 +236,9 @@ class NereusKafkaRecoveryStateCodecTest {
 
         codec.hydrateCheckpoint(
                 state,
+                header(0, 1),
                 new KafkaCanonicalCheckpointStateCodecV1()
-                        .encodeSections(checkpoint),
-                1);
+                        .encodeSections(checkpoint));
         codec.replayBatch(state, new KafkaReplayBatch(1, 1, tail));
         codec.validateRecoveredState(state, source(0, 2, 7));
 
@@ -254,6 +256,73 @@ class NereusKafkaRecoveryStateCodecTest {
                 99,
                 state.producerTransactionState()
                         .producers().get(0).producerId());
+    }
+
+    @Test
+    void hydratesACheckpointCapturedBeforeTheCurrentDurableTrim() throws Exception {
+        KafkaVirtualSegmentState.LogConfigHistoryEntry config =
+                KafkaVirtualSegmentState.LogConfigHistoryEntry.create(
+                        1,
+                        0,
+                        1_024,
+                        60_000,
+                        0,
+                        1_024,
+                        64,
+                        -1,
+                        -1,
+                        0,
+                        86_400_000,
+                        0,
+                        Long.MAX_VALUE,
+                        0.5,
+                        KafkaVirtualSegmentState.LogConfigHistoryEntry.CLEANUP_DELETE_FLAG);
+        KafkaVirtualSegmentState virtual =
+                new KafkaVirtualSegmentState(
+                        0,
+                        3,
+                        List.of(
+                                segment(config, 0, 1, 10, KafkaVirtualSegmentState.SegmentState.CLOSED),
+                                segment(config, 1, 2, 10, KafkaVirtualSegmentState.SegmentState.CLOSED),
+                                segment(config, 2, 3, 10, KafkaVirtualSegmentState.SegmentState.ACTIVE)),
+                        List.of(config));
+        KafkaDerivedIndexState derived =
+                new KafkaDerivedIndexState(
+                        0,
+                        3,
+                        List.of(
+                                new KafkaDerivedIndexState.SegmentTimeIndex(0, List.of()),
+                                new KafkaDerivedIndexState.SegmentTimeIndex(1, List.of()),
+                                new KafkaDerivedIndexState.SegmentTimeIndex(2, List.of())),
+                        List.of(
+                                new KafkaDerivedIndexState.SegmentLogicalByteIndex(0, 10, List.of()),
+                                new KafkaDerivedIndexState.SegmentLogicalByteIndex(1, 10, List.of()),
+                                new KafkaDerivedIndexState.SegmentLogicalByteIndex(2, 10, List.of())));
+        KafkaCanonicalCheckpointState checkpoint =
+                new KafkaCanonicalCheckpointState(
+                        3,
+                        0,
+                        3,
+                        new KafkaProducerTransactionState(3, List.of(), List.of(), List.of()),
+                        new KafkaLeaderEpochState(
+                                0,
+                                3,
+                                List.of(new KafkaLeaderEpochState.LeaderEpochRange(5, 0))),
+                        virtual,
+                        derived);
+        NereusKafkaRecoveryStateCodec codec =
+                codec(7, 2, 3, "pre-trim-checkpoint");
+        NereusKafkaRecoveredState state = codec.freshState();
+
+        codec.hydrateCheckpoint(
+                state,
+                header(0, 3),
+                new KafkaCanonicalCheckpointStateCodecV1().encodeSections(checkpoint));
+        codec.validateRecoveredState(state, source(2, 3, 7));
+
+        assertEquals(2, state.logStartOffset());
+        assertEquals(3, state.stableEndOffset());
+        assertEquals(3, state.checkpointState().orElseThrow().stableEndOffset());
     }
 
     @Test
@@ -343,6 +412,55 @@ class NereusKafkaRecoveryStateCodecTest {
                 new Checksum(ChecksumType.SHA256, "a".repeat(64)),
                 false,
                 endOffset);
+    }
+
+    private static KafkaCheckpointHeader header(
+            long logStartOffset,
+            long checkpointOffset
+    ) {
+        return new KafkaCheckpointHeader(
+                0,
+                IDENTITY.kafkaClusterId(),
+                IDENTITY.topicId(),
+                IDENTITY.partition(),
+                1,
+                new StreamId("stream-1"),
+                1,
+                7,
+                checkpointOffset,
+                logStartOffset,
+                checkpointOffset,
+                1,
+                "commit-1",
+                new Checksum(ChecksumType.SHA256, "a".repeat(64)));
+    }
+
+    private static KafkaVirtualSegmentState.VirtualSegment segment(
+            KafkaVirtualSegmentState.LogConfigHistoryEntry config,
+            long baseOffset,
+            long endOffset,
+            long logicalBytes,
+            KafkaVirtualSegmentState.SegmentState state
+    ) {
+        return new KafkaVirtualSegmentState.VirtualSegment(
+                baseOffset,
+                endOffset,
+                baseOffset,
+                1_000 + baseOffset,
+                state == KafkaVirtualSegmentState.SegmentState.CLOSED
+                        ? 1_001 + baseOffset
+                        : 0,
+                0,
+                1_000 + baseOffset,
+                baseOffset,
+                logicalBytes,
+                baseOffset * logicalBytes,
+                endOffset * logicalBytes,
+                config.configDigest(),
+                baseOffset == 0
+                        ? KafkaVirtualSegmentState.RollReason.INITIAL
+                        : KafkaVirtualSegmentState.RollReason.SIZE,
+                state);
     }
 
     private static byte[] bytes(MemoryRecords records) {

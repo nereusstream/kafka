@@ -19,7 +19,10 @@ package kafka.log.nereus;
 import org.apache.kafka.storage.internals.log.LogConfig;
 import org.apache.kafka.storage.internals.log.RollParams;
 
+import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointState;
 import com.nereusstream.kafka.checkpoint.KafkaDerivedIndexState;
+import com.nereusstream.kafka.checkpoint.KafkaLeaderEpochState;
+import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
 import com.nereusstream.kafka.checkpoint.KafkaVirtualSegmentState;
 
 import org.junit.jupiter.api.Test;
@@ -115,6 +118,55 @@ class NereusCanonicalLogStateTest {
                 virtual.segments().get(1).rollReason());
         assertFalse(virtual.segments().get(0).configDigest()
                 .equals(virtual.segments().get(1).configDigest()));
+    }
+
+    @Test
+    void restoresAPreTrimCheckpointThenPrunesToTheCurrentDurableLogStart() {
+        LogConfig config = config(100, 64);
+        NereusCanonicalLogState captured = empty(config, 3);
+        captured.commitStable(List.of(batch(0, 60, 100)), 1_000);
+        captured.stageRoll(1, 2_000);
+        captured.commitStable(List.of(batch(1, 60, 200)), 2_000);
+        captured.stageRoll(2, 3_000);
+        captured.commitStable(List.of(batch(2, 60, 300)), 3_000);
+        KafkaCanonicalCheckpointState checkpoint =
+                new KafkaCanonicalCheckpointState(
+                        3,
+                        0,
+                        3,
+                        new KafkaProducerTransactionState(
+                                3,
+                                List.of(),
+                                List.of(),
+                                List.of()),
+                        new KafkaLeaderEpochState(
+                                0,
+                                3,
+                                List.of(
+                                        new KafkaLeaderEpochState.LeaderEpochRange(
+                                                7,
+                                                0))),
+                        captured.virtualSegments(),
+                        captured.derivedIndexes());
+        NereusCanonicalLogState restored =
+                new NereusCanonicalLogState("cluster/topic/0");
+
+        restored.restore(
+                2,
+                3,
+                Optional.of(checkpoint),
+                List.of(),
+                config,
+                3,
+                4_000);
+
+        assertEquals(2, restored.virtualSegments().logStartOffset());
+        assertEquals(
+                List.of(2L),
+                restored.virtualSegments().segments().stream()
+                        .map(KafkaVirtualSegmentState.VirtualSegment::baseOffset)
+                        .toList());
+        assertEquals(List.of(2L), restored.segmentBaseOffsets(3));
     }
 
     private static NereusCanonicalLogState empty(

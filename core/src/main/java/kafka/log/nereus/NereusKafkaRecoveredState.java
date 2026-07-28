@@ -32,6 +32,7 @@ import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
 import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
 import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.recovery.KafkaReplayBatch;
+import com.nereusstream.objectstore.kafka.checkpoint.KafkaCheckpointHeader;
 import com.nereusstream.objectstore.kafka.checkpoint.KafkaCheckpointSection;
 
 import java.io.IOException;
@@ -103,14 +104,21 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
     }
 
     void hydrateCheckpoint(
-            List<KafkaCheckpointSection> sections,
-            long checkpointOffset
+            KafkaCheckpointHeader header,
+            List<KafkaCheckpointSection> sections
     ) {
         requireMutable();
+        Objects.requireNonNull(header, "header");
         Objects.requireNonNull(sections, "sections");
+        long checkpointOffset = header.checkpointOffset();
         if (checkpointHydrated
                 || batchCount != 0
-                || nextOffset != logStartOffset
+                || nextOffset != logStartOffset) {
+            throw invariant(
+                    "Kafka producer checkpoint is not the initial bounded recovery state");
+        }
+        if (header.logStartOffset() > logStartOffset
+                || header.stableEndOffset() != checkpointOffset
                 || checkpointOffset < logStartOffset
                 || checkpointOffset > expectedStableEndOffset) {
             throw invariant(
@@ -121,8 +129,8 @@ public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecovery
                     checkpointCodec.decodeSections(
                             sections,
                             checkpointOffset,
-                            logStartOffset,
-                            checkpointOffset);
+                            header.logStartOffset(),
+                            header.stableEndOffset());
             checkpointState = checkpoint;
             producerStateManager.restoreCanonical(
                     checkpoint.producerTransactionState());

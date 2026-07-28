@@ -21,6 +21,7 @@ import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
 import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.recovery.KafkaRecoveryStateCodec;
 import com.nereusstream.kafka.recovery.KafkaReplayBatch;
+import com.nereusstream.objectstore.kafka.checkpoint.KafkaCheckpointHeader;
 import com.nereusstream.objectstore.kafka.checkpoint.KafkaCheckpointSection;
 
 import java.util.List;
@@ -73,10 +74,10 @@ public final class NereusKafkaRecoveryStateCodec
     @Override
     public void hydrateCheckpoint(
             NereusKafkaRecoveredState state,
-            List<KafkaCheckpointSection> sections,
-            long checkpointOffset
+            KafkaCheckpointHeader header,
+            List<KafkaCheckpointSection> sections
     ) {
-        exact(state).hydrateCheckpoint(sections, checkpointOffset);
+        exact(state).hydrateCheckpoint(header, sections);
     }
 
     @Override

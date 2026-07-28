@@ -96,12 +96,10 @@ final class NereusCanonicalLogState {
         stableEndOffset = expectedLogStartOffset;
 
         if (checkpoint.isPresent()) {
-            KafkaCanonicalCheckpointState exact = checkpoint.orElseThrow();
-            if (exact.logStartOffset() != expectedLogStartOffset
-                    || exact.stableEndOffset() > expectedStableEndOffset) {
-                throw invariant("canonical checkpoint does not match recovered source bounds");
-            }
-            restoreCheckpoint(exact);
+            restoreCheckpointForCurrentWindow(
+                    checkpoint.orElseThrow(),
+                    expectedLogStartOffset,
+                    expectedStableEndOffset);
         } else {
             addConfig(canonicalConfig(currentConfig, currentMetadataOffset, logStartOffset));
         }
@@ -123,6 +121,21 @@ final class NereusCanonicalLogState {
                 || !previous.configDigest().equals(exactCurrent.configDigest())
                 || currentMetadataOffset > previous.metadataOffset()) {
             addConfig(exactCurrent);
+        }
+    }
+
+    private void restoreCheckpointForCurrentWindow(
+            KafkaCanonicalCheckpointState checkpoint,
+            long expectedLogStartOffset,
+            long expectedStableEndOffset
+    ) {
+        if (checkpoint.logStartOffset() > expectedLogStartOffset
+                || checkpoint.stableEndOffset() > expectedStableEndOffset) {
+            throw invariant("canonical checkpoint does not match recovered source bounds");
+        }
+        restoreCheckpoint(checkpoint);
+        if (logStartOffset < expectedLogStartOffset) {
+            advanceLogStart(expectedLogStartOffset);
         }
     }
 
