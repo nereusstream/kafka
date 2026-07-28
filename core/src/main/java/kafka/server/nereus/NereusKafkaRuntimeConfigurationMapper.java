@@ -463,11 +463,13 @@ public final class NereusKafkaRuntimeConfigurationMapper {
         if (storage.core().profile()
                 != NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT
                 && storage.core().profile()
+                != NereusKafkaStorageConfig.Profile.OBJECT_WAL_ASYNC_OBJECT
+                && storage.core().profile()
                 != NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY) {
             throw new ConfigException(
                     NereusKafkaConfigs.PROFILE_CONFIG,
                     storage.core().profile().name(),
-                    "only OBJECT_WAL_SYNC_OBJECT and BOOKKEEPER_WAL_ONLY have production provider runtimes");
+                    "only Object-WAL profiles and BOOKKEEPER_WAL_ONLY have production provider runtimes");
         }
     }
 
@@ -627,17 +629,23 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                         == NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY
                 ? Set.of(
                         StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        StorageProfile.OBJECT_WAL_ASYNC_OBJECT,
                         StorageProfile.BOOKKEEPER_WAL_ONLY)
-                : Set.of(StorageProfile.OBJECT_WAL_SYNC_OBJECT);
+                : Set.of(
+                        StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        StorageProfile.OBJECT_WAL_ASYNC_OBJECT);
     }
 
     private static StorageProfile defaultProfile(
             NereusKafkaStorageConfig storage
     ) {
-        return storage.core().profile()
-                        == NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY
-                ? StorageProfile.BOOKKEEPER_WAL_ONLY
-                : StorageProfile.OBJECT_WAL_SYNC_OBJECT;
+        return switch (storage.core().profile()) {
+            case OBJECT_WAL_SYNC_OBJECT -> StorageProfile.OBJECT_WAL_SYNC_OBJECT;
+            case OBJECT_WAL_ASYNC_OBJECT -> StorageProfile.OBJECT_WAL_ASYNC_OBJECT;
+            case BOOKKEEPER_WAL_ONLY -> StorageProfile.BOOKKEEPER_WAL_ONLY;
+            default -> throw new IllegalStateException(
+                    "mapped a storage profile without an executable provider runtime");
+        };
     }
 
     private static String canonicalProvider(String value) {

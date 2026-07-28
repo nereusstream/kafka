@@ -62,7 +62,9 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                 256 * 1024 * 1024,
                 mapped.runtime().runtime().recoveryChunkBytes());
         assertEquals(
-                java.util.Set.of(StorageProfile.OBJECT_WAL_SYNC_OBJECT),
+                java.util.Set.of(
+                        StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        StorageProfile.OBJECT_WAL_ASYNC_OBJECT),
                 mapped.runtime().runtime().executableProfiles());
         assertFalse(mapped.runtime().streamStorage().autoAcquireAppendSession());
         assertEquals(
@@ -178,6 +180,7 @@ class NereusKafkaRuntimeConfigurationMapperTest {
         assertEquals(
                 java.util.Set.of(
                         StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        StorageProfile.OBJECT_WAL_ASYNC_OBJECT,
                         StorageProfile.BOOKKEEPER_WAL_ONLY),
                 mapped.runtime().runtime().executableProfiles());
         assertTrue(mapped.runtime().bookKeeper().isPresent());
@@ -193,6 +196,7 @@ class NereusKafkaRuntimeConfigurationMapperTest {
         assertEquals(
                 java.util.List.of(
                         StorageProfile.BOOKKEEPER_WAL_ONLY.name(),
+                        StorageProfile.OBJECT_WAL_ASYNC_OBJECT.name(),
                         StorageProfile.OBJECT_WAL_SYNC_OBJECT.name()),
                 controller.activationPolicy().allowedStorageProfiles());
         assertEquals(
@@ -216,6 +220,7 @@ class NereusKafkaRuntimeConfigurationMapperTest {
                 mapped.oxia().serviceAddress());
         assertEquals(
                 java.util.List.of(
+                        StorageProfile.OBJECT_WAL_ASYNC_OBJECT.name(),
                         StorageProfile.OBJECT_WAL_SYNC_OBJECT.name()),
                 mapped.activationPolicy().allowedStorageProfiles());
         assertEquals(
@@ -228,11 +233,29 @@ class NereusKafkaRuntimeConfigurationMapperTest {
     }
 
     @Test
-    void rejectsProfileWithoutExecutableProviderBeforeResourceCreation() {
+    void mapsAsyncObjectWalAsDefaultOverTheSameInstalledObjectProviders() {
+        NereusKafkaMappedRuntimeConfiguration mapped =
+                map(configuration(
+                        NereusKafkaStorageConfig.Profile.OBJECT_WAL_ASYNC_OBJECT,
+                        "s3"));
+
+        assertEquals(
+                java.util.Set.of(
+                        StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        StorageProfile.OBJECT_WAL_ASYNC_OBJECT),
+                mapped.runtime().runtime().executableProfiles());
+        assertEquals(
+                StorageProfile.OBJECT_WAL_ASYNC_OBJECT.name(),
+                mapped.capability().defaultStorageProfile());
+        assertTrue(mapped.runtime().bookKeeper().isEmpty());
+    }
+
+    @Test
+    void rejectsBookKeeperMaterializationProfileBeforeResourceCreation() {
         ConfigException failure = assertThrows(
                 ConfigException.class,
                 () -> map(configuration(
-                        NereusKafkaStorageConfig.Profile.OBJECT_WAL_ASYNC_OBJECT,
+                        NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT,
                         "s3")));
 
         assertTrue(failure.getMessage().contains("BOOKKEEPER_WAL_ONLY"));
