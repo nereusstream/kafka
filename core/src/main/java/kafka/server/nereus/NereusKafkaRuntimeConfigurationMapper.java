@@ -42,6 +42,7 @@ import com.nereusstream.kafka.runtime.NereusKafkaCompactionRuntimeConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaMaintenanceConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaObjectWalRuntimeConfiguration;
 import com.nereusstream.kafka.runtime.NereusKafkaRuntimeConfiguration;
+import com.nereusstream.materialization.MaterializationConfig;
 import com.nereusstream.metadata.oxia.KafkaBrokerIdentity;
 import com.nereusstream.metadata.oxia.OxiaClientConfiguration;
 import com.nereusstream.metadata.oxia.records.KafkaStorageProtocolActivationRecord;
@@ -65,7 +66,7 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * Closed, deterministic mapping from the stock-owned 58-key snapshot to the first executable Nereus provider graph.
+ * Closed, deterministic mapping from the stock-owned 91-key snapshot to the executable Nereus provider graph.
  *
  * <p>The mapper performs no provider, filesystem, network or scheduler I/O. Unsupported profiles/providers fail before
  * an owned resource is created.
@@ -203,6 +204,13 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 exact.lifecycle().recoveryTimeout(),
                 exact.rollout().shutdownDrainTimeout());
         Duration orphanGrace = multiplyExact(pendingProtection, 2);
+        MaterializationConfig materialization =
+                MaterializationConfig.kafkaDefaults(
+                        exact.core().cacheDir()
+                                .orElseThrow()
+                                .resolve("materialization-staging")
+                                .toAbsolutePath()
+                                .normalize());
         NereusKafkaObjectWalRuntimeConfiguration objectWal =
                 new NereusKafkaObjectWalRuntimeConfiguration(
                         runtime,
@@ -213,6 +221,7 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                         MAXIMUM_CLOCK_SKEW,
                         orphanGrace,
                         exact.lifecycle().executorThreads(),
+                        materialization,
                         bookKeeper);
 
         byte[] configurationDigest = configurationCompatibilitySha256(exact, bookKeeper);
@@ -460,17 +469,6 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                     false,
                     "cannot map a disabled Nereus Kafka storage configuration");
         }
-        if (storage.core().profile()
-                != NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT
-                && storage.core().profile()
-                != NereusKafkaStorageConfig.Profile.OBJECT_WAL_ASYNC_OBJECT
-                && storage.core().profile()
-                != NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY) {
-            throw new ConfigException(
-                    NereusKafkaConfigs.PROFILE_CONFIG,
-                    storage.core().profile().name(),
-                    "only Object-WAL profiles and BOOKKEEPER_WAL_ONLY have production provider runtimes");
-        }
     }
 
     private static byte[] configurationCompatibilitySha256(
@@ -581,8 +579,7 @@ public final class NereusKafkaRuntimeConfigurationMapper {
 
     private static Optional<NereusKafkaBookKeeperWalRuntimeConfiguration>
             bookKeeperConfiguration(NereusKafkaStorageConfig storage) {
-        if (storage.core().profile()
-                != NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY) {
+        if (!storage.core().profile().usesBookKeeper()) {
             return Optional.empty();
         }
         NereusKafkaBookKeeperConfig exact =
@@ -625,12 +622,13 @@ public final class NereusKafkaRuntimeConfigurationMapper {
     private static Set<StorageProfile> executableProfiles(
             NereusKafkaStorageConfig storage
     ) {
-        return storage.core().profile()
-                        == NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY
+        return storage.core().profile().usesBookKeeper()
                 ? Set.of(
                         StorageProfile.OBJECT_WAL_SYNC_OBJECT,
                         StorageProfile.OBJECT_WAL_ASYNC_OBJECT,
-                        StorageProfile.BOOKKEEPER_WAL_ONLY)
+                        StorageProfile.BOOKKEEPER_WAL_ONLY,
+                        StorageProfile.BOOKKEEPER_WAL_ASYNC_OBJECT,
+                        StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT)
                 : Set.of(
                         StorageProfile.OBJECT_WAL_SYNC_OBJECT,
                         StorageProfile.OBJECT_WAL_ASYNC_OBJECT);
@@ -643,8 +641,10 @@ public final class NereusKafkaRuntimeConfigurationMapper {
             case OBJECT_WAL_SYNC_OBJECT -> StorageProfile.OBJECT_WAL_SYNC_OBJECT;
             case OBJECT_WAL_ASYNC_OBJECT -> StorageProfile.OBJECT_WAL_ASYNC_OBJECT;
             case BOOKKEEPER_WAL_ONLY -> StorageProfile.BOOKKEEPER_WAL_ONLY;
-            default -> throw new IllegalStateException(
-                    "mapped a storage profile without an executable provider runtime");
+            case BOOKKEEPER_WAL_ASYNC_OBJECT ->
+                StorageProfile.BOOKKEEPER_WAL_ASYNC_OBJECT;
+            case BOOKKEEPER_WAL_SYNC_OBJECT ->
+                StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT;
         };
     }
 
