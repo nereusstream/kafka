@@ -89,6 +89,7 @@ class BrokerStorageRuntimeFactoryTest {
     properties.put(ServerLogConfigs.LOG_DIRS_CONFIG, "/tmp/nereus-kafka-runtime-stock-log")
     properties.put(NereusKafkaConfigs.ENABLED_CONFIG, "true")
     properties.put(NereusKafkaConfigs.CLUSTER_CONFIG, "nereus-cluster")
+    properties.put(NereusKafkaConfigs.PROFILE_CONFIG, "OBJECT_WAL_SYNC_OBJECT")
     properties.put(NereusKafkaConfigs.OXIA_SERVICE_ADDRESS_CONFIG, "oxia://127.0.0.1:6648")
     properties.put(NereusKafkaConfigs.CACHE_DIR_CONFIG, "/tmp/nereus-kafka-runtime-cache")
     properties.put(NereusKafkaConfigs.BOOKKEEPER_METADATA_SERVICE_URI_CONFIG, "bk://127.0.0.1/ledgers")

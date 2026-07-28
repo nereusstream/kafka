@@ -1076,7 +1076,7 @@ class KafkaConfigTest {
         /** Share coordinator configs */
         case ShareCoordinatorConfig.APPEND_LINGER_MS_CONFIG => assertPropertyInvalid(baseProperties, name, "not_a_number", -2, -0.5)
 
-        /** Optional Nereus native-storage free-form strings */
+        /** Optional Nereus native-storage fields validated only for their selected profile */
         case NereusKafkaConfigs.CLUSTER_CONFIG |
              NereusKafkaConfigs.OXIA_SERVICE_ADDRESS_CONFIG |
              NereusKafkaConfigs.OXIA_NAMESPACE_CONFIG |
@@ -1085,6 +1085,14 @@ class KafkaConfigTest {
              NereusKafkaConfigs.OBJECT_ENDPOINT_CONFIG |
              NereusKafkaConfigs.OBJECT_REGION_CONFIG |
              NereusKafkaConfigs.BOOKKEEPER_METADATA_SERVICE_URI_CONFIG |
+             NereusKafkaConfigs.BOOKKEEPER_DEPLOYMENT_ID_CONFIG |
+             NereusKafkaConfigs.BOOKKEEPER_CLUSTER_ALIAS_CONFIG |
+             NereusKafkaConfigs.BOOKKEEPER_PROVIDER_SCOPE_SHA256_CONFIG |
+             NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_PREFIX_VALUE_CONFIG |
+             NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_RESERVATION_ID_CONFIG |
+             NereusKafkaConfigs.BOOKKEEPER_PASSWORD_FILE_CONFIG |
+             NereusKafkaConfigs.BOOKKEEPER_PASSWORD_VERSION_CONFIG |
+             NereusKafkaConfigs.BOOKKEEPER_READINESS_SHA256_CONFIG |
              NereusKafkaConfigs.CACHE_DIR_CONFIG |
              NereusKafkaConfigs.COMPACTION_SPILL_DIR_CONFIG => // ignore string
 
