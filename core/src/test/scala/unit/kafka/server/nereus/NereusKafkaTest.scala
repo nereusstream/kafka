@@ -22,12 +22,17 @@ import org.junit.jupiter.api.Test
 
 class NereusKafkaTest {
   @Test
-  def testSelectsFreshProductionFactoryWithoutGlobalRegistration(): Unit = {
-    val first = NereusKafka.productionFactory
-    val second = NereusKafka.productionFactory
+  def testSelectsFreshProductionFactoriesWithoutGlobalRegistration(): Unit = {
+    val firstBroker = NereusKafka.productionBrokerFactory
+    val secondBroker = NereusKafka.productionBrokerFactory
+    val firstController = NereusKafka.productionControllerFactory
+    val secondController = NereusKafka.productionControllerFactory
 
-    assertInstanceOf(classOf[NereusBrokerStorageRuntimeFactory], first)
-    assertInstanceOf(classOf[NereusBrokerStorageRuntimeFactory], second)
-    assertNotSame(first, second)
+    assertInstanceOf(classOf[NereusBrokerStorageRuntimeFactory], firstBroker)
+    assertInstanceOf(classOf[NereusBrokerStorageRuntimeFactory], secondBroker)
+    assertNotSame(firstBroker, secondBroker)
+    assertInstanceOf(classOf[NereusControllerStorageRuntimeFactory], firstController)
+    assertInstanceOf(classOf[NereusControllerStorageRuntimeFactory], secondController)
+    assertNotSame(firstController, secondController)
   }
 }

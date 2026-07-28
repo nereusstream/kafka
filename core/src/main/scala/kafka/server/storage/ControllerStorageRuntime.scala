@@ -15,27 +15,18 @@
  * limitations under the License.
  */
 
-package kafka.server.nereus
+package kafka.server.storage
 
-import kafka.Kafka
-import kafka.server.storage.BrokerStorageRuntimeFactory
-import kafka.server.storage.ControllerStorageRuntimeFactory
+import org.apache.kafka.image.publisher.MetadataPublisher
+
+import java.util.concurrent.CompletionStage
 
 /**
- * Explicit native-storage process entry point. It reuses the stock Kafka lifecycle and statically injects the Nereus
- * production runtime without reflection, a service loader, or a process-global registry.
+ * Stock-owned controller lifecycle seam for an optional authoritative-storage activation runtime.
+ *
+ * The runtime is also a metadata publisher so controller leadership and image callbacks remain ordered by the stock
+ * MetadataLoader. start only creates runtime resources; it must not wait for first activation to complete.
  */
-object NereusKafka {
-  def main(args: Array[String]): Unit = {
-    Kafka.run(
-      args,
-      productionBrokerFactory,
-      productionControllerFactory)
-  }
-
-  private[nereus] def productionBrokerFactory: BrokerStorageRuntimeFactory =
-    NereusBrokerStorageRuntimeFactory.production()
-
-  private[nereus] def productionControllerFactory: ControllerStorageRuntimeFactory =
-    NereusControllerStorageRuntimeFactory.production()
+trait ControllerStorageRuntime extends MetadataPublisher {
+  def start(): CompletionStage[Void]
 }

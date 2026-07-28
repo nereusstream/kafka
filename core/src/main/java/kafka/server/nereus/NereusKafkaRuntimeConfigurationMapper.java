@@ -30,6 +30,7 @@ import com.nereusstream.api.ReadOptions;
 import com.nereusstream.api.StorageProfile;
 import com.nereusstream.core.StreamStorageConfig;
 import com.nereusstream.kafka.activation.KafkaBrokerCapabilitySpecification;
+import com.nereusstream.kafka.activation.KafkaStorageActivationPolicy;
 import com.nereusstream.kafka.compaction.KafkaCompactionPartitionPass;
 import com.nereusstream.kafka.compaction.KafkaCompactionTwoPassExecutor;
 import com.nereusstream.kafka.runtime.NereusKafkaCompactionRuntimeConfiguration;
@@ -88,18 +89,7 @@ public final class NereusKafkaRuntimeConfigurationMapper {
             String javaVersion
     ) {
         NereusKafkaStorageConfig exact = Objects.requireNonNull(storage, "storage");
-        if (!exact.enabled()) {
-            throw new ConfigException(
-                    NereusKafkaConfigs.ENABLED_CONFIG,
-                    false,
-                    "cannot map a disabled Nereus Kafka storage configuration");
-        }
-        if (exact.core().profile() != NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT) {
-            throw new ConfigException(
-                    NereusKafkaConfigs.PROFILE_CONFIG,
-                    exact.core().profile().name(),
-                    "only OBJECT_WAL_SYNC_OBJECT has a production provider runtime");
-        }
+        requireExecutableStorage(exact);
         String cluster = required(exact.core().cluster(), NereusKafkaConfigs.CLUSTER_CONFIG);
         String oxiaAddress = required(
                 exact.core().oxiaServiceAddress(),
@@ -139,19 +129,8 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 Optional.empty(),
                 Optional.empty());
 
-        int maxPendingOperations = Math.max(
-                MIN_PENDING_OPERATIONS,
-                addExact(
-                        exact.append().executorQueueCapacity(),
-                        exact.fetch().executorQueueCapacity(),
-                        exact.lifecycle().executorQueueCapacity()));
-        OxiaClientConfiguration oxia = new OxiaClientConfiguration(
-                oxiaAddress,
-                exact.core().oxiaNamespace(),
-                providerTimeout,
-                exact.append().sessionTtl(),
-                MAX_COMMIT_CHAIN_SCAN,
-                maxPendingOperations);
+        OxiaClientConfiguration oxia =
+                oxiaConfiguration(exact, oxiaAddress, providerTimeout);
 
         long operationEpoch = Math.addExact(brokerEpoch, 1);
         String brokerIdentity = "kafka-broker-" + brokerId + "-epoch-" + brokerEpoch;
@@ -255,6 +234,46 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                 pendingProtection, orphanGrace,
                 nereusBuild,
                 providerToken);
+    }
+
+    /**
+     * Maps the controller's minimal activation graph without requiring a broker epoch or constructing provider resources.
+     */
+    public NereusKafkaControllerRuntimeConfiguration mapController(
+            NereusKafkaStorageConfig storage,
+            String kafkaClusterId
+    ) {
+        NereusKafkaStorageConfig exact =
+                Objects.requireNonNull(storage, "storage");
+        requireExecutableStorage(exact);
+        String nereusCluster =
+                required(exact.core().cluster(), NereusKafkaConfigs.CLUSTER_CONFIG);
+        String oxiaAddress = required(
+                exact.core().oxiaServiceAddress(),
+                NereusKafkaConfigs.OXIA_SERVICE_ADDRESS_CONFIG);
+        canonicalProvider(required(
+                exact.core().objectProvider(),
+                NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG));
+        required(
+                exact.core().objectBucket(),
+                NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
+        String exactKafkaClusterId =
+                nonblank(kafkaClusterId, "kafkaClusterId");
+        Duration providerTimeout =
+                minimum(exact.append().timeout(), exact.fetch().timeout());
+        Duration retryInterval = minimum(
+                exact.rollout().capabilityHeartbeat(),
+                Duration.ofSeconds(1));
+        return new NereusKafkaControllerRuntimeConfiguration(
+                nereusCluster,
+                exactKafkaClusterId,
+                oxiaConfiguration(exact, oxiaAddress, providerTimeout),
+                new KafkaStorageActivationPolicy(
+                        exactKafkaClusterId,
+                        Set.of(StorageProfile.OBJECT_WAL_SYNC_OBJECT),
+                        StorageProfile.OBJECT_WAL_SYNC_OBJECT,
+                        exact.rollout().capabilityExpiry()),
+                retryInterval);
     }
 
     /** Maps request-scan limits without requiring broker identity or constructing provider resources. */
@@ -394,6 +413,44 @@ public final class NereusKafkaRuntimeConfigurationMapper {
                         Math.max(3, storage.append().sessionRenewFailureGrace() + 1),
                         storage.lifecycle().registryScanPageSize(),
                         maximumPartitions));
+    }
+
+    private static OxiaClientConfiguration oxiaConfiguration(
+            NereusKafkaStorageConfig storage,
+            String oxiaAddress,
+            Duration providerTimeout
+    ) {
+        int maxPendingOperations = Math.max(
+                MIN_PENDING_OPERATIONS,
+                addExact(
+                        storage.append().executorQueueCapacity(),
+                        storage.fetch().executorQueueCapacity(),
+                        storage.lifecycle().executorQueueCapacity()));
+        return new OxiaClientConfiguration(
+                oxiaAddress,
+                storage.core().oxiaNamespace(),
+                providerTimeout,
+                storage.append().sessionTtl(),
+                MAX_COMMIT_CHAIN_SCAN,
+                maxPendingOperations);
+    }
+
+    private static void requireExecutableStorage(
+            NereusKafkaStorageConfig storage
+    ) {
+        if (!storage.enabled()) {
+            throw new ConfigException(
+                    NereusKafkaConfigs.ENABLED_CONFIG,
+                    false,
+                    "cannot map a disabled Nereus Kafka storage configuration");
+        }
+        if (storage.core().profile()
+                != NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT) {
+            throw new ConfigException(
+                    NereusKafkaConfigs.PROFILE_CONFIG,
+                    storage.core().profile().name(),
+                    "only OBJECT_WAL_SYNC_OBJECT has a production provider runtime");
+        }
     }
 
     private static byte[] configurationCompatibilitySha256(NereusKafkaStorageConfig storage) {

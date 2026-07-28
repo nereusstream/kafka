@@ -165,6 +165,33 @@ class NereusKafkaRuntimeConfigurationMapperTest {
     }
 
     @Test
+    void mapsControllerActivationWithoutBrokerIdentityOrProviderIo() {
+        NereusKafkaStorageConfig config = configuration(
+                NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT,
+                "s3");
+
+        NereusKafkaControllerRuntimeConfiguration mapped =
+                mapper.mapController(config, "kafka-cluster-a");
+
+        assertEquals("nereus-a", mapped.nereusCluster());
+        assertEquals("kafka-cluster-a", mapped.kafkaClusterId());
+        assertEquals(
+                "oxia://127.0.0.1:6648",
+                mapped.oxia().serviceAddress());
+        assertEquals(
+                java.util.List.of(
+                        StorageProfile.OBJECT_WAL_SYNC_OBJECT.name()),
+                mapped.activationPolicy().allowedStorageProfiles());
+        assertEquals(
+                StorageProfile.OBJECT_WAL_SYNC_OBJECT.name(),
+                mapped.activationPolicy().defaultStorageProfile());
+        assertEquals(
+                config.rollout().capabilityExpiry(),
+                mapped.activationPolicy().readinessTtl());
+        assertEquals(Duration.ofSeconds(1), mapped.retryInterval());
+    }
+
+    @Test
     void rejectsProfileWithoutExecutableProviderBeforeResourceCreation() {
         ConfigException failure = assertThrows(
                 ConfigException.class,

@@ -20,7 +20,7 @@ package kafka
 import java.util.{Objects, Properties}
 import joptsimple.OptionParser
 import kafka.server.{KafkaConfig, KafkaRaftServer, Server}
-import kafka.server.storage.BrokerStorageRuntimeFactory
+import kafka.server.storage.{BrokerStorageRuntimeFactory, ControllerStorageRuntimeFactory}
 import kafka.utils.Implicits._
 import kafka.utils.Logging
 import org.apache.kafka.common.utils.{Exit, Java, LoggingSignalHandler, OperatingSystem, Time, Utils}
@@ -64,32 +64,42 @@ object Kafka extends Logging {
 
   private def buildServer(
     props: Properties,
-    brokerStorageRuntimeFactory: BrokerStorageRuntimeFactory
+    brokerStorageRuntimeFactory: BrokerStorageRuntimeFactory,
+    controllerStorageRuntimeFactory: ControllerStorageRuntimeFactory
   ): Server = {
     val config = KafkaConfig.fromProps(props, doLog = false)
     new KafkaRaftServer(
       config,
       Time.SYSTEM,
       brokerStorageRuntimeFactory,
+      controllerStorageRuntimeFactory,
     )
   }
 
   def main(args: Array[String]): Unit = {
-    run(args, BrokerStorageRuntimeFactory.Disabled)
+    run(
+      args,
+      BrokerStorageRuntimeFactory.Disabled,
+      ControllerStorageRuntimeFactory.Disabled)
   }
 
   /**
-   * Shared stock lifecycle for an explicitly selected broker-storage runtime. The Nereus launcher calls this method with
-   * its statically linked production factory; the stock entry point above remains artifact-independent and disabled.
+   * Shared stock lifecycle for explicitly selected broker/controller storage runtimes. The Nereus launcher calls this
+   * method with its statically linked production factories; the stock entry point remains artifact-independent and disabled.
    */
   private[kafka] def run(
     args: Array[String],
-    brokerStorageRuntimeFactory: BrokerStorageRuntimeFactory
+    brokerStorageRuntimeFactory: BrokerStorageRuntimeFactory,
+    controllerStorageRuntimeFactory: ControllerStorageRuntimeFactory
   ): Unit = {
     Objects.requireNonNull(brokerStorageRuntimeFactory, "brokerStorageRuntimeFactory")
+    Objects.requireNonNull(controllerStorageRuntimeFactory, "controllerStorageRuntimeFactory")
     try {
       val serverProps = getPropsFromArgs(args)
-      val server = buildServer(serverProps, brokerStorageRuntimeFactory)
+      val server = buildServer(
+        serverProps,
+        brokerStorageRuntimeFactory,
+        controllerStorageRuntimeFactory)
 
       try {
         if (!OperatingSystem.IS_WINDOWS && !Java.isIbmJdk)

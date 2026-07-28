@@ -21,6 +21,7 @@ import kafka.network.SocketServer
 import kafka.raft.KafkaRaftManager
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.metadata.{ClientQuotaMetadataManager, DynamicConfigPublisher, DynamicTopicClusterQuotaPublisher, KRaftMetadataCachePublisher}
+import kafka.server.storage.{ControllerStorageRuntime, ControllerStorageRuntimeContext, ControllerStorageRuntimeFactory}
 
 import scala.collection.immutable
 import kafka.utils.{CoreUtils, Logging}
@@ -54,6 +55,7 @@ import org.apache.kafka.server.util.{Deadline, FutureUtils}
 import org.apache.kafka.server.NodeToControllerChannelManagerImpl
 import org.apache.kafka.server.RaftControllerNodeProvider
 
+import java.nio.file.Path
 import java.util
 import java.util.{Optional, OptionalLong}
 import java.util.concurrent.locks.ReentrantLock
@@ -68,8 +70,19 @@ import scala.jdk.OptionConverters.RichOption
 class ControllerServer(
   val sharedServer: SharedServer,
   val configSchema: KafkaConfigSchema,
-  val bootstrapMetadata: BootstrapMetadata
+  val bootstrapMetadata: BootstrapMetadata,
+  val controllerStorageRuntimeFactory: ControllerStorageRuntimeFactory = ControllerStorageRuntimeFactory.Disabled
 ) extends Logging {
+
+  def this(
+    sharedServer: SharedServer,
+    configSchema: KafkaConfigSchema,
+    bootstrapMetadata: BootstrapMetadata
+  ) = this(
+    sharedServer,
+    configSchema,
+    bootstrapMetadata,
+    ControllerStorageRuntimeFactory.Disabled)
 
   import kafka.server.Server._
 
@@ -111,6 +124,7 @@ class ControllerServer(
   @volatile var incarnationId: Uuid = _
   @volatile var registrationManager: ControllerRegistrationManager = _
   @volatile var registrationChannelManager: NodeToControllerChannelManager = _
+  @volatile var controllerStorageRuntime: ControllerStorageRuntime = _
 
   private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
     lock.lock()
@@ -387,6 +401,23 @@ class ControllerServer(
         authorizerPlugin.toJava
       ))
 
+      // Nereus inject start: create resources before publisher installation, then let stock loader callbacks drive
+      // controller-leader-only activation attempts. start never waits for first activation.
+      controllerStorageRuntime = controllerStorageRuntimeFactory.create(
+        ControllerStorageRuntimeContext(
+          config,
+          clusterId,
+          config.nodeId,
+          metadataCache,
+          time,
+          config.logDirs.asScala.map(Path.of(_)).asJava,
+          sharedServer.metadataPublishingFaultHandler))
+      FutureUtils.waitWithLogging(logger.underlying, logIdent,
+        "the controller storage runtime to start",
+        controllerStorageRuntime.start().toCompletableFuture, startupDeadline, time)
+      metadataPublishers.add(controllerStorageRuntime)
+      // Nereus inject end: controller storage runtime
+
       // Install all metadata publishers.
       FutureUtils.waitWithLogging(logger.underlying, logIdent,
         "the controller metadata publishers to be installed",
@@ -445,6 +476,8 @@ class ControllerServer(
       // smoother transition.
       sharedServer.ensureNotRaftLeader()
       incarnationId = null
+      Utils.closeQuietly(controllerStorageRuntime, "controller storage runtime")
+      controllerStorageRuntime = null
       Utils.closeQuietly(registrationManager, "registration manager")
       registrationManager = null
       if (registrationChannelManager != null) {
