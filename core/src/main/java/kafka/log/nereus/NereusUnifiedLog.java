@@ -914,7 +914,15 @@ public final class NereusUnifiedLog extends UnifiedLog
                 || source.appendInFlight()
                 || producerStateManager.mapEndOffset() != source.endOffset()) {
             throw invariant(
-                    "Nereus maintenance capture does not match the exact stable source");
+                    "Nereus maintenance capture does not match the exact stable source"
+                            + " [sourceTrim=" + source.trimOffset()
+                            + ", snapshotLogStart=" + snapshot.logStartOffset()
+                            + ", sourceEnd=" + source.endOffset()
+                            + ", snapshotStableEnd=" + snapshot.stableEndOffset()
+                            + ", sourceStateMapEnd=" + source.stateMapEndOffset()
+                            + ", producerStateMapEnd=" + producerStateManager.mapEndOffset()
+                            + ", appendInFlight=" + source.appendInFlight()
+                            + "]");
         }
         KafkaVirtualSegmentState virtualSegments = canonicalState.virtualSegments();
         KafkaDerivedIndexState derivedIndexes = canonicalState.derivedIndexes();
