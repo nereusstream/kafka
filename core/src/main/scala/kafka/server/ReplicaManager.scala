@@ -2739,8 +2739,13 @@ class ReplicaManager(val config: KafkaConfig,
       getOrCreatePartition(tp, delta, info.topicId).foreach { case (partition, isNew) =>
         try {
           val partitionAssignedDirectoryId = directoryIds.find(_._1.topicPartition() == tp).map(_._2)
-          partition.makeLeader(info.partition, isNew, offsetCheckpoints, Some(info.topicId), partitionAssignedDirectoryId)
-          onLeaderStatePublished(partition, info.topicId, info.partition.leaderEpoch)
+          partition.makeLeader(
+            info.partition,
+            isNew,
+            offsetCheckpoints,
+            Some(info.topicId),
+            partitionAssignedDirectoryId,
+            () => onLeaderStatePublished(partition, info.topicId, info.partition.leaderEpoch))
 
           changedPartitions.add(partition)
         } catch {

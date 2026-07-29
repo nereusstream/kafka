@@ -599,7 +599,9 @@ class Partition(val topicPartition: TopicPartition,
                  isNew: Boolean,
                  highWatermarkCheckpoints: OffsetCheckpoints,
                  topicId: Option[Uuid],
-                 targetDirectoryId: Option[Uuid] = None): Boolean = {
+                 targetDirectoryId: Option[Uuid] = None,
+                 onLeaderStatePublished: () => Unit = () => ()): Boolean = {
+    java.util.Objects.requireNonNull(onLeaderStatePublished, "onLeaderStatePublished")
     val (leaderHWIncremented, isNewLeader) = inWriteLock(leaderIsrUpdateLock) {
       // Partition state changes are expected to have a partition epoch larger or equal
       // to the current partition epoch. The latter is allowed because the partition epoch
@@ -688,6 +690,13 @@ class Partition(val topicPartition: TopicPartition,
 
       partitionEpoch = partitionRegistration.partitionEpoch
       leaderReplicaIdOpt = Some(localBrokerId)
+
+      // Nereus inject start: fence request routing before publishing a recoverable leader
+      // The callback must run under the same write lock as the leader transition. Running it after makeLeader
+      // returns leaves a request-visible window where the new empty cache log can answer ListOffsets before
+      // asynchronous Nereus recovery has marked the leader epoch pending.
+      onLeaderStatePublished()
+      // Nereus inject end: fence request routing before publishing a recoverable leader
 
       // We may need to increment high watermark since ISR could be down to 1.
       (maybeIncrementLeaderHW(leaderLog, currentTimeMs = currentTimeMs), isNewLeader)

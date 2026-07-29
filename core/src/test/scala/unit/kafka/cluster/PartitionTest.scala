@@ -42,7 +42,7 @@ import org.mockito.invocation.InvocationOnMock
 import java.lang.{Long => JLong}
 import java.nio.ByteBuffer
 import java.util.Optional
-import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Semaphore}
+import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CountDownLatch, ExecutionException, Semaphore, TimeUnit, TimeoutException}
 import kafka.server.share.DelayedShareFetch
 import org.apache.kafka.clients.ClientResponse
 import org.apache.kafka.common.compress.Compression
@@ -875,6 +875,56 @@ class PartitionTest extends AbstractPartitionTest {
       None,
       Optional.of(leaderEpoch),
       fetchOnlyFromLeader = true).timestampAndOffsetOpt().isPresent)
+  }
+
+  @Test
+  def testLeaderPublicationFencesListOffsetsBeforeMakeLeaderReleasesStateLock(): Unit = {
+    val leaderEpoch = 5
+    val replicas = Array(brokerId, remoteReplicaId)
+    val registration = new PartitionRegistration.Builder()
+      .setLeader(brokerId)
+      .setLeaderRecoveryState(LeaderRecoveryState.RECOVERED)
+      .setLeaderEpoch(leaderEpoch)
+      .setIsr(replicas)
+      .setPartitionEpoch(1)
+      .setReplicas(replicas)
+      .setDirectories(DirectoryId.unassignedArray(replicas.length))
+      .build()
+    val callbackEntered = new CountDownLatch(1)
+    val releaseCallback = new CountDownLatch(1)
+    val transition = CompletableFuture.supplyAsync(() =>
+      partition.makeLeader(
+        registration,
+        isNew = true,
+        offsetCheckpoints,
+        topicId,
+        None,
+        () => {
+          partition.beginLeaderEpochAwareOffsetLookup(leaderEpoch)
+          callbackEntered.countDown()
+          assertTrue(releaseCallback.await(5, TimeUnit.SECONDS))
+        }))
+
+    assertTrue(callbackEntered.await(5, TimeUnit.SECONDS))
+    val listOffsetsStarted = new CountDownLatch(1)
+    val listOffsets = CompletableFuture.supplyAsync(() => {
+      listOffsetsStarted.countDown()
+      partition.fetchOffsetForTimestamp(
+        ListOffsetsRequest.LATEST_TIMESTAMP,
+        None,
+        Optional.of(leaderEpoch),
+        fetchOnlyFromLeader = true)
+    })
+    assertTrue(listOffsetsStarted.await(5, TimeUnit.SECONDS))
+    try {
+      assertThrows(classOf[TimeoutException], () => listOffsets.get(100, TimeUnit.MILLISECONDS))
+    } finally {
+      releaseCallback.countDown()
+    }
+
+    assertTrue(transition.get(5, TimeUnit.SECONDS))
+    val failure = assertThrows(classOf[ExecutionException], () => listOffsets.get(5, TimeUnit.SECONDS))
+    assertInstanceOf(classOf[OffsetNotAvailableException], failure.getCause)
   }
 
   @Test
