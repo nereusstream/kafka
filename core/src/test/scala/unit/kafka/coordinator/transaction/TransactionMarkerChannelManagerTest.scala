@@ -400,6 +400,44 @@ class TransactionMarkerChannelManagerTest {
   }
 
   @Test
+  def shouldSaveForLaterWhenExistingPartitionHasNoLeader(): Unit = {
+    mockCache()
+
+    when(metadataCache.contains(partition1)).thenReturn(true)
+    when(metadataCache.getPartitionLeaderEndpoint(
+      ArgumentMatchers.eq(partition1.topic),
+      ArgumentMatchers.eq(partition1.partition),
+      any())
+    ).thenReturn(Optional.empty())
+      .thenReturn(Optional.empty())
+      .thenReturn(Optional.of(broker1))
+    when(metadataCache.getPartitionLeaderEndpoint(
+      ArgumentMatchers.eq(partition2.topic),
+      ArgumentMatchers.eq(partition2.partition),
+      any())
+    ).thenReturn(Optional.of(broker2))
+
+    channelManager.addTxnMarkersToSend(
+      coordinatorEpoch,
+      txnResult,
+      txnMetadata1,
+      txnMetadata1.prepareComplete(time.milliseconds()))
+
+    assertEquals(1, channelManager.numTxnsWithPendingMarkers)
+    assertEquals(1, channelManager.queueForUnknownBroker.totalNumMarkers)
+    assertEquals(1, channelManager.queueForBroker(broker2.id).get.totalNumMarkers)
+
+    val firstRequest = channelManager.generateRequests().asScala
+    assertEquals(1, firstRequest.size)
+    assertEquals(broker2, firstRequest.head.destination)
+
+    val secondRequest = channelManager.generateRequests().asScala
+    assertEquals(1, secondRequest.size)
+    assertEquals(broker1, secondRequest.head.destination)
+    assertEquals(0, channelManager.queueForUnknownBroker.totalNumMarkers)
+  }
+
+  @Test
   def shouldRemoveMarkersForTxnPartitionWhenPartitionEmigrated(): Unit = {
     mockCache()
 

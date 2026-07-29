@@ -387,7 +387,13 @@ class TransactionMarkerChannelManager(
                                  topicPartitions: immutable.Set[TopicPartition]): Unit = {
     val txnTopicPartition = txnStateManager.partitionFor(pendingCompleteTxn.transactionalId)
     val partitionsByDestination: immutable.Map[Option[Node], immutable.Set[TopicPartition]] = topicPartitions.groupBy { topicPartition: TopicPartition =>
-      OptionConverters.toScala(metadataCache.getPartitionLeaderEndpoint(topicPartition.topic, topicPartition.partition, interBrokerListenerName))
+      OptionConverters.toScala(metadataCache.getPartitionLeaderEndpoint(
+        topicPartition.topic,
+        topicPartition.partition,
+        interBrokerListenerName
+      )).orElse {
+        if (metadataCache.contains(topicPartition)) Some(Node.noNode) else None
+      }
     }
 
     val coordinatorEpoch = pendingCompleteTxn.coordinatorEpoch
