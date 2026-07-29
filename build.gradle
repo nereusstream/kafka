@@ -189,6 +189,13 @@ allprojects {
     // Nereus inject end: isolated development repository
     mavenCentral()
   }
+  // Nereus inject start: always resolve the just-published isolated development bytes
+  if (nereusDevelopmentEnabled) {
+    configurations.configureEach {
+      resolutionStrategy.cacheChangingModulesFor 0, 'seconds'
+    }
+  }
+  // Nereus inject end: always resolve the just-published isolated development bytes
 
   dependencyUpdates {
     revision="release"
@@ -1158,11 +1165,13 @@ project(':core') {
     // Nereus inject start: exact product-owned adapter boundary
     if (nereusDevelopmentEnabled) {
       implementation("com.nereusstream:nereus-kafka-adapter:${nereusDevelopmentVersion.get()}") {
+        changing = true
         // The host selects the exact SLF4J -> Log4j provider above. A provider
         // from a storage dependency must not cross the adapter boundary.
         exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
       }
       implementation("com.nereusstream:nereus-bookkeeper:${nereusDevelopmentVersion.get()}") {
+        changing = true
         // BookKeeper publishes these Java archives with NAR packaging. Resolve the same
         // archives explicitly as JARs so Kafka's -Werror compiler does not reject the
         // otherwise valid classes solely because their classpath entries end in .nar.
@@ -1173,10 +1182,18 @@ project(':core') {
       implementation "org.apache.bookkeeper:circe-checksum:4.18.0@jar"
       implementation "org.apache.bookkeeper:cpu-affinity:4.18.0@jar"
       implementation "org.slf4j:slf4j-api:2.0.17"
-      implementation "com.nereusstream:nereus-core:${nereusDevelopmentVersion.get()}"
-      implementation "com.nereusstream:nereus-materialization:${nereusDevelopmentVersion.get()}"
-      implementation "com.nereusstream:nereus-metadata-oxia:${nereusDevelopmentVersion.get()}"
-      implementation "com.nereusstream:nereus-object-store:${nereusDevelopmentVersion.get()}"
+      implementation("com.nereusstream:nereus-core:${nereusDevelopmentVersion.get()}") {
+        changing = true
+      }
+      implementation("com.nereusstream:nereus-materialization:${nereusDevelopmentVersion.get()}") {
+        changing = true
+      }
+      implementation("com.nereusstream:nereus-metadata-oxia:${nereusDevelopmentVersion.get()}") {
+        changing = true
+      }
+      implementation("com.nereusstream:nereus-object-store:${nereusDevelopmentVersion.get()}") {
+        changing = true
+      }
     }
     // Nereus inject end: exact product-owned adapter boundary
 
