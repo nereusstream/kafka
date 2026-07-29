@@ -20,6 +20,7 @@ package kafka.log.nereus
 import com.nereusstream.api.{ErrorCode, NereusException}
 import com.nereusstream.kafka.partition.{KafkaListOffsetsResolver, KafkaPartitionIdentity, KafkaPartitionLeaderOpenRequest, KafkaPartitionState, KafkaPartitionStorage, KafkaPartitionStorageManager}
 import kafka.cluster.Partition
+import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.common.errors.{FencedLeaderEpochException, NotLeaderOrFollowerException}
 import org.apache.kafka.storage.internals.log.LeaderEpochAwareOffsetLookup
 
@@ -93,7 +94,7 @@ final class NereusListOffsetsLifecycle(
     if (opening == null) {
       completeOpen(attempt, null, new NullPointerException("Nereus partition manager returned a null open future"))
     } else {
-      opening.whenComplete((storage, failure) => completeOpen(attempt, storage, failure))
+      opening.whenComplete((storage, failure) => completeManagerOpen(attempt, storage, failure))
     }
     attempt.result
   }
@@ -205,6 +206,43 @@ final class NereusListOffsetsLifecycle(
 
   override def close(): Unit = {
     shutdown()
+  }
+
+  private def completeManagerOpen(
+    attempt: Slot,
+    storage: KafkaPartitionStorage,
+    suppliedFailure: Throwable
+  ): Unit = {
+    if (suppliedFailure != null || storage == null) {
+      completeOpen(attempt, storage, suppliedFailure)
+      return
+    }
+    try {
+      validateStorage(attempt.request, storage)
+    } catch {
+      case failure: Throwable =>
+        completeOpen(attempt, storage, failure)
+        return
+    }
+    if (!requiresCoordinatorCompactedProbe(attempt.request.identity().observedTopicName())) {
+      completeOpen(attempt, storage, null)
+      return
+    }
+    val probe = try {
+      storage.probeMandatoryCompactedRead(attempt.request.timeout())
+    } catch {
+      case failure: Throwable =>
+        completeOpen(attempt, storage, failure)
+        return
+    }
+    if (probe == null) {
+      completeOpen(
+        attempt,
+        storage,
+        new NullPointerException("Nereus partition storage returned a null mandatory compacted-read probe"))
+    } else {
+      probe.whenComplete((_, failure) => completeOpen(attempt, storage, failure))
+    }
   }
 
   private def completeOpen(
@@ -348,6 +386,11 @@ final class NereusListOffsetsLifecycle(
       throw invariant("Nereus partition manager returned storage outside the requested recovered leader authority")
     }
   }
+
+  private def requiresCoordinatorCompactedProbe(topic: String): Boolean =
+    topic == Topic.GROUP_METADATA_TOPIC_NAME ||
+      topic == Topic.TRANSACTION_STATE_TOPIC_NAME ||
+      topic == Topic.SHARE_GROUP_STATE_TOPIC_NAME
 
   private def requireRoutingIdentity(partition: Partition, identity: KafkaPartitionIdentity): Unit = {
     if (partition.topic != identity.observedTopicName() || partition.partitionId != identity.partition()) {
