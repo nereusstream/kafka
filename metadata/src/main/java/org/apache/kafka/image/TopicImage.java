@@ -23,10 +23,14 @@ import org.apache.kafka.image.node.TopicImageNode;
 import org.apache.kafka.image.writer.ImageWriter;
 import org.apache.kafka.image.writer.ImageWriterOptions;
 import org.apache.kafka.metadata.PartitionRegistration;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateV1;
 
 import java.util.Collections;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Objects;
+import java.util.Optional;
 
 
 /**
@@ -34,16 +38,32 @@ import java.util.Map.Entry;
  *
  * This class is thread-safe.
  */
-public record TopicImage(String name, Uuid id, Map<Integer, PartitionRegistration> partitions) {
+public record TopicImage(
+    String name,
+    Uuid id,
+    Map<Integer, PartitionRegistration> partitions,
+    Optional<KafkaTopicBindingAggregateV1> nereusAggregate
+) {
     public TopicImage {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(id, "id");
         partitions = Collections.unmodifiableMap(partitions);
+        nereusAggregate = Objects.requireNonNull(nereusAggregate, "nereusAggregate");
+    }
+
+    public TopicImage(String name, Uuid id, Map<Integer, PartitionRegistration> partitions) {
+        this(name, id, partitions, Optional.empty());
     }
 
     public void write(ImageWriter writer, ImageWriterOptions options) {
         writer.write(0, new TopicRecord().
             setName(name).
             setTopicId(id));
-        for (Entry<Integer, PartitionRegistration> entry : partitions.entrySet()) {
+        nereusAggregate.ifPresent(aggregate -> writer.write(
+            KafkaTopicBindingAggregateMapperV1.WIRE_VERSION,
+            KafkaTopicBindingAggregateMapperV1.toRecord(aggregate)));
+        for (Entry<Integer, PartitionRegistration> entry : partitions.entrySet().stream().
+                sorted(Entry.comparingByKey()).toList()) {
             int partitionId = entry.getKey();
             PartitionRegistration partition = entry.getValue();
             writer.write(partition.toRecord(id, partitionId, options));

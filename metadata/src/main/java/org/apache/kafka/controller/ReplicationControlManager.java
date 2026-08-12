@@ -73,6 +73,7 @@ import org.apache.kafka.common.metadata.ClearElrRecord;
 import org.apache.kafka.common.metadata.PartitionChangeRecord;
 import org.apache.kafka.common.metadata.PartitionRecord;
 import org.apache.kafka.common.metadata.RemoveTopicRecord;
+import org.apache.kafka.common.metadata.TopicBindingAggregateRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.metadata.UnregisterBrokerRecord;
 import org.apache.kafka.common.protocol.Errors;
@@ -88,18 +89,22 @@ import org.apache.kafka.metadata.KafkaConfigSchema;
 import org.apache.kafka.metadata.LeaderRecoveryState;
 import org.apache.kafka.metadata.PartitionRegistration;
 import org.apache.kafka.metadata.Replicas;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateV1;
 import org.apache.kafka.metadata.placement.ClusterDescriber;
 import org.apache.kafka.metadata.placement.PartitionAssignment;
 import org.apache.kafka.metadata.placement.PlacementSpec;
 import org.apache.kafka.metadata.placement.TopicAssignment;
 import org.apache.kafka.metadata.placement.UsableBroker;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 import org.apache.kafka.server.common.TopicIdPartition;
 import org.apache.kafka.server.mutable.BoundedList;
 import org.apache.kafka.server.policy.CreateTopicPolicy;
 import org.apache.kafka.timeline.SnapshotRegistry;
 import org.apache.kafka.timeline.TimelineHashMap;
 import org.apache.kafka.timeline.TimelineHashSet;
+import org.apache.kafka.timeline.TimelineObject;
 
 import org.slf4j.Logger;
 
@@ -251,11 +256,13 @@ public class ReplicationControlManager {
         private final String name;
         private final Uuid id;
         private final TimelineHashMap<Integer, PartitionRegistration> parts;
+        private final TimelineObject<Optional<KafkaTopicBindingAggregateV1>> nereusAggregate;
 
         TopicControlInfo(String name, SnapshotRegistry snapshotRegistry, Uuid id) {
             this.name = name;
             this.id = id;
             this.parts = new TimelineHashMap<>(snapshotRegistry, 0);
+            this.nereusAggregate = new TimelineObject<>(snapshotRegistry, Optional.empty());
         }
 
         public String name() {
@@ -264,6 +271,10 @@ public class ReplicationControlManager {
 
         public Uuid topicId() {
             return id;
+        }
+
+        public Optional<KafkaTopicBindingAggregateV1> nereusAggregate() {
+            return nereusAggregate.get();
         }
 
         public int numPartitions(long epoch) {
@@ -470,6 +481,66 @@ public class ReplicationControlManager {
         } else {
             imbalancedPartitions.add(new TopicIdPartition(record.topicId(), record.partitionId()));
         }
+    }
+
+    public void replay(TopicBindingAggregateRecord record) {
+        if (!featureControl.isNereusStorageFeatureEnabled()) {
+            throw new RuntimeException("Tried to replay TopicBindingAggregateRecord while " +
+                NereusStorageVersion.FEATURE_NAME + " is disabled");
+        }
+        TopicControlInfo topicInfo = topics.get(record.topicId());
+        if (topicInfo == null) {
+            throw new RuntimeException("Tried to install TopicBindingAggregateRecord for topic ID " +
+                record.topicId() + ", but no topic with that ID was found.");
+        }
+        if (topicInfo.nereusAggregate.get().isPresent()) {
+            throw new RuntimeException("Found duplicate TopicBindingAggregateRecord for topic " + topicInfo.name +
+                " with topic ID " + topicInfo.id);
+        }
+        KafkaTopicBindingAggregateV1 aggregate = KafkaTopicBindingAggregateMapperV1.fromRecord(
+            record, KafkaTopicBindingAggregateMapperV1.WIRE_VERSION);
+        KafkaTopicBindingAggregateMapperV1.validateBackReference(aggregate, topicInfo.id, topicInfo.name);
+        topicInfo.nereusAggregate.set(Optional.of(aggregate));
+        log.info("Replayed TopicBindingAggregateRecord for topic {} with topic ID {}.",
+            topicInfo.name, topicInfo.id);
+    }
+
+    void validateNereusTopicBindingAggregates(Collection<ApiMessageAndVersion> records) {
+        Set<Uuid> touchedTopicIds = new HashSet<>();
+        for (ApiMessageAndVersion record : records) {
+            if (record.message() instanceof TopicRecord topicRecord) {
+                touchedTopicIds.add(topicRecord.topicId());
+            } else if (record.message() instanceof TopicBindingAggregateRecord aggregateRecord) {
+                touchedTopicIds.add(aggregateRecord.topicId());
+            } else if (record.message() instanceof PartitionRecord partitionRecord) {
+                touchedTopicIds.add(partitionRecord.topicId());
+            } else if (record.message() instanceof PartitionChangeRecord partitionChangeRecord) {
+                touchedTopicIds.add(partitionChangeRecord.topicId());
+            }
+        }
+        if (featureControl.isNereusStorageFeatureEnabled()) {
+            for (Uuid topicId : touchedTopicIds) {
+                TopicControlInfo topicInfo = topics.get(topicId);
+                if (topicInfo != null) {
+                    validateNereusTopicBindingAggregate(topicInfo);
+                }
+            }
+        }
+    }
+
+    void validateAllNereusTopicBindingAggregates() {
+        if (featureControl.isNereusStorageFeatureEnabled()) {
+            for (TopicControlInfo topicInfo : topics.values()) {
+                validateNereusTopicBindingAggregate(topicInfo);
+            }
+        }
+    }
+
+    private static void validateNereusTopicBindingAggregate(TopicControlInfo topicInfo) {
+        KafkaTopicBindingAggregateV1 aggregate = topicInfo.nereusAggregate.get().orElseThrow(() ->
+            new IllegalStateException("Feature-2 topic " + topicInfo.name + " with ID " + topicInfo.id +
+                " has no TopicBindingAggregateRecord"));
+        KafkaTopicBindingAggregateMapperV1.validateBackReference(aggregate, topicInfo.id, topicInfo.name);
     }
 
     private void updateReassigningTopicsIfNeeded(Uuid topicId, int partitionId,

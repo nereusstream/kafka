@@ -24,6 +24,7 @@ import org.apache.kafka.common.metadata.PartitionChangeRecord;
 import org.apache.kafka.common.metadata.PartitionRecord;
 import org.apache.kafka.metadata.PartitionRegistration;
 import org.apache.kafka.metadata.Replicas;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateV1;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -41,6 +42,7 @@ public final class TopicDelta {
     private final Map<Integer, PartitionRegistration> partitionChanges = new HashMap<>();
     private final Map<Integer, Integer> partitionToUncleanLeaderElectionCount = new HashMap<>();
     private final Map<Integer, Integer> partitionToElrElectionCount = new HashMap<>();
+    private KafkaTopicBindingAggregateV1 nereusAggregateChange = null;
 
     public TopicDelta(TopicImage image) {
         this.image = image;
@@ -72,6 +74,21 @@ public final class TopicDelta {
 
     public Map<Integer, Integer> partitionToElrElectionCount() {
         return partitionToElrElectionCount;
+    }
+
+    public java.util.Optional<KafkaTopicBindingAggregateV1> nereusAggregate() {
+        if (nereusAggregateChange != null) {
+            return java.util.Optional.of(nereusAggregateChange);
+        }
+        return image.nereusAggregate();
+    }
+
+    public void replay(KafkaTopicBindingAggregateV1 aggregate) {
+        if (nereusAggregateChange != null || image.nereusAggregate().isPresent()) {
+            throw new RuntimeException("Found duplicate TopicBindingAggregateRecord for topic " + image.name() +
+                " with topic ID " + image.id());
+        }
+        nereusAggregateChange = aggregate;
     }
     public Map<Integer, Integer> partitionToUncleanLeaderElectionCount() {
         return partitionToUncleanLeaderElectionCount;
@@ -151,7 +168,7 @@ public final class TopicDelta {
                 newPartitions.put(entry.getKey(), entry.getValue());
             }
         }
-        return new TopicImage(image.name(), image.id(), newPartitions);
+        return new TopicImage(image.name(), image.id(), newPartitions, nereusAggregate());
     }
 
     /**

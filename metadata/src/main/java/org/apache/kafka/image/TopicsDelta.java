@@ -24,8 +24,11 @@ import org.apache.kafka.common.metadata.ClearElrRecord;
 import org.apache.kafka.common.metadata.PartitionChangeRecord;
 import org.apache.kafka.common.metadata.PartitionRecord;
 import org.apache.kafka.common.metadata.RemoveTopicRecord;
+import org.apache.kafka.common.metadata.TopicBindingAggregateRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.metadata.Replicas;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateV1;
 import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.server.immutable.ImmutableMap;
 
@@ -88,6 +91,24 @@ public final class TopicsDelta {
     public void replay(PartitionRecord record) {
         TopicDelta topicDelta = getOrCreateTopicDelta(record.topicId());
         topicDelta.replay(record);
+    }
+
+    public void replay(TopicBindingAggregateRecord record) {
+        TopicDelta topicDelta = changedTopics.get(record.topicId());
+        if (topicDelta == null) {
+            TopicImage topicImage = image.getTopic(record.topicId());
+            if (topicImage == null) {
+                throw new RuntimeException("Unable to apply TopicBindingAggregateRecord for topic ID " +
+                    record.topicId() + ": no such topic found.");
+            }
+            topicDelta = new TopicDelta(topicImage);
+            changedTopics.put(record.topicId(), topicDelta);
+        }
+        KafkaTopicBindingAggregateV1 aggregate = KafkaTopicBindingAggregateMapperV1.fromRecord(
+            record, KafkaTopicBindingAggregateMapperV1.WIRE_VERSION);
+        KafkaTopicBindingAggregateMapperV1.validateBackReference(
+            aggregate, topicDelta.id(), topicDelta.name());
+        topicDelta.replay(aggregate);
     }
 
     public void replay(PartitionChangeRecord record) {

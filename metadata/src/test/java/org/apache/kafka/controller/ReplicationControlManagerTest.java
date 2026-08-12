@@ -70,6 +70,7 @@ import org.apache.kafka.common.metadata.PartitionChangeRecord;
 import org.apache.kafka.common.metadata.PartitionRecord;
 import org.apache.kafka.common.metadata.RegisterBrokerRecord;
 import org.apache.kafka.common.metadata.RemoveTopicRecord;
+import org.apache.kafka.common.metadata.TopicBindingAggregateRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.ApiMessage;
@@ -92,6 +93,8 @@ import org.apache.kafka.metadata.LeaderRecoveryState;
 import org.apache.kafka.metadata.PartitionRegistration;
 import org.apache.kafka.metadata.RecordTestUtils;
 import org.apache.kafka.metadata.Replicas;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingTestFixtures;
 import org.apache.kafka.metadata.placement.StripedReplicaPlacer;
 import org.apache.kafka.metadata.placement.UsableBroker;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
@@ -748,6 +751,45 @@ public class ReplicationControlManagerTest {
             new FeatureLevelRecord().
                 setName(NereusStorageVersion.FEATURE_NAME).
                 setFeatureLevel(NereusStorageVersion.DISABLED_LEVEL)));
+    }
+
+    @Test
+    public void testNereusTopicBindingAggregateReplayAndBatchValidation() {
+        ReplicationControlTestContext ctx =
+            new ReplicationControlTestContext.Builder().
+                setIsNereusStorageEnabled(true).
+                build();
+        Uuid topicId = new Uuid(71L, 72L);
+        TopicRecord topicRecord = new TopicRecord().setName("aggregate-topic").setTopicId(topicId);
+        TopicBindingAggregateRecord aggregateRecord = KafkaTopicBindingAggregateMapperV1.toRecord(
+            KafkaTopicBindingTestFixtures.aggregate(topicId, "aggregate-topic"));
+
+        ctx.replicationControl.replay(topicRecord);
+        assertThrows(IllegalStateException.class, () ->
+            ctx.replicationControl.validateNereusTopicBindingAggregates(List.of(
+                new ApiMessageAndVersion(topicRecord, (short) 0))));
+        ctx.replicationControl.replay(aggregateRecord);
+        ctx.replicationControl.validateNereusTopicBindingAggregates(List.of(
+            new ApiMessageAndVersion(topicRecord, (short) 0),
+            new ApiMessageAndVersion(aggregateRecord, (short) 0)));
+        assertTrue(ctx.replicationControl.getTopic(topicId).nereusAggregate().isPresent());
+        assertThrows(RuntimeException.class, () -> ctx.replicationControl.replay(aggregateRecord.duplicate()));
+
+        ctx.replicationControl.replay(new RemoveTopicRecord().setTopicId(topicId));
+        ctx.replicationControl.validateAllNereusTopicBindingAggregates();
+        assertNull(ctx.replicationControl.getTopic(topicId));
+    }
+
+    @Test
+    public void testNereusTopicBindingAggregateRejectsUnknownTopic() {
+        ReplicationControlTestContext ctx =
+            new ReplicationControlTestContext.Builder().
+                setIsNereusStorageEnabled(true).
+                build();
+        Uuid topicId = new Uuid(81L, 82L);
+        TopicBindingAggregateRecord aggregateRecord = KafkaTopicBindingAggregateMapperV1.toRecord(
+            KafkaTopicBindingTestFixtures.aggregate(topicId, "missing-topic"));
+        assertThrows(RuntimeException.class, () -> ctx.replicationControl.replay(aggregateRecord));
     }
 
     @Test

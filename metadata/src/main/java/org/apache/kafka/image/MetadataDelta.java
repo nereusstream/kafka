@@ -35,12 +35,15 @@ import org.apache.kafka.common.metadata.RemoveAccessControlEntryRecord;
 import org.apache.kafka.common.metadata.RemoveDelegationTokenRecord;
 import org.apache.kafka.common.metadata.RemoveTopicRecord;
 import org.apache.kafka.common.metadata.RemoveUserScramCredentialRecord;
+import org.apache.kafka.common.metadata.TopicBindingAggregateRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.metadata.UnfenceBrokerRecord;
 import org.apache.kafka.common.metadata.UnregisterBrokerRecord;
 import org.apache.kafka.common.metadata.UserScramCredentialRecord;
 import org.apache.kafka.common.protocol.ApiMessage;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingImageValidatorV1;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 
 import java.util.Optional;
 
@@ -81,6 +84,8 @@ public final class MetadataDelta {
     private ScramDelta scramDelta = null;
 
     private DelegationTokenDelta delegationTokenDelta = null;
+
+    private boolean finishedSnapshot = false;
 
     public MetadataDelta(MetadataImage image) {
         this.image = image;
@@ -193,6 +198,9 @@ public final class MetadataDelta {
             case TOPIC_RECORD:
                 replay((TopicRecord) record);
                 break;
+            case TOPIC_BINDING_AGGREGATE_RECORD:
+                replay((TopicBindingAggregateRecord) record);
+                break;
             case PARTITION_RECORD:
                 replay((PartitionRecord) record);
                 break;
@@ -271,6 +279,10 @@ public final class MetadataDelta {
     }
 
     public void replay(TopicRecord record) {
+        getOrCreateTopicsDelta().replay(record);
+    }
+
+    public void replay(TopicBindingAggregateRecord record) {
         getOrCreateTopicsDelta().replay(record);
     }
 
@@ -363,6 +375,7 @@ public final class MetadataDelta {
      * referenced in the snapshot records we just applied.
      */
     public void finishSnapshot() {
+        finishedSnapshot = true;
         getOrCreateFeaturesDelta().finishSnapshot();
         getOrCreateClusterDelta().finishSnapshot();
         getOrCreateTopicsDelta().finishSnapshot();
@@ -393,6 +406,13 @@ public final class MetadataDelta {
         } else {
             newTopics = topicsDelta.apply();
         }
+        boolean nereusFeatureChanged = featuresDelta != null &&
+            featuresDelta.changes().containsKey(NereusStorageVersion.FEATURE_NAME);
+        KafkaTopicBindingImageValidatorV1.validatePublication(
+            newFeatures,
+            newTopics,
+            topicsDelta,
+            finishedSnapshot || nereusFeatureChanged);
         ConfigurationsImage newConfigs;
         if (configsDelta == null) {
             newConfigs = image.configs();

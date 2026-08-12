@@ -21,6 +21,7 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.metadata.AbortTransactionRecord;
 import org.apache.kafka.common.metadata.BeginTransactionRecord;
 import org.apache.kafka.common.metadata.EndTransactionRecord;
+import org.apache.kafka.common.metadata.FeatureLevelRecord;
 import org.apache.kafka.common.metadata.NoOpRecord;
 import org.apache.kafka.common.metadata.PartitionRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
@@ -31,6 +32,7 @@ import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.raft.Batch;
 import org.apache.kafka.raft.LeaderAndEpoch;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 import org.apache.kafka.server.fault.MockFaultHandler;
 
 import org.junit.jupiter.api.Test;
@@ -253,6 +255,24 @@ public class MetadataBatchLoaderTest {
         );
         batchLoader.maybeFlushBatches(LEADER_AND_EPOCH, true);
         assertEquals(0, updater.updates);
+    }
+
+    @Test
+    public void testInvalidNereusCandidateImageIsNotPublished() {
+        MockMetadataUpdater updater = new MockMetadataUpdater();
+        MockFaultHandler faultHandler = new MockFaultHandler("testInvalidNereusCandidateImageIsNotPublished");
+        MetadataBatchLoader batchLoader = loadSingleBatch(updater, faultHandler, List.of(
+            new ApiMessageAndVersion(new FeatureLevelRecord()
+                .setName(NereusStorageVersion.FEATURE_NAME)
+                .setFeatureLevel(NereusStorageVersion.NSV_2.featureLevel()), (short) 0),
+            new ApiMessageAndVersion(new TopicRecord()
+                .setName("missing-aggregate")
+                .setTopicId(Uuid.randomUuid()), (short) 0)));
+
+        batchLoader.maybeFlushBatches(LEADER_AND_EPOCH, true);
+        assertEquals(0, updater.updates);
+        assertNotNull(faultHandler.firstException());
+        assertTrue(faultHandler.firstException().getCause().getMessage().contains("has no TopicBindingAggregateRecord"));
     }
 
     @Test

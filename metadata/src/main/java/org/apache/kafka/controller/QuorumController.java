@@ -79,6 +79,7 @@ import org.apache.kafka.common.metadata.RemoveAccessControlEntryRecord;
 import org.apache.kafka.common.metadata.RemoveDelegationTokenRecord;
 import org.apache.kafka.common.metadata.RemoveTopicRecord;
 import org.apache.kafka.common.metadata.RemoveUserScramCredentialRecord;
+import org.apache.kafka.common.metadata.TopicBindingAggregateRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.metadata.UnfenceBrokerRecord;
 import org.apache.kafka.common.metadata.UnregisterBrokerRecord;
@@ -835,6 +836,7 @@ public final class QuorumController implements Controller {
                             }
                             recordIndex++;
                         }
+                        replicationControl.validateNereusTopicBindingAggregates(records);
                         raftClient.schedulePreparedAppend();
                         offsetControl.handleScheduleAppend(lastOffset);
                         return lastOffset;
@@ -1010,6 +1012,7 @@ public final class QuorumController implements Controller {
                                 }
                                 recordIndex++;
                             }
+                            replicationControl.validateNereusTopicBindingAggregates(messages);
                             offsetControl.handleCommitBatch(batch);
                         }
                     }
@@ -1053,6 +1056,7 @@ public final class QuorumController implements Controller {
                             i++;
                         }
                     }
+                    replicationControl.validateAllNereusTopicBindingAggregates();
                     offsetControl.endLoadSnapshot(reader.lastContainedLogTimestamp());
                 } catch (FaultHandlerException e) {
                     throw e;
@@ -1218,6 +1222,9 @@ public final class QuorumController implements Controller {
                 break;
             case TOPIC_RECORD:
                 replicationControl.replay((TopicRecord) message);
+                break;
+            case TOPIC_BINDING_AGGREGATE_RECORD:
+                replicationControl.replay((TopicBindingAggregateRecord) message);
                 break;
             case PARTITION_RECORD:
                 replicationControl.replay((PartitionRecord) message);

@@ -268,10 +268,10 @@ public class MetadataBatchLoader {
             faultHandler.handleFault("Error generating new metadata image from " +
                 "metadata delta between offset " + image.offset() +
                 " and " + manifest.provenance().lastContainedOffset(), e);
+            resetToImage(image);
+            return;
         }
 
-        // Whether we can apply the delta or not, we need to make sure the batch loader gets reset
-        // to the image known to MetadataLoader
         callback.update(delta, image, manifest);
         resetToImage(image);
     }
