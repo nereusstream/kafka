@@ -1,0 +1,80 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "com.nereusstream",
+    "module": "nereus-domain",
+    "version": "0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.5.1"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "files": [
+        {
+          "name": "nereus-domain-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar",
+          "url": "nereus-domain-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar",
+          "size": 70491,
+          "sha512": "3764afa737289315ca308bc478d3fdcf2bc7aeb7701908ee6e1b0c108c881a9dada414a7a035ac9eb2a2163878e165cbb2071dee2e92ab7b31d41c4c06720b2f",
+          "sha256": "2c605ef675c388953f3d2046e02f17bff6b7273a04e4ab8d09cf60be59095600",
+          "sha1": "1fa2854da6722bc593dd212fd474785e7d978363",
+          "md5": "0a7ebdb60b651df3b11f08045c27d816"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "nereus-domain-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar",
+          "url": "nereus-domain-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar",
+          "size": 70491,
+          "sha512": "3764afa737289315ca308bc478d3fdcf2bc7aeb7701908ee6e1b0c108c881a9dada414a7a035ac9eb2a2163878e165cbb2071dee2e92ab7b31d41c4c06720b2f",
+          "sha256": "2c605ef675c388953f3d2046e02f17bff6b7273a04e4ab8d09cf60be59095600",
+          "sha1": "1fa2854da6722bc593dd212fd474785e7d978363",
+          "md5": "0a7ebdb60b651df3b11f08045c27d816"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "nereus-domain-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e-sources.jar",
+          "url": "nereus-domain-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e-sources.jar",
+          "size": 42044,
+          "sha512": "62b6cfa7589864b74a155536be5fa4d13a4fadf1318a7fcffe995e7d8a2dd3068ee0d1f33a8e6babba5ddc2d870a24e218e76fead3d2ae72da57c4a2c35c88de",
+          "sha256": "8ecedcc192a1b00846e9645758fff3a939944070ce201702495f3b59a7e8a129",
+          "sha1": "09032ff7f1835837830588eacb2ff7d60d5ef1f9",
+          "md5": "ba25896079ab59a704b82681f50d7a9b"
+        }
+      ]
+    }
+  ]
+}

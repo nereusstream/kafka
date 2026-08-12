@@ -1,0 +1,98 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "com.nereusstream",
+    "module": "nereus-metadata-spi",
+    "version": "0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.5.1"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "com.nereusstream",
+          "module": "nereus-domain",
+          "version": {
+            "requires": "0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "nereus-metadata-spi-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar",
+          "url": "nereus-metadata-spi-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar",
+          "size": 18790,
+          "sha512": "970efa01f12cba19762581eb35eb17d1ca4f689ad38adfbc3eead07e2f1894b85bec026b5c9ada17f9d999c0ad7c71a7c766779a2aa4fc2df369470d8d410bfb",
+          "sha256": "65827a76cea73b5116e7833813094ca144575d9141780d01d344f52f635a00b5",
+          "sha1": "9a4b436d44148f854d2ecfd303e2dc62644c2efe",
+          "md5": "0e9f2eb87674742e0c0fa278c6f7124f"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "com.nereusstream",
+          "module": "nereus-domain",
+          "version": {
+            "requires": "0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "nereus-metadata-spi-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar",
+          "url": "nereus-metadata-spi-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e.jar",
+          "size": 18790,
+          "sha512": "970efa01f12cba19762581eb35eb17d1ca4f689ad38adfbc3eead07e2f1894b85bec026b5c9ada17f9d999c0ad7c71a7c766779a2aa4fc2df369470d8d410bfb",
+          "sha256": "65827a76cea73b5116e7833813094ca144575d9141780d01d344f52f635a00b5",
+          "sha1": "9a4b436d44148f854d2ecfd303e2dc62644c2efe",
+          "md5": "0e9f2eb87674742e0c0fa278c6f7124f"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "nereus-metadata-spi-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e-sources.jar",
+          "url": "nereus-metadata-spi-0.2.0-n1.330aaec349c51fb2ace52b1085e8a9e5a60b5e3e-sources.jar",
+          "size": 14758,
+          "sha512": "d3eedea6ce88e386d01fb4fe58ed0a7be652c74f7601453641be284f8982d6a7b47b25081176ce1346c40e4f63f0f78904530517cd6b88e9e4ed9ebee45e842f",
+          "sha256": "7255139607b6c76f1ad214d8d9a425ea9e98ba5eb835588a84c90ded651183fe",
+          "sha1": "f2381bc32886b78f6e534b0346b62e62c44101c7",
+          "md5": "ea7af7eae9af38aadfe7117eea208217"
+        }
+      ]
+    }
+  ]
+}

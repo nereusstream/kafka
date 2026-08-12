@@ -52,6 +52,15 @@ if (nereusDevelopmentRepository.isPresent() != nereusDevelopmentVersion.isPresen
 }
 // Nereus inject end: isolated development artifact inputs
 
+// Nereus V2 K1 inject start: immutable N1 domain input
+def nereusN1SourceCommit = '330aaec349c51fb2ace52b1085e8a9e5a60b5e3e'
+def nereusN1DomainVersion = "0.2.0-n1.${nereusN1SourceCommit}"
+def nereusN1Repository = file("$rootDir/gradle/locked-artifacts/nereus-n1/${nereusN1SourceCommit}/m2")
+if (!nereusN1Repository.isDirectory()) {
+  throw new GradleException("missing immutable Nereus N1 repository ${nereusN1Repository}")
+}
+// Nereus V2 K1 inject end: immutable N1 domain input
+
 ext {
   minClientJavaVersion = 11
   minNonClientJavaVersion = 17
@@ -176,6 +185,23 @@ ext {
 allprojects {
 
   repositories {
+    // Nereus V2 K1 inject start: the Kafka metadata authority consumes only the exact N1 domain module.
+    exclusiveContent {
+      forRepository {
+        maven {
+          name = 'nereusN1Domain'
+          url = uri(nereusN1Repository)
+          metadataSources {
+            gradleMetadata()
+            mavenPom()
+          }
+        }
+      }
+      filter {
+        includeModule 'com.nereusstream', 'nereus-domain'
+      }
+    }
+    // Nereus V2 K1 inject end: immutable N1 domain input
     // Nereus inject start: isolated development repository
     if (nereusDevelopmentEnabled) {
       maven {
@@ -321,7 +347,8 @@ if (repo != null) {
         'clients/src/test/resources/serializedData/*',
         'docker/test/fixtures/secrets/*',
         'docker/examples/fixtures/secrets/*',
-        'docker/docker_official_images/.gitkeep'
+        'docker/docker_official_images/.gitkeep',
+        'gradle/locked-artifacts/nereus-n1/**'
     ])
   }
 } else {
@@ -1470,6 +1497,9 @@ project(':metadata') {
   }
 
   dependencies {
+    // Nereus V2 K1 inject start: direct domain mapping; never metadata SPI, Oxia, SNAPSHOT, or composite input.
+    implementation "com.nereusstream:nereus-domain:${nereusN1DomainVersion}"
+    // Nereus V2 K1 inject end: immutable N1 domain input
     implementation project(':server-common')
     implementation project(':clients')
     implementation project(':raft')
