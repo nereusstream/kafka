@@ -103,6 +103,7 @@ import org.apache.kafka.metadata.FinalizedControllerFeatures;
 import org.apache.kafka.metadata.KafkaConfigSchema;
 import org.apache.kafka.metadata.VersionRange;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
+import org.apache.kafka.metadata.nereus.NereusKafkaMetadataPolicyV1;
 import org.apache.kafka.metadata.placement.ReplicaPlacer;
 import org.apache.kafka.metadata.placement.StripedReplicaPlacer;
 import org.apache.kafka.metadata.util.RecordRedactor;
@@ -111,12 +112,14 @@ import org.apache.kafka.queue.EventQueue.EarliestDeadlineFunction;
 import org.apache.kafka.queue.KafkaEventQueue;
 import org.apache.kafka.raft.Batch;
 import org.apache.kafka.raft.BatchReader;
+import org.apache.kafka.raft.KafkaRaftClient;
 import org.apache.kafka.raft.LeaderAndEpoch;
 import org.apache.kafka.raft.RaftClient;
 import org.apache.kafka.server.authorizer.AclCreateResult;
 import org.apache.kafka.server.authorizer.AclDeleteResult;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.KRaftVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 import org.apache.kafka.server.common.OffsetAndEpoch;
 import org.apache.kafka.server.fault.FaultHandler;
 import org.apache.kafka.server.fault.FaultHandlerException;
@@ -135,6 +138,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
@@ -213,6 +217,8 @@ public final class QuorumController implements Controller {
         private Map<String, Object> staticConfig = Map.of();
         private BootstrapMetadata bootstrapMetadata = null;
         private int maxRecordsPerBatch = DEFAULT_MAX_RECORDS_PER_BATCH;
+        private int maxBatchSizeBytes = KafkaRaftClient.MAX_BATCH_SIZE_BYTES;
+        private NereusKafkaMetadataPolicyV1 nereusMetadataPolicy = null;
         private long controllerPerformanceSamplePeriodMs = 60000L;
         private long controllerPerformanceAlwaysLogThresholdMs = 2000L;
         private DelegationTokenCache tokenCache;
@@ -321,6 +327,16 @@ public final class QuorumController implements Controller {
             return this;
         }
 
+        public Builder setMaxBatchSizeBytes(int maxBatchSizeBytes) {
+            this.maxBatchSizeBytes = maxBatchSizeBytes;
+            return this;
+        }
+
+        public Builder setNereusMetadataPolicy(NereusKafkaMetadataPolicyV1 nereusMetadataPolicy) {
+            this.nereusMetadataPolicy = Objects.requireNonNull(nereusMetadataPolicy, "nereusMetadataPolicy");
+            return this;
+        }
+
         public Builder setControllerPerformanceSamplePeriodMs(long controllerPerformanceSamplePeriodMs) {
             this.controllerPerformanceSamplePeriodMs = controllerPerformanceSamplePeriodMs;
             return this;
@@ -404,6 +420,14 @@ public final class QuorumController implements Controller {
             if (controllerMetrics == null) {
                 controllerMetrics = new QuorumControllerMetrics(Optional.empty(), time, 0);
             }
+            if (bootstrapMetadata.featureLevel(NereusStorageVersion.FEATURE_NAME) ==
+                    NereusStorageVersion.NSV_2.featureLevel()) {
+                if (nereusMetadataPolicy == null) {
+                    throw new IllegalStateException(
+                        "nereus.storage.version=2 requires an immutable Nereus Kafka metadata policy");
+                }
+                nereusMetadataPolicy.validateFeatureAdmission();
+            }
 
             KafkaEventQueue queue = null;
             try {
@@ -440,6 +464,8 @@ public final class QuorumController implements Controller {
                     staticConfig,
                     bootstrapMetadata,
                     maxRecordsPerBatch,
+                    maxBatchSizeBytes,
+                    nereusMetadataPolicy,
                     tokenCache,
                     tokenSecretKeyString,
                     delegationTokenMaxLifeMs,
@@ -1496,6 +1522,8 @@ public final class QuorumController implements Controller {
         Map<String, Object> staticConfig,
         BootstrapMetadata bootstrapMetadata,
         int maxRecordsPerBatch,
+        int maxBatchSizeBytes,
+        NereusKafkaMetadataPolicyV1 nereusMetadataPolicy,
         DelegationTokenCache tokenCache,
         String tokenSecretKeyString,
         long delegationTokenMaxLifeMs,
@@ -1571,6 +1599,9 @@ public final class QuorumController implements Controller {
             setClusterControl(clusterControl).
             setCreateTopicPolicy(createTopicPolicy).
             setFeatureControl(featureControl).
+            setNereusMetadataPolicy(Optional.ofNullable(nereusMetadataPolicy)).
+            setMaxRecordsPerBatch(maxRecordsPerBatch).
+            setMaxBatchSizeBytes(maxBatchSizeBytes).
             build();
         this.scramControlManager = new ScramControlManager.Builder().
             setLogContext(logContext).

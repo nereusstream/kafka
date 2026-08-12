@@ -40,7 +40,7 @@ import org.apache.kafka.metadata.{KafkaConfigSchema, KRaftMetadataCache, Listene
 import org.apache.kafka.metadata.authorizer.ClusterMetadataAuthorizer
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata
 import org.apache.kafka.metadata.publisher.{AclPublisher, DelegationTokenPublisher, DynamicClientQuotaPublisher, FeaturesPublisher, ScramPublisher}
-import org.apache.kafka.raft.QuorumConfig
+import org.apache.kafka.raft.{MetadataLogConfig, QuorumConfig}
 import org.apache.kafka.security.{CredentialProvider, DelegationTokenManager}
 import org.apache.kafka.server.{ProcessRole, SimpleApiVersionManager}
 import org.apache.kafka.server.authorizer.Authorizer
@@ -256,6 +256,7 @@ class ControllerServer(
           setQuorumFeatures(quorumFeatures).
           setDefaultReplicationFactor(config.defaultReplicationFactor.toShort).
           setDefaultNumPartitions(config.numPartitions.intValue()).
+          setMaxBatchSizeBytes(config.getInt(MetadataLogConfig.INTERNAL_METADATA_MAX_BATCH_SIZE_IN_BYTES_CONFIG)).
           setSessionTimeoutNs(TimeUnit.NANOSECONDS.convert(config.brokerSessionTimeoutMs.longValue(),
             TimeUnit.MILLISECONDS)).
           setLeaderImbalanceCheckIntervalNs(leaderImbalanceCheckIntervalNs).

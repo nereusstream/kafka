@@ -91,6 +91,10 @@ import org.apache.kafka.metadata.PartitionRegistration;
 import org.apache.kafka.metadata.Replicas;
 import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1;
 import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateV1;
+import org.apache.kafka.metadata.nereus.MetadataRecordBatchSizer;
+import org.apache.kafka.metadata.nereus.NereusKafkaMetadataPolicyV1;
+import org.apache.kafka.metadata.nereus.NereusTopicProfileResolverV1;
+import org.apache.kafka.metadata.nereus.TopicCreateCandidateV1;
 import org.apache.kafka.metadata.placement.ClusterDescriber;
 import org.apache.kafka.metadata.placement.PartitionAssignment;
 import org.apache.kafka.metadata.placement.PlacementSpec;
@@ -145,6 +149,7 @@ import static org.apache.kafka.controller.PartitionReassignmentReplicas.isReassi
 import static org.apache.kafka.controller.QuorumController.MAX_RECORDS_PER_USER_OP;
 import static org.apache.kafka.metadata.LeaderConstants.NO_LEADER;
 import static org.apache.kafka.metadata.LeaderConstants.NO_LEADER_CHANGE;
+import static org.apache.kafka.raft.KafkaRaftClient.MAX_BATCH_SIZE_BYTES;
 
 
 /**
@@ -167,6 +172,9 @@ public class ReplicationControlManager {
         private ClusterControlManager clusterControl = null;
         private Optional<CreateTopicPolicy> createTopicPolicy = Optional.empty();
         private FeatureControlManager featureControl = null;
+        private Optional<NereusKafkaMetadataPolicyV1> nereusMetadataPolicy = Optional.empty();
+        private int maxRecordsPerBatch = MAX_RECORDS_PER_USER_OP;
+        private int maxBatchSizeBytes = MAX_BATCH_SIZE_BYTES;
 
         Builder setSnapshotRegistry(SnapshotRegistry snapshotRegistry) {
             this.snapshotRegistry = snapshotRegistry;
@@ -213,6 +221,22 @@ public class ReplicationControlManager {
             return this;
         }
 
+        public Builder setNereusMetadataPolicy(Optional<NereusKafkaMetadataPolicyV1> nereusMetadataPolicy) {
+            this.nereusMetadataPolicy = Objects.requireNonNull(
+                nereusMetadataPolicy, "nereusMetadataPolicy");
+            return this;
+        }
+
+        Builder setMaxRecordsPerBatch(int maxRecordsPerBatch) {
+            this.maxRecordsPerBatch = maxRecordsPerBatch;
+            return this;
+        }
+
+        Builder setMaxBatchSizeBytes(int maxBatchSizeBytes) {
+            this.maxBatchSizeBytes = maxBatchSizeBytes;
+            return this;
+        }
+
         ReplicationControlManager build() {
             if (configurationControl == null) {
                 throw new IllegalStateException("Configuration control must be set before building");
@@ -232,7 +256,10 @@ public class ReplicationControlManager {
                 configurationControl,
                 clusterControl,
                 createTopicPolicy,
-                featureControl);
+                featureControl,
+                nereusMetadataPolicy,
+                maxRecordsPerBatch,
+                maxBatchSizeBytes);
         }
     }
 
@@ -286,8 +313,19 @@ public class ReplicationControlManager {
      * Translate a CreatableTopicConfigCollection to a map from string to string.
      */
     static Map<String, String> translateCreationConfigs(CreatableTopicConfigCollection collection) {
+        return translateCreationConfigs(collection, false);
+    }
+
+    static Map<String, String> translateCreationConfigs(
+        CreatableTopicConfigCollection collection,
+        boolean stripNereusProfile
+    ) {
         HashMap<String, String> result = new HashMap<>();
-        collection.forEach(config -> result.put(config.name(), config.value()));
+        collection.forEach(config -> {
+            if (!stripNereusProfile || !NereusTopicProfileResolverV1.isProfileConfig(config.name())) {
+                result.put(config.name(), config.value());
+            }
+        });
         return Collections.unmodifiableMap(result);
     }
 
@@ -330,6 +368,13 @@ public class ReplicationControlManager {
      * The feature control manager.
      */
     private final FeatureControlManager featureControl;
+
+    /** Immutable policy input used only while constructing feature-2 topic aggregates. */
+    private final Optional<NereusKafkaMetadataPolicyV1> nereusMetadataPolicy;
+
+    private final int maxRecordsPerBatch;
+
+    private final int maxBatchSizeBytes;
 
     /**
      * Maps topic names to topic UUIDs.
@@ -398,7 +443,10 @@ public class ReplicationControlManager {
         ConfigurationControlManager configurationControl,
         ClusterControlManager clusterControl,
         Optional<CreateTopicPolicy> createTopicPolicy,
-        FeatureControlManager featureControl
+        FeatureControlManager featureControl,
+        Optional<NereusKafkaMetadataPolicyV1> nereusMetadataPolicy,
+        int maxRecordsPerBatch,
+        int maxBatchSizeBytes
     ) {
         this.snapshotRegistry = snapshotRegistry;
         this.log = logContext.logger(ReplicationControlManager.class);
@@ -408,6 +456,9 @@ public class ReplicationControlManager {
         this.configurationControl = configurationControl;
         this.createTopicPolicy = createTopicPolicy;
         this.featureControl = featureControl;
+        this.nereusMetadataPolicy = nereusMetadataPolicy;
+        this.maxRecordsPerBatch = maxRecordsPerBatch;
+        this.maxBatchSizeBytes = maxBatchSizeBytes;
         this.clusterControl = clusterControl;
         this.topicsByName = new TimelineHashMap<>(snapshotRegistry, 0);
         this.topicsWithCollisionChars = new TimelineHashMap<>(snapshotRegistry, 0);
@@ -694,6 +745,9 @@ public class ReplicationControlManager {
         CreateTopicsRequestData request,
         Set<String> describable
     ) {
+        if (featureControl.isNereusStorageFeatureEnabled()) {
+            return createNereusTopics(context, request, describable);
+        }
         Map<String, ApiError> topicErrors = new HashMap<>();
         List<ApiMessageAndVersion> records = BoundedList.newArrayBacked(MAX_RECORDS_PER_USER_OP);
 
@@ -772,6 +826,317 @@ public class ReplicationControlManager {
             log.info("CreateTopics result(s): {}", resultsBuilder);
             return ControllerResult.atomicOf(records, data);
         }
+    }
+
+    private ControllerResult<CreateTopicsResponseData> createNereusTopics(
+        ControllerRequestContext context,
+        CreateTopicsRequestData request,
+        Set<String> describable
+    ) {
+        NereusKafkaMetadataPolicyV1 policy = nereusMetadataPolicy.orElseThrow(() ->
+            new IllegalStateException(
+                "nereus.storage.version=2 is active without an immutable Kafka metadata policy"));
+        policy.validateFeatureAdmission();
+
+        Map<String, ApiError> topicErrors = new HashMap<>();
+        List<ApiMessageAndVersion> records = new ArrayList<>();
+        validateTotalNumberOfPartitions(request, defaultNumPartitions);
+        validateNewTopicNames(topicErrors, request.topics(), topicsWithCollisionChars);
+        request.topics().stream().filter(creatableTopic -> topicsByName.containsKey(creatableTopic.name()))
+            .forEach(topic -> topicErrors.put(topic.name(), new ApiError(
+                Errors.TOPIC_ALREADY_EXISTS, "Topic '" + topic.name() + "' already exists.")));
+
+        Map<ConfigResource, Map<String, Entry<OpType, String>>> configChanges =
+            computeConfigChanges(topicErrors, request.topics(), true);
+        Map<String, CreatableTopicResult> successes = new HashMap<>();
+        for (CreatableTopic topic : request.topics()) {
+            if (topicErrors.containsKey(topic.name())) {
+                continue;
+            }
+
+            final NereusTopicProfileResolverV1.Resolution resolution;
+            try {
+                resolution = NereusTopicProfileResolverV1.resolve(topic.name(), topic.configs(), policy);
+            } catch (ApiException e) {
+                topicErrors.put(topic.name(), ApiError.fromThrowable(e));
+                continue;
+            }
+
+            ConfigResource configResource = new ConfigResource(TOPIC, topic.name());
+            Map<String, Entry<OpType, String>> keyToOps = configChanges.get(configResource);
+            List<ApiMessageAndVersion> configRecords;
+            if (keyToOps == null) {
+                configRecords = List.of();
+            } else {
+                ControllerResult<ApiError> configResult =
+                    configurationControl.incrementalAlterConfig(configResource, keyToOps, true);
+                if (configResult.response().isFailure()) {
+                    topicErrors.put(topic.name(), configResult.response());
+                    continue;
+                }
+                configRecords = configResult.records();
+            }
+
+            final NereusTopicCandidateResult candidateResult;
+            try {
+                candidateResult = createNereusTopicCandidate(
+                    topic,
+                    configRecords,
+                    describable.contains(topic.name()),
+                    policy,
+                    resolution);
+            } catch (ApiException e) {
+                topicErrors.put(topic.name(), ApiError.fromThrowable(e));
+                continue;
+            }
+            if (candidateResult.error().isFailure()) {
+                topicErrors.put(topic.name(), candidateResult.error());
+                continue;
+            }
+
+            TopicCreateCandidateV1 candidate = candidateResult.candidate();
+            List<ApiMessageAndVersion> proposedRecords = new ArrayList<>(records.size() + candidate.records().size());
+            proposedRecords.addAll(records);
+            proposedRecords.addAll(candidate.records());
+            final boolean admitted;
+            try {
+                admitted = proposedRecords.size() <= maxRecordsPerBatch &&
+                    MetadataRecordBatchSizer.sizeInBytes(proposedRecords) <= maxBatchSizeBytes;
+            } catch (ArithmeticException e) {
+                topicErrors.put(topic.name(), new ApiError(
+                    Errors.POLICY_VIOLATION, "CreateTopics metadata batch size overflow"));
+                continue;
+            }
+            if (!admitted) {
+                topicErrors.put(topic.name(), new ApiError(
+                    Errors.POLICY_VIOLATION,
+                    "Topic creation would exceed the atomic metadata batch limit of " +
+                        maxRecordsPerBatch + " records or " + maxBatchSizeBytes + " bytes."));
+                continue;
+            }
+
+            if (!request.validateOnly()) {
+                try {
+                    context.applyPartitionChangeQuota(candidate.numPartitions());
+                } catch (ThrottlingQuotaExceededException e) {
+                    log.debug("Topic creation of {} partitions not allowed because quota is violated. Delay time: {}",
+                        candidate.numPartitions(), e.throttleTimeMs());
+                    topicErrors.put(topic.name(), ApiError.fromThrowable(e));
+                    continue;
+                }
+            }
+            records.clear();
+            records.addAll(proposedRecords);
+            successes.put(topic.name(), candidate.response());
+        }
+
+        CreateTopicsResponseData data = createTopicsResponse(request, topicErrors, successes);
+        if (request.validateOnly()) {
+            return ControllerResult.atomicOf(List.of(), data);
+        }
+        return ControllerResult.atomicOf(records, data);
+    }
+
+    private record NereusTopicCandidateResult(ApiError error, TopicCreateCandidateV1 candidate) {
+        static NereusTopicCandidateResult failure(ApiError error) {
+            return new NereusTopicCandidateResult(error, null);
+        }
+
+        static NereusTopicCandidateResult success(TopicCreateCandidateV1 candidate) {
+            return new NereusTopicCandidateResult(ApiError.NONE, candidate);
+        }
+    }
+
+    private NereusTopicCandidateResult createNereusTopicCandidate(
+        CreatableTopic topic,
+        List<ApiMessageAndVersion> configRecords,
+        boolean authorizedToReturnConfigs,
+        NereusKafkaMetadataPolicyV1 policy,
+        NereusTopicProfileResolverV1.Resolution resolution
+    ) {
+        Map<String, String> creationConfigs = translateCreationConfigs(topic.configs(), true);
+        Map<Integer, PartitionRegistration> newParts = new HashMap<>();
+        if (!topic.assignments().isEmpty()) {
+            if (topic.replicationFactor() != -1) {
+                return NereusTopicCandidateResult.failure(new ApiError(INVALID_REQUEST,
+                    "A manual partition assignment was specified, but replication factor was not set to -1."));
+            }
+            if (topic.numPartitions() != -1) {
+                return NereusTopicCandidateResult.failure(new ApiError(INVALID_REQUEST,
+                    "A manual partition assignment was specified, but numPartitions was not set to -1."));
+            }
+            OptionalInt replicationFactor = OptionalInt.empty();
+            for (CreatableReplicaAssignment assignment : topic.assignments()) {
+                if (newParts.containsKey(assignment.partitionIndex())) {
+                    return NereusTopicCandidateResult.failure(new ApiError(
+                        Errors.INVALID_REPLICA_ASSIGNMENT,
+                        "Found multiple manual partition assignments for partition " + assignment.partitionIndex()));
+                }
+                PartitionAssignment partitionAssignment =
+                    new PartitionAssignment(assignment.brokerIds(), clusterDescriber);
+                validateManualPartitionAssignment(partitionAssignment, replicationFactor);
+                replicationFactor = OptionalInt.of(assignment.brokerIds().size());
+                List<Integer> isr = assignment.brokerIds().stream().filter(clusterControl::isActive).toList();
+                if (isr.isEmpty()) {
+                    return NereusTopicCandidateResult.failure(new ApiError(
+                        Errors.INVALID_REPLICA_ASSIGNMENT,
+                        "All brokers specified in the manual partition assignment for partition " +
+                            assignment.partitionIndex() + " are fenced or in controlled shutdown."));
+                }
+                newParts.put(
+                    assignment.partitionIndex(),
+                    buildPartitionRegistration(partitionAssignment, isr));
+            }
+            for (int i = 0; i < newParts.size(); i++) {
+                if (!newParts.containsKey(i)) {
+                    return NereusTopicCandidateResult.failure(new ApiError(
+                        Errors.INVALID_REPLICA_ASSIGNMENT,
+                        "partitions should be a consecutive 0-based integer sequence"));
+                }
+            }
+            ApiError error = maybeCheckCreateTopicPolicy(() -> {
+                Map<Integer, List<Integer>> assignments = new HashMap<>();
+                newParts.forEach((key, value) -> assignments.put(key, Replicas.toList(value.replicas)));
+                return new CreateTopicPolicy.RequestMetadata(
+                    topic.name(), null, null, assignments, creationConfigs);
+            });
+            if (error.isFailure()) {
+                return NereusTopicCandidateResult.failure(error);
+            }
+        } else if (topic.replicationFactor() < -1 || topic.replicationFactor() == 0) {
+            return NereusTopicCandidateResult.failure(new ApiError(
+                Errors.INVALID_REPLICATION_FACTOR,
+                "Replication factor must be larger than 0, or -1 to use the default value."));
+        } else if (topic.numPartitions() < -1 || topic.numPartitions() == 0) {
+            return NereusTopicCandidateResult.failure(new ApiError(
+                Errors.INVALID_PARTITIONS,
+                "Number of partitions was set to an invalid non-positive value."));
+        } else {
+            int numPartitions = topic.numPartitions() == -1 ? defaultNumPartitions : topic.numPartitions();
+            short replicationFactor = topic.replicationFactor() == -1 ?
+                defaultReplicationFactor : topic.replicationFactor();
+            try {
+                TopicAssignment topicAssignment = clusterControl.replicaPlacer().place(new PlacementSpec(
+                    0, numPartitions, replicationFactor), clusterDescriber);
+                for (int partitionId = 0; partitionId < topicAssignment.assignments().size(); partitionId++) {
+                    PartitionAssignment partitionAssignment = topicAssignment.assignments().get(partitionId);
+                    List<Integer> isr = partitionAssignment.replicas().stream()
+                        .filter(clusterControl::isActive).toList();
+                    if (isr.isEmpty()) {
+                        return NereusTopicCandidateResult.failure(new ApiError(
+                            Errors.INVALID_REPLICATION_FACTOR,
+                            "Unable to replicate the partition " + replicationFactor +
+                                " time(s): All brokers are currently fenced or in controlled shutdown."));
+                    }
+                    newParts.put(partitionId, buildPartitionRegistration(partitionAssignment, isr));
+                }
+            } catch (InvalidReplicationFactorException e) {
+                return NereusTopicCandidateResult.failure(new ApiError(
+                    Errors.INVALID_REPLICATION_FACTOR,
+                    "Unable to replicate the partition " + replicationFactor + " time(s): " + e.getMessage()));
+            }
+            ApiError error = maybeCheckCreateTopicPolicy(() -> new CreateTopicPolicy.RequestMetadata(
+                topic.name(), numPartitions, replicationFactor, null, creationConfigs));
+            if (error.isFailure()) {
+                return NereusTopicCandidateResult.failure(error);
+            }
+        }
+
+        Uuid topicId = Uuid.randomUuid();
+        int numPartitions = newParts.size();
+        CreatableTopicResult response = createNereusTopicResponse(
+            topic,
+            topicId,
+            newParts,
+            creationConfigs,
+            resolution,
+            authorizedToReturnConfigs);
+        KafkaTopicBindingAggregateV1 aggregate = KafkaTopicBindingAggregateMapperV1.create(
+            topicId, topic.name(), policy, resolution.profile(), resolution.origin());
+        List<ApiMessageAndVersion> candidateRecords = new ArrayList<>(
+            Math.addExact(Math.addExact(2, configRecords.size()), newParts.size()));
+        candidateRecords.add(new ApiMessageAndVersion(new TopicRecord()
+            .setName(topic.name())
+            .setTopicId(topicId), (short) 0));
+        candidateRecords.add(new ApiMessageAndVersion(
+            KafkaTopicBindingAggregateMapperV1.toRecord(aggregate),
+            KafkaTopicBindingAggregateMapperV1.WIRE_VERSION));
+        candidateRecords.addAll(configRecords);
+        List<Integer> partitionIds = new ArrayList<>(newParts.keySet());
+        partitionIds.sort(Integer::compareTo);
+        ImageWriterOptions imageWriterOptions = new ImageWriterOptions.Builder(
+            featureControl.metadataVersionOrThrow())
+            .setEligibleLeaderReplicasEnabled(featureControl.isElrFeatureEnabled())
+            .build();
+        for (int partitionId : partitionIds) {
+            candidateRecords.add(newParts.get(partitionId).toRecord(topicId, partitionId, imageWriterOptions));
+        }
+        return NereusTopicCandidateResult.success(new TopicCreateCandidateV1(
+            topicId, numPartitions, response, candidateRecords));
+    }
+
+    private CreatableTopicResult createNereusTopicResponse(
+        CreatableTopic topic,
+        Uuid topicId,
+        Map<Integer, PartitionRegistration> newParts,
+        Map<String, String> creationConfigs,
+        NereusTopicProfileResolverV1.Resolution resolution,
+        boolean authorizedToReturnConfigs
+    ) {
+        CreatableTopicResult result = new CreatableTopicResult()
+            .setName(topic.name())
+            .setTopicId(topicId)
+            .setErrorCode(NONE.code())
+            .setErrorMessage(null);
+        if (!authorizedToReturnConfigs) {
+            return result.setTopicConfigErrorCode(TOPIC_AUTHORIZATION_FAILED.code());
+        }
+
+        Map<String, ConfigEntry> effectiveConfig = configurationControl.computeEffectiveTopicConfigs(creationConfigs);
+        List<String> configNames = new ArrayList<>(effectiveConfig.keySet());
+        configNames.sort(String::compareTo);
+        for (String configName : configNames) {
+            ConfigEntry entry = effectiveConfig.get(configName);
+            result.configs().add(new CreateTopicsResponseData.CreatableTopicConfigs()
+                .setName(entry.name())
+                .setValue(entry.isSensitive() ? null : entry.value())
+                .setReadOnly(entry.isReadOnly())
+                .setConfigSource(KafkaConfigSchema.translateConfigSource(entry.source()).id())
+                .setIsSensitive(entry.isSensitive()));
+        }
+        ConfigEntry.ConfigSource pseudoSource = resolution.origin() ==
+            com.nereusstream.domain.aggregate.ProfileOriginV1.TOPIC_EXPLICIT ?
+                ConfigEntry.ConfigSource.DYNAMIC_TOPIC_CONFIG : ConfigEntry.ConfigSource.DEFAULT_CONFIG;
+        result.configs().add(new CreateTopicsResponseData.CreatableTopicConfigs()
+            .setName(NereusTopicProfileResolverV1.PROFILE_CONFIG)
+            .setValue(resolution.profile().name())
+            .setReadOnly(true)
+            .setConfigSource(KafkaConfigSchema.translateConfigSource(pseudoSource).id())
+            .setIsSensitive(false));
+        result.setNumPartitions(newParts.size());
+        result.setReplicationFactor((short) newParts.values().iterator().next().replicas.length);
+        result.setTopicConfigErrorCode(NONE.code());
+        return result;
+    }
+
+    private CreateTopicsResponseData createTopicsResponse(
+        CreateTopicsRequestData request,
+        Map<String, ApiError> topicErrors,
+        Map<String, CreatableTopicResult> successes
+    ) {
+        CreateTopicsResponseData data = new CreateTopicsResponseData();
+        for (CreatableTopic topic : request.topics()) {
+            ApiError error = topicErrors.get(topic.name());
+            if (error == null) {
+                data.topics().add(successes.get(topic.name()));
+            } else {
+                data.topics().add(new CreatableTopicResult()
+                    .setName(topic.name())
+                    .setErrorCode(error.error().code())
+                    .setErrorMessage(error.message()));
+            }
+        }
+        return data;
     }
 
     private ApiError createTopic(ControllerRequestContext context,
@@ -1005,12 +1370,22 @@ public class ReplicationControlManager {
     static Map<ConfigResource, Map<String, Entry<OpType, String>>>
             computeConfigChanges(Map<String, ApiError> topicErrors,
                                  CreatableTopicCollection topics) {
+        return computeConfigChanges(topicErrors, topics, false);
+    }
+
+    static Map<ConfigResource, Map<String, Entry<OpType, String>>>
+            computeConfigChanges(Map<String, ApiError> topicErrors,
+                                 CreatableTopicCollection topics,
+                                 boolean stripNereusProfile) {
         Map<ConfigResource, Map<String, Entry<OpType, String>>> configChanges = new HashMap<>();
         for (CreatableTopic topic : topics) {
             if (topicErrors.containsKey(topic.name())) continue;
             Map<String, Entry<OpType, String>> topicConfigs = new HashMap<>();
             List<String> nullConfigs = new ArrayList<>();
             for (CreateTopicsRequestData.CreatableTopicConfig config : topic.configs()) {
+                if (stripNereusProfile && NereusTopicProfileResolverV1.isProfileConfig(config.name())) {
+                    continue;
+                }
                 if (config.value() == null) {
                     nullConfigs.add(config.name());
                 } else {
@@ -1383,15 +1758,6 @@ public class ReplicationControlManager {
 
         int[] newIsr = partitionData.newIsrWithEpochs().stream()
             .mapToInt(BrokerState::brokerId).toArray();
-
-        if (featureControl.isNereusStorageFeatureEnabled() &&
-                (newIsr.length != 1 || newIsr[0] != partition.leader)) {
-            log.error("Rejecting AlterPartition request from node {} for {}-{} because " +
-                    "nereus.storage.version requires the ISR to be exactly [{}], but got {}.",
-                brokerId, topic.name, partitionId, partition.leader,
-                partitionData.newIsrWithEpochs());
-            return INVALID_REQUEST;
-        }
 
         if (!Replicas.validateIsr(partition.replicas, newIsr)) {
             log.error("Rejecting AlterPartition request from node {} for {}-{} because " +
@@ -1983,12 +2349,6 @@ public class ReplicationControlManager {
                 Short.MAX_VALUE);
         }
         short replicationFactor = (short) partitionInfo.replicas.length;
-        if (featureControl.isNereusStorageFeatureEnabled() &&
-                replicationFactor != 1) {
-            throw new InvalidReplicationFactorException(
-                "Existing topic replication factor must be 1 when " +
-                    "nereus.storage.version is enabled.");
-        }
         int startPartitionId = topicInfo.parts.size();
 
         List<PartitionAssignment> partitionAssignments;
@@ -1998,12 +2358,6 @@ public class ReplicationControlManager {
             isrs = new ArrayList<>();
             for (int i = 0; i < topic.assignments().size(); i++) {
                 List<Integer> replicas = topic.assignments().get(i).brokerIds();
-                if (featureControl.isNereusStorageFeatureEnabled() &&
-                        replicas.size() != 1) {
-                    throw new InvalidReplicaAssignmentException(
-                        "New partition assignments must contain exactly one broker " +
-                            "when nereus.storage.version is enabled.");
-                }
                 PartitionAssignment partitionAssignment = new PartitionAssignment(replicas, clusterDescriber);
                 validateManualPartitionAssignment(partitionAssignment, OptionalInt.of(replicationFactor));
                 partitionAssignments.add(partitionAssignment);
@@ -2233,60 +2587,10 @@ public class ReplicationControlManager {
         Optional<ApiMessageAndVersion> record;
         if (target.replicas() == null) {
             record = cancelPartitionReassignment(topicName, tp, part);
-        } else if (featureControl.isNereusStorageFeatureEnabled()) {
-            if (target.replicas().size() != 1) {
-                throw new InvalidReplicaAssignmentException(
-                    "Partition reassignment targets must contain exactly one broker " +
-                        "when nereus.storage.version is enabled.");
-            }
-            record = changeNereusPartitionReassignment(
-                tp, part, target, allowRFChange);
         } else {
             record = changePartitionReassignment(tp, part, target, allowRFChange);
         }
         record.ifPresent(records::add);
-    }
-
-    Optional<ApiMessageAndVersion> changeNereusPartitionReassignment(
-        TopicIdPartition tp,
-        PartitionRegistration part,
-        ReassignablePartition target,
-        boolean allowRFChange
-    ) {
-        if (part.replicas.length != 1 || isReassignmentInProgress(part)) {
-            throw new InvalidReplicaAssignmentException(
-                "Existing partitions must have one stable replica before a Nereus " +
-                    "shared-storage reassignment.");
-        }
-        PartitionAssignment targetAssignment =
-            new PartitionAssignment(target.replicas(), clusterDescriber);
-        validateManualPartitionAssignment(targetAssignment, OptionalInt.of(1));
-        if (!allowRFChange) {
-            validatePartitionReplicationFactorUnchanged(part, target);
-        }
-        int targetBroker = target.replicas().get(0);
-        if (!clusterControl.isActive(targetBroker)) {
-            throw new InvalidReplicaAssignmentException(
-                "Nereus shared-storage reassignment target broker " +
-                    targetBroker + " must be active.");
-        }
-
-        PartitionChangeBuilder builder = new PartitionChangeBuilder(
-            part,
-            tp.topicId(),
-            tp.partitionId(),
-            clusterControl::isActive,
-            featureControl.metadataVersionOrThrow(),
-            getTopicEffectiveMinIsr(topics.get(tp.topicId()).name)
-        );
-        builder.setEligibleLeaderReplicasEnabled(
-            featureControl.isElrFeatureEnabled());
-        builder.setTargetReplicas(target.replicas());
-        builder.setTargetIsr(target.replicas());
-        builder.setTargetRemoving(List.of());
-        builder.setTargetAdding(List.of());
-        builder.setElection(PartitionChangeBuilder.Election.PREFERRED);
-        return builder.setDefaultDirProvider(clusterDescriber).build();
     }
 
     Optional<ApiMessageAndVersion> cancelPartitionReassignment(String topicName,

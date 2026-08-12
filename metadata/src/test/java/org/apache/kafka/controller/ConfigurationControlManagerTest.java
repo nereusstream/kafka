@@ -521,7 +521,7 @@ public class ConfigurationControlManagerTest {
     }
 
     @Test
-    public void testRejectNonSingletonMinIsrWhenNereusStorageEnabled() {
+    public void testNereusStoragePreservesNativeMinIsrSemantics() {
         FeatureControlManager featureManager =
             new FeatureControlManager.Builder().
                 setQuorumFeatures(new QuorumFeatures(
@@ -541,29 +541,15 @@ public class ConfigurationControlManagerTest {
                 setKafkaConfigSchema(SCHEMA).
                 build();
 
-        ControllerResult<ApiError> invalid =
+        ControllerResult<ApiError> result =
             manager.incrementalAlterConfig(
                 MYTOPIC,
                 toMap(entry(
                     TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG,
                     entry(SET, "2"))),
                 true);
-        assertEquals(Errors.INVALID_CONFIG, invalid.response().error());
-        assertEquals(
-            TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG +
-                " must remain 1 while nereus.storage.version is enabled.",
-            invalid.response().message());
-        assertEquals(List.of(), invalid.records());
-
-        ControllerResult<ApiError> valid =
-            manager.incrementalAlterConfig(
-                MYTOPIC,
-                toMap(entry(
-                    TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG,
-                    entry(SET, "1"))),
-                true);
-        assertEquals(Errors.NONE, valid.response().error());
-        assertEquals(1, valid.records().size());
+        assertEquals(Errors.NONE, result.response().error());
+        assertEquals(1, result.records().size());
     }
 
     @ParameterizedTest

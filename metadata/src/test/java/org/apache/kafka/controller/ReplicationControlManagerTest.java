@@ -95,6 +95,7 @@ import org.apache.kafka.metadata.RecordTestUtils;
 import org.apache.kafka.metadata.Replicas;
 import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1;
 import org.apache.kafka.metadata.nereus.KafkaTopicBindingTestFixtures;
+import org.apache.kafka.metadata.nereus.NereusTopicProfileResolverV1;
 import org.apache.kafka.metadata.placement.StripedReplicaPlacer;
 import org.apache.kafka.metadata.placement.UsableBroker;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
@@ -136,7 +137,6 @@ import static org.apache.kafka.common.metadata.MetadataRecordType.CLEAR_ELR_RECO
 import static org.apache.kafka.common.protocol.Errors.ELECTION_NOT_NEEDED;
 import static org.apache.kafka.common.protocol.Errors.ELIGIBLE_LEADERS_NOT_AVAILABLE;
 import static org.apache.kafka.common.protocol.Errors.INELIGIBLE_REPLICA;
-import static org.apache.kafka.common.protocol.Errors.INVALID_CONFIG;
 import static org.apache.kafka.common.protocol.Errors.INVALID_PARTITIONS;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICATION_FACTOR;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICA_ASSIGNMENT;
@@ -180,6 +180,7 @@ public class ReplicationControlManagerTest {
             private MockTime mockTime = new MockTime();
             private boolean isElrEnabled = false;
             private boolean isNereusStorageEnabled = false;
+            private int maxRecordsPerBatch = QuorumController.MAX_RECORDS_PER_USER_OP;
             private final Map<String, Object> staticConfig = new HashMap<>();
 
             Builder setCreateTopicPolicy(CreateTopicPolicy createTopicPolicy) {
@@ -207,6 +208,11 @@ public class ReplicationControlManagerTest {
                 return this;
             }
 
+            Builder setMaxRecordsPerBatch(int maxRecordsPerBatch) {
+                this.maxRecordsPerBatch = maxRecordsPerBatch;
+                return this;
+            }
+
             Builder setMockTime(MockTime mockTime) {
                 this.mockTime = mockTime;
                 return this;
@@ -218,6 +224,7 @@ public class ReplicationControlManagerTest {
                     mockTime,
                     isElrEnabled,
                     isNereusStorageEnabled,
+                    maxRecordsPerBatch,
                     staticConfig);
             }
         }
@@ -244,6 +251,7 @@ public class ReplicationControlManagerTest {
             MockTime time,
             boolean isElrEnabled,
             boolean isNereusStorageEnabled,
+            int maxRecordsPerBatch,
             Map<String, Object> staticConfig
         ) {
             this.time = time;
@@ -296,6 +304,9 @@ public class ReplicationControlManagerTest {
                 setClusterControl(clusterControl).
                 setCreateTopicPolicy(createTopicPolicy).
                 setFeatureControl(featureControl).
+                setNereusMetadataPolicy(isNereusStorageEnabled ?
+                    Optional.of(KafkaTopicBindingTestFixtures.metadataPolicy()) : Optional.empty()).
+                setMaxRecordsPerBatch(maxRecordsPerBatch).
                 build();
             clusterControl.activate();
         }
@@ -704,7 +715,7 @@ public class ReplicationControlManagerTest {
     }
 
     @Test
-    public void testNereusStorageFeatureGatesTopicCreationAndPartitionGrowth() {
+    public void testNereusStorageFeatureCreatesAggregateWithNativeReplicaSemantics() {
         ReplicationControlTestContext ctx =
             new ReplicationControlTestContext.Builder().
                 setIsNereusStorageEnabled(true).
@@ -712,32 +723,138 @@ public class ReplicationControlManagerTest {
         ctx.registerBrokers(0, 1);
         ctx.unfenceBrokers(0, 1);
 
-        ctx.createTestTopic("rf-two", 1, (short) 2,
-            INVALID_REPLICATION_FACTOR.code());
-        ctx.createTestTopic(
+        CreatableTopicResult result = ctx.createTestTopic("rf-two", 1, (short) 2, NONE.code());
+        assertEquals(2, ctx.replicationControl.getPartition(result.topicId(), 0).replicas.length);
+        assertTrue(ctx.replicationControl.getTopic(result.topicId()).nereusAggregate().isPresent());
+
+        CreatableTopicResult manual = ctx.createTestTopic(
             "manual-rf-two",
             new int[][] {new int[] {0, 1}},
-            INVALID_REPLICA_ASSIGNMENT.code());
-        ctx.createTestTopic(
-            "min-isr-two",
-            new int[][] {new int[] {0}},
             Map.of(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, "2"),
-            INVALID_CONFIG.code());
+            NONE.code());
+        assertEquals(2, manual.replicationFactor());
+        assertTrue(ctx.replicationControl.getTopic(manual.topicId()).nereusAggregate().isPresent());
+    }
 
-        ctx.createTestTopic(
-            "valid",
-            new int[][] {new int[] {0}},
-            NONE.code());
-        ctx.createPartitions(
-            2,
-            "valid",
-            new int[][] {new int[] {0, 1}},
-            INVALID_REPLICA_ASSIGNMENT.code());
-        ctx.createPartitions(
-            2,
-            "valid",
-            new int[][] {new int[] {1}},
-            NONE.code());
+    @Test
+    public void testNereusCreateTopicsUsesLastProfileValueAndCanonicalRecordOrder() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder()
+            .setIsNereusStorageEnabled(true)
+            .build();
+        ctx.registerBrokers(0, 1);
+        ctx.unfenceBrokers(0, 1);
+        CreatableTopic topic = new CreatableTopic()
+            .setName("explicit-profile")
+            .setNumPartitions(2)
+            .setReplicationFactor((short) 2);
+        topic.configs().add(new CreateTopicsRequestData.CreatableTopicConfig()
+            .setName(NereusTopicProfileResolverV1.PROFILE_CONFIG)
+            .setValue("OBJECT_WAL"));
+        topic.configs().add(new CreateTopicsRequestData.CreatableTopicConfig()
+            .setName(NereusTopicProfileResolverV1.PROFILE_CONFIG)
+            .setValue("BOOKKEEPER_WAL_ASYNC_OBJECT"));
+        CreateTopicsRequestData request = new CreateTopicsRequestData();
+        request.topics().add(topic);
+
+        ControllerResult<CreateTopicsResponseData> result = ctx.replicationControl.createTopics(
+            anonymousContextFor(ApiKeys.CREATE_TOPICS), request, Set.of(topic.name()));
+
+        assertEquals(NONE.code(), result.response().topics().find(topic.name()).errorCode());
+        assertInstanceOf(TopicRecord.class, result.records().get(0).message());
+        TopicBindingAggregateRecord aggregateRecord = assertInstanceOf(
+            TopicBindingAggregateRecord.class, result.records().get(1).message());
+        assertTrue(result.records().stream().noneMatch(record ->
+            record.message() instanceof ConfigRecord configRecord &&
+                NereusTopicProfileResolverV1.PROFILE_CONFIG.equals(configRecord.name())));
+        assertEquals(
+            "BOOKKEEPER_WAL_ASYNC_OBJECT",
+            KafkaTopicBindingAggregateMapperV1.fromRecord(
+                aggregateRecord,
+                KafkaTopicBindingAggregateMapperV1.WIRE_VERSION).storageProfile().name());
+        assertEquals(
+            "TOPIC_EXPLICIT",
+            KafkaTopicBindingAggregateMapperV1.fromRecord(
+                aggregateRecord,
+                KafkaTopicBindingAggregateMapperV1.WIRE_VERSION).profileOrigin().name());
+    }
+
+    @Test
+    public void testNereusValidateOnlyDoesNotConsumeMutationQuota() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder()
+            .setIsNereusStorageEnabled(true)
+            .build();
+        ctx.registerBrokers(0);
+        ctx.unfenceBrokers(0);
+        CreateTopicsRequestData request = new CreateTopicsRequestData().setValidateOnly(true);
+        request.topics().add(new CreatableTopic()
+            .setName("validate-only")
+            .setNumPartitions(1)
+            .setReplicationFactor((short) 1));
+
+        ControllerResult<CreateTopicsResponseData> result = ctx.replicationControl.createTopics(
+            anonymousContextWithMutationQuotaExceededFor(ApiKeys.CREATE_TOPICS),
+            request,
+            Set.of("validate-only"));
+
+        assertTrue(result.records().isEmpty());
+        assertEquals(NONE.code(), result.response().topics().find("validate-only").errorCode());
+        assertNull(ctx.replicationControl.getTopic(result.response().topics().find("validate-only").topicId()));
+    }
+
+    @Test
+    public void testNereusCreateTopicsGreedyAtomicBatchAdmissionContinuesAfterRejection() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder()
+            .setIsNereusStorageEnabled(true)
+            .setMaxRecordsPerBatch(3)
+            .build();
+        ctx.registerBrokers(0);
+        ctx.unfenceBrokers(0);
+        CreateTopicsRequestData request = new CreateTopicsRequestData();
+        request.topics().add(new CreatableTopic()
+            .setName("too-large-first")
+            .setNumPartitions(2)
+            .setReplicationFactor((short) 1));
+        request.topics().add(new CreatableTopic()
+            .setName("small-second")
+            .setNumPartitions(1)
+            .setReplicationFactor((short) 1));
+
+        ControllerResult<CreateTopicsResponseData> result = ctx.replicationControl.createTopics(
+            anonymousContextFor(ApiKeys.CREATE_TOPICS), request, Set.of());
+
+        assertEquals(POLICY_VIOLATION.code(), result.response().topics().find("too-large-first").errorCode());
+        assertEquals(NONE.code(), result.response().topics().find("small-second").errorCode());
+        assertEquals(3, result.records().size());
+        assertEquals("small-second", ((TopicRecord) result.records().get(0).message()).name());
+    }
+
+    @Test
+    public void testNereusCreateTopicsPreservesConfigurationDerivedRecordOrder() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder()
+            .setIsNereusStorageEnabled(true)
+            .setIsElrEnabled(true)
+            .build();
+        ctx.registerBrokers(0, 1);
+        ctx.unfenceBrokers(0, 1);
+        CreateTopicsRequestData request = new CreateTopicsRequestData();
+        CreatableTopic topic = new CreatableTopic()
+            .setName("config-derived")
+            .setNumPartitions(1)
+            .setReplicationFactor((short) 2);
+        topic.configs().add(new CreateTopicsRequestData.CreatableTopicConfig()
+            .setName(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG)
+            .setValue("2"));
+        request.topics().add(topic);
+
+        ControllerResult<CreateTopicsResponseData> result = ctx.replicationControl.createTopics(
+            anonymousContextFor(ApiKeys.CREATE_TOPICS), request, Set.of());
+
+        assertEquals(NONE.code(), result.response().topics().find(topic.name()).errorCode());
+        assertInstanceOf(TopicRecord.class, result.records().get(0).message());
+        assertInstanceOf(TopicBindingAggregateRecord.class, result.records().get(1).message());
+        assertInstanceOf(ConfigRecord.class, result.records().get(2).message());
+        assertInstanceOf(ClearElrRecord.class, result.records().get(3).message());
+        assertInstanceOf(PartitionRecord.class, result.records().get(4).message());
     }
 
     @Test
@@ -790,58 +907,6 @@ public class ReplicationControlManagerTest {
         TopicBindingAggregateRecord aggregateRecord = KafkaTopicBindingAggregateMapperV1.toRecord(
             KafkaTopicBindingTestFixtures.aggregate(topicId, "missing-topic"));
         assertThrows(RuntimeException.class, () -> ctx.replicationControl.replay(aggregateRecord));
-    }
-
-    @Test
-    public void testNereusStorageFeatureAtomicallyHandsOffSingletonReplica() {
-        ReplicationControlTestContext ctx =
-            new ReplicationControlTestContext.Builder().
-                setIsNereusStorageEnabled(true).
-                build();
-        ctx.registerBrokers(0, 1);
-        ctx.unfenceBrokers(0, 1);
-        Uuid topicId = ctx.createTestTopic(
-            "shared-storage-handoff",
-            new int[][] {new int[] {0}},
-            NONE.code()).topicId();
-        PartitionRegistration before =
-            ctx.replicationControl.getPartition(topicId, 0);
-
-        ControllerResult<AlterPartitionReassignmentsResponseData> result =
-            ctx.replicationControl.alterPartitionReassignments(
-                new AlterPartitionReassignmentsRequestData().
-                    setTopics(List.of(new ReassignableTopic().
-                        setName("shared-storage-handoff").
-                        setPartitions(List.of(new ReassignablePartition().
-                            setPartitionIndex(0).
-                            setReplicas(List.of(1)))))));
-
-        assertEquals(
-            NONE.code(),
-            result.response().responses().get(0).partitions().get(0).
-                errorCode());
-        assertEquals(1, result.records().size());
-        PartitionChangeRecord handoff =
-            (PartitionChangeRecord) result.records().get(0).message();
-        assertEquals(List.of(1), handoff.replicas());
-        assertEquals(List.of(1), handoff.isr());
-        assertEquals(1, handoff.leader());
-        assertNull(handoff.removingReplicas());
-        assertNull(handoff.addingReplicas());
-
-        ctx.replay(result.records());
-        PartitionRegistration after =
-            ctx.replicationControl.getPartition(topicId, 0);
-        assertArrayEquals(new int[] {1}, after.replicas);
-        assertArrayEquals(new int[] {1}, after.isr);
-        assertArrayEquals(new int[] {}, after.removingReplicas);
-        assertArrayEquals(new int[] {}, after.addingReplicas);
-        assertEquals(1, after.leader);
-        assertEquals(before.leaderEpoch + 1, after.leaderEpoch);
-        assertEquals(
-            NONE_REASSIGNING,
-            ctx.replicationControl.listPartitionReassignments(
-                null, Long.MAX_VALUE));
     }
 
     @Test

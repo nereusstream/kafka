@@ -66,4 +66,15 @@ public final class KafkaTopicBindingTestFixtures {
                     "policy-v1".getBytes(StandardCharsets.US_ASCII)))),
                 FrameEncodingPolicyCatalogV1.none())));
     }
+
+    public static NereusKafkaMetadataPolicyV1 metadataPolicy() {
+        return new NereusKafkaMetadataPolicyV1(
+            new Uuid(1L, 2L),
+            new Uuid(3L, 4L),
+            Sha256Digest.hash(CanonicalBytes.copyOf(
+                "policy-v1".getBytes(StandardCharsets.US_ASCII))).bytes().toByteArray(),
+            StorageProfileV1.BOOKKEEPER_WAL_ONLY,
+            NereusKafkaMetadataPolicyV1.INTERNAL_TOPIC_POLICY_VERSION,
+            false);
+    }
 }

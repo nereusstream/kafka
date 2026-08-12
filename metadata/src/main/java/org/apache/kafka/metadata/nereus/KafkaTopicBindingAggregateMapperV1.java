@@ -29,6 +29,7 @@ import com.nereusstream.domain.aggregate.TopicBindingAggregateValidatorV1;
 import com.nereusstream.domain.aggregate.TopicBindingV1;
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.domain.bytes.Sha256Digest;
+import com.nereusstream.domain.codec.DeterministicTopicIdsV1;
 import com.nereusstream.domain.identity.DeploymentId;
 import com.nereusstream.domain.identity.Id128;
 import com.nereusstream.domain.identity.KafkaCellId;
@@ -92,6 +93,35 @@ public final class KafkaTopicBindingAggregateMapperV1 {
             throw new IllegalArgumentException("API-key-32000 wire v0 record is not canonical");
         }
         return result;
+    }
+
+    public static KafkaTopicBindingAggregateV1 create(
+        Uuid topicId,
+        String topicName,
+        NereusKafkaMetadataPolicyV1 policy,
+        StorageProfileV1 profile,
+        ProfileOriginV1 origin
+    ) {
+        Objects.requireNonNull(topicId, "topicId");
+        Objects.requireNonNull(topicName, "topicName");
+        Objects.requireNonNull(policy, "policy");
+        KafkaTopicIncarnationIdentity incarnation = new KafkaTopicIncarnationIdentity(
+            new KafkaTopicId(id128(topicId, "topic ID")),
+            new KafkaTopicName(topicName));
+        KafkaProtocolCellIdentity cell = policy.cellIdentity();
+        TopicBindingId bindingId = DeterministicTopicIdsV1.deriveBindingId(cell, incarnation);
+        TopicBindingAggregateV1 value = new TopicBindingAggregateV1(
+            TopicBindingAggregateV1.SCHEMA_VERSION,
+            new TopicBindingV1(ProtocolKindV1.KAFKA, bindingId, cell, incarnation),
+            new InitialStorageEpochV1(
+                DeterministicTopicIdsV1.deriveStorageEpochId(bindingId, 0L),
+                0L,
+                Objects.requireNonNull(profile, "profile"),
+                Objects.requireNonNull(origin, "origin"),
+                policy.policyCatalogDigest(),
+                com.nereusstream.domain.aggregate.FrameEncodingPolicyCatalogV1.requiredFor(profile)));
+        TopicBindingAggregateValidatorV1.validate(value);
+        return new KafkaTopicBindingAggregateV1(value);
     }
 
     public static TopicBindingAggregateRecord toRecord(KafkaTopicBindingAggregateV1 aggregate) {

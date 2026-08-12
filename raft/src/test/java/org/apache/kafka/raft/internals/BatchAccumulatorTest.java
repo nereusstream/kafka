@@ -366,6 +366,27 @@ class BatchAccumulatorTest {
     }
 
     @Test
+    public void testCurrentOffsetDeltaCannotRejectCandidateThatFitsFreshBatch() {
+        int leaderEpoch = 17;
+        List<String> candidate = java.util.Collections.nCopies(100, "candidate");
+        int maxBatchSize = BatchBuilder.sizeInBytesForFreshBatch(
+            candidate,
+            new ObjectSerializationCache(),
+            serde);
+        Mockito.when(memoryPool.tryAllocate(maxBatchSize))
+            .thenAnswer(__ -> ByteBuffer.allocate(maxBatchSize));
+        BatchAccumulator<String> acc = buildAccumulator(leaderEpoch, 0, 50, maxBatchSize);
+
+        acc.append(leaderEpoch, java.util.Collections.nCopies(64, "prefix"), false);
+        assertEquals(163, acc.append(leaderEpoch, candidate, false));
+
+        List<BatchAccumulator.CompletedBatch<String>> batches = acc.drain();
+        assertEquals(2, batches.size());
+        assertEquals(candidate, batches.get(1).records.get());
+        assertTrue(batches.get(1).data.sizeInBytes() <= maxBatchSize);
+    }
+
+    @Test
     public void testCloseWhenEmpty() {
         int leaderEpoch = 17;
         long baseOffset = 157;

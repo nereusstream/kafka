@@ -135,7 +135,10 @@ public class BatchBuilder<T> {
     public OptionalInt bytesNeeded(Collection<T> records, ObjectSerializationCache serializationCache) {
         int bytesNeeded = bytesNeededForRecords(
             records,
-            serializationCache
+            serializationCache,
+            baseOffset,
+            nextOffset,
+            serde
         );
 
         if (!isOpenForAppends) {
@@ -155,6 +158,36 @@ public class BatchBuilder<T> {
         }
 
         return OptionalInt.of(Math.addExact(batchHeaderSizeInBytes(), bytesNeeded));
+    }
+
+    /**
+     * Return the exact uncompressed size of a fresh record batch containing {@code records}.
+     *
+     * The offset delta of the first record in a fresh batch is always zero.  Callers which
+     * perform admission before the accumulator allocates a batch must use this method rather
+     * than carrying over the offset delta from an existing batch.
+     */
+    public static <T> int sizeInBytesForFreshBatch(
+        Collection<T> records,
+        ObjectSerializationCache serializationCache,
+        RecordSerde<T> serde
+    ) {
+        return sizeInBytesForFreshBatch(records, serializationCache, serde, Compression.NONE);
+    }
+
+    public static <T> int sizeInBytesForFreshBatch(
+        Collection<T> records,
+        ObjectSerializationCache serializationCache,
+        RecordSerde<T> serde,
+        Compression compression
+    ) {
+        return Math.addExact(
+            AbstractRecords.recordBatchHeaderSizeInBytes(
+                RecordBatch.MAGIC_VALUE_V2,
+                compression.type()
+            ),
+            bytesNeededForRecords(records, serializationCache, 0L, 0L, serde)
+        );
     }
 
     private int flushedSizeInBytes() {
@@ -315,9 +348,12 @@ public class BatchBuilder<T> {
         );
     }
 
-    private int bytesNeededForRecords(
+    private static <T> int bytesNeededForRecords(
         Collection<T> records,
-        ObjectSerializationCache serializationCache
+        ObjectSerializationCache serializationCache,
+        long baseOffset,
+        long nextOffset,
+        RecordSerde<T> serde
     ) {
         long expectedNextOffset = nextOffset;
         int bytesNeeded = 0;
