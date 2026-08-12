@@ -86,8 +86,8 @@ public final class FeaturesImage {
     public boolean isNereusStorageEnabled() {
         return finalizedVersions.getOrDefault(
             NereusStorageVersion.FEATURE_NAME,
-            NereusStorageVersion.NSV_0.featureLevel())
-            >= NereusStorageVersion.NSV_1.featureLevel();
+            NereusStorageVersion.DISABLED_LEVEL)
+            == NereusStorageVersion.NSV_2.featureLevel();
     }
 
     public void write(ImageWriter writer, ImageWriterOptions options) {

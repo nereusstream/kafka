@@ -472,7 +472,7 @@ Found problem:
       () => runFormatCommand(
         new ByteArrayOutputStream(),
         disabled,
-        Seq("--feature", s"${NereusStorageVersion.FEATURE_NAME}=1")))
+        Seq("--feature", s"${NereusStorageVersion.FEATURE_NAME}=2")))
     assertTrue(failure.getMessage.contains(NereusKafkaConfigs.ENABLED_CONFIG))
   }
 
@@ -487,12 +487,26 @@ Found problem:
       runFormatCommand(
         stream,
         properties,
-        Seq("--feature", s"${NereusStorageVersion.FEATURE_NAME}=1")))
+        Seq("--feature", s"${NereusStorageVersion.FEATURE_NAME}=2")))
     val bootstrapMetadata =
       new BootstrapDirectory(availableDir.toString).read
     assertEquals(
-      NereusStorageVersion.NSV_1.featureLevel(),
+      NereusStorageVersion.NSV_2.featureLevel(),
       bootstrapMetadata.featureLevel(NereusStorageVersion.FEATURE_NAME))
+  }
+
+  @Test
+  def testFormatRejectsLegacyNereusStorageFeature(): Unit = {
+    val availableDir = TestUtils.tempDir()
+    val properties = nereusControllerProperties(availableDir.toString)
+
+    val failure = assertThrows(
+      classOf[TerseFailure],
+      () => runFormatCommand(
+        new ByteArrayOutputStream(),
+        properties,
+        Seq("--feature", s"${NereusStorageVersion.FEATURE_NAME}=1")))
+    assertTrue(failure.getMessage.contains(NereusStorageVersion.FEATURE_NAME))
   }
 
   @Test

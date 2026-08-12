@@ -142,6 +142,12 @@ object StorageTool extends Logging {
       map(featureNamesAndLevels).
       getOrElse(Map.empty)
     if (configuredFeatureLevels.contains(NereusStorageVersion.FEATURE_NAME)) {
+      val configuredLevel = configuredFeatureLevels(NereusStorageVersion.FEATURE_NAME)
+      if (configuredLevel != NereusStorageVersion.NSV_2.featureLevel()) {
+        throw new TerseFailure(
+          s"${NereusStorageVersion.FEATURE_NAME} only supports fresh V2 feature level " +
+            s"${NereusStorageVersion.NSV_2.featureLevel()}; configured level was $configuredLevel")
+      }
       if (!config.nereusKafkaStorageConfig.enabled()) {
         throw new TerseFailure(
           s"${NereusStorageVersion.FEATURE_NAME} may only be formatted when " +

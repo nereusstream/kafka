@@ -79,7 +79,7 @@ public final class QuorumFeatures {
             features.put(
                 NereusStorageVersion.FEATURE_NAME,
                 VersionRange.of(
-                    NereusStorageVersion.NSV_0.featureLevel(),
+                    NereusStorageVersion.NSV_2.featureLevel(),
                     NereusStorageVersion.LATEST_PRODUCTION.featureLevel()));
         }
         return features;

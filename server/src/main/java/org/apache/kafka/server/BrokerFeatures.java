@@ -98,7 +98,7 @@ public class BrokerFeatures {
             features.put(
                 NereusStorageVersion.FEATURE_NAME,
                 new SupportedVersionRange(
-                    NereusStorageVersion.NSV_0.featureLevel(),
+                    NereusStorageVersion.NSV_2.featureLevel(),
                     NereusStorageVersion.LATEST_PRODUCTION.featureLevel()));
         }
         return Features.supportedFeatures(features);

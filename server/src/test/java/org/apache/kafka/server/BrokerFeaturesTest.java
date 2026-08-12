@@ -127,8 +127,8 @@ public class BrokerFeaturesTest {
             containsKey(NereusStorageVersion.FEATURE_NAME));
         assertEquals(
             new SupportedVersionRange(
-                NereusStorageVersion.NSV_0.featureLevel(),
-                NereusStorageVersion.NSV_1.featureLevel()),
+                NereusStorageVersion.NSV_2.featureLevel(),
+                NereusStorageVersion.NSV_2.featureLevel()),
             BrokerFeatures.createDefault(false, true).
                 supportedFeatures().get(NereusStorageVersion.FEATURE_NAME));
     }

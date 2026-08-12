@@ -97,8 +97,8 @@ public class QuorumFeaturesTest {
             containsKey(NereusStorageVersion.FEATURE_NAME));
         assertEquals(
             VersionRange.of(
-                NereusStorageVersion.NSV_0.featureLevel(),
-                NereusStorageVersion.NSV_1.featureLevel()),
+                NereusStorageVersion.NSV_2.featureLevel(),
+                NereusStorageVersion.NSV_2.featureLevel()),
             QuorumFeatures.defaultSupportedFeatureMap(false, true).
                 get(NereusStorageVersion.FEATURE_NAME));
     }

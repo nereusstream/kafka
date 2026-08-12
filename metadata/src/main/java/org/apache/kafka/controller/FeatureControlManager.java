@@ -240,6 +240,11 @@ public class FeatureControlManager {
                 "The controller does not support the given upgrade type.");
         }
 
+        if (featureName.equals(NereusStorageVersion.FEATURE_NAME)) {
+            return invalidUpdateVersion(featureName, newVersion,
+                "Nereus V2 is bootstrap-only and cannot be changed through the runtime feature-update API.");
+        }
+
         final short currentVersion;
         if (featureName.equals(MetadataVersion.FEATURE_NAME)) {
             currentVersion = metadataVersionOrThrow().featureLevel();
@@ -481,7 +486,8 @@ public class FeatureControlManager {
     }
 
     boolean isNereusStorageFeatureEnabled() {
-        return finalizedVersions.getOrDefault(NereusStorageVersion.FEATURE_NAME, (short) 0) >=
-            NereusStorageVersion.NSV_1.featureLevel();
+        return finalizedVersions.getOrDefault(
+            NereusStorageVersion.FEATURE_NAME,
+            NereusStorageVersion.DISABLED_LEVEL) == NereusStorageVersion.NSV_2.featureLevel();
     }
 }

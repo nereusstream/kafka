@@ -23,19 +23,19 @@ import java.util.Map;
  *
  * <p>The feature is deliberately not part of Kafka's automatically bootstrapped production
  * feature set. Nodes advertise support only when their local Nereus storage mode is enabled,
- * and operators must explicitly format or upgrade the cluster to level 1.
+ * and operators must explicitly establish level 2 during fresh storage formatting.
  */
 public enum NereusStorageVersion implements FeatureVersion {
 
-    // Version 0 keeps stock Kafka storage and replication semantics.
-    NSV_0(0, MetadataVersion.MINIMUM_VERSION, Map.of()),
-
-    // Version 1 enables Nereus authoritative single-replica storage semantics.
-    NSV_1(1, MetadataVersion.MINIMUM_VERSION, Map.of());
+    // Version 2 is the clean-break V2 aggregate metadata format. Level 1 permanently denotes V1.
+    NSV_2(2, MetadataVersion.MINIMUM_VERSION, Map.of());
 
     public static final String FEATURE_NAME = "nereus.storage.version";
 
-    public static final NereusStorageVersion LATEST_PRODUCTION = NSV_1;
+    public static final short DISABLED_LEVEL = 0;
+    public static final short LEGACY_V1_LEVEL = 1;
+
+    public static final NereusStorageVersion LATEST_PRODUCTION = NSV_2;
 
     private final short featureLevel;
     private final MetadataVersion bootstrapMetadataVersion;
@@ -73,8 +73,7 @@ public enum NereusStorageVersion implements FeatureVersion {
 
     public static NereusStorageVersion fromFeatureLevel(short version) {
         return switch (version) {
-            case 0 -> NSV_0;
-            case 1 -> NSV_1;
+            case 2 -> NSV_2;
             default -> throw new IllegalArgumentException(
                 "Unknown Nereus storage feature level: " + (int) version);
         };

@@ -133,9 +133,8 @@ import static org.apache.kafka.common.metadata.MetadataRecordType.CLEAR_ELR_RECO
 import static org.apache.kafka.common.protocol.Errors.ELECTION_NOT_NEEDED;
 import static org.apache.kafka.common.protocol.Errors.ELIGIBLE_LEADERS_NOT_AVAILABLE;
 import static org.apache.kafka.common.protocol.Errors.INELIGIBLE_REPLICA;
-import static org.apache.kafka.common.protocol.Errors.INVALID_PARTITIONS;
 import static org.apache.kafka.common.protocol.Errors.INVALID_CONFIG;
-import static org.apache.kafka.common.protocol.Errors.INVALID_REQUEST;
+import static org.apache.kafka.common.protocol.Errors.INVALID_PARTITIONS;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICATION_FACTOR;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICA_ASSIGNMENT;
 import static org.apache.kafka.common.protocol.Errors.INVALID_TOPIC_EXCEPTION;
@@ -150,7 +149,6 @@ import static org.apache.kafka.common.protocol.Errors.THROTTLING_QUOTA_EXCEEDED;
 import static org.apache.kafka.common.protocol.Errors.UNKNOWN_SERVER_ERROR;
 import static org.apache.kafka.common.protocol.Errors.UNKNOWN_TOPIC_ID;
 import static org.apache.kafka.common.protocol.Errors.UNKNOWN_TOPIC_OR_PARTITION;
-import static org.apache.kafka.common.protocol.Errors.UNSUPPORTED_VERSION;
 import static org.apache.kafka.controller.ControllerRequestContextUtil.QUOTA_EXCEEDED_IN_TEST_MSG;
 import static org.apache.kafka.controller.ControllerRequestContextUtil.anonymousContextFor;
 import static org.apache.kafka.controller.ControllerRequestContextUtil.anonymousContextWithMutationQuotaExceededFor;
@@ -266,8 +264,8 @@ public class ReplicationControlManagerTest {
             featureControl.replay(new FeatureLevelRecord()
                 .setName(NereusStorageVersion.FEATURE_NAME)
                 .setFeatureLevel(isNereusStorageEnabled ?
-                    NereusStorageVersion.NSV_1.featureLevel() :
-                    NereusStorageVersion.NSV_0.featureLevel())
+                    NereusStorageVersion.NSV_2.featureLevel() :
+                    NereusStorageVersion.DISABLED_LEVEL)
             );
             this.clusterControl = new ClusterControlManager.Builder().
                 setLogContext(logContext).
@@ -740,86 +738,16 @@ public class ReplicationControlManagerTest {
     }
 
     @Test
-    public void testNereusStorageFeatureGatesIsrReassignmentAndDirectories() {
+    public void testNereusStorageFeatureRejectsLegacyRuntimeActivation() {
         ReplicationControlTestContext ctx =
             new ReplicationControlTestContext.Builder().
                 setIsNereusStorageEnabled(true).
                 build();
-        ctx.registerBrokers(0, 1);
-        ctx.unfenceBrokers(0, 1);
 
-        // Build a legacy RF=2 topic, then enable the durable feature to exercise
-        // defensive validation of an inconsistent pre-activation image.
-        ctx.featureControl.replay(new FeatureLevelRecord().
-            setName(NereusStorageVersion.FEATURE_NAME).
-            setFeatureLevel(NereusStorageVersion.NSV_0.featureLevel()));
-        Uuid topicId = ctx.createTestTopic(
-            "legacy",
-            new int[][] {new int[] {0, 1}},
-            NONE.code()).topicId();
-        ctx.featureControl.replay(new FeatureLevelRecord().
-            setName(NereusStorageVersion.FEATURE_NAME).
-            setFeatureLevel(NereusStorageVersion.NSV_1.featureLevel()));
-
-        PartitionRegistration partition =
-            ctx.replicationControl.getPartition(topicId, 0);
-        ControllerResult<AlterPartitionResponseData> alterResult =
-            ctx.replicationControl.alterPartition(
-                anonymousContextFor(ApiKeys.ALTER_PARTITION),
-                new AlterPartitionRequestData().
-                    setBrokerId(partition.leader).
-                    setBrokerEpoch(ctx.currentBrokerEpoch(partition.leader)).
-                    setTopics(List.of(new TopicData().
-                        setTopicId(topicId).
-                        setPartitions(List.of(new PartitionData().
-                            setPartitionIndex(0).
-                            setPartitionEpoch(partition.partitionEpoch).
-                            setLeaderEpoch(partition.leaderEpoch).
-                            setLeaderRecoveryState(
-                                LeaderRecoveryState.RECOVERED.value()).
-                            setNewIsrWithEpochs(
-                                isrWithDefaultEpoch(0, 1)))))));
-        assertEquals(
-            INVALID_REQUEST.code(),
-            alterResult.response().topics().get(0).partitions().get(0).
-                errorCode());
-        assertEquals(List.of(), alterResult.records());
-
-        ControllerResult<AlterPartitionReassignmentsResponseData>
-            reassignmentResult =
-                ctx.replicationControl.alterPartitionReassignments(
-                    new AlterPartitionReassignmentsRequestData().
-                        setTopics(List.of(new ReassignableTopic().
-                            setName("legacy").
-                            setPartitions(List.of(new ReassignablePartition().
-                                setPartitionIndex(0).
-                                setReplicas(List.of(0, 1)))))));
-        assertEquals(
-            INVALID_REPLICA_ASSIGNMENT.code(),
-            reassignmentResult.response().responses().get(0).
-                partitions().get(0).errorCode());
-        assertEquals(List.of(), reassignmentResult.records());
-
-        Uuid directoryId =
-            Uuid.fromString("TESTBROKER00000DIRAAAA");
-        TopicIdPartition topicPartition =
-            new TopicIdPartition(topicId, 0);
-        ControllerResult<AssignReplicasToDirsResponseData> directoryResult =
-            ctx.replicationControl.handleAssignReplicasToDirs(
-                AssignmentsHelper.buildRequestData(
-                    partition.leader,
-                    ctx.currentBrokerEpoch(partition.leader),
-                    Map.of(topicPartition, directoryId)));
-        assertEquals(List.of(), directoryResult.records());
-        assertEquals(
-            AssignmentsHelper.normalize(
-                AssignmentsHelper.buildResponseData(
-                    (short) 0,
-                    0,
-                    Map.of(
-                        directoryId,
-                        Map.of(topicPartition, UNSUPPORTED_VERSION)))),
-            AssignmentsHelper.normalize(directoryResult.response()));
+        assertThrows(RuntimeException.class, () -> ctx.featureControl.replay(
+            new FeatureLevelRecord().
+                setName(NereusStorageVersion.FEATURE_NAME).
+                setFeatureLevel(NereusStorageVersion.DISABLED_LEVEL)));
     }
 
     @Test

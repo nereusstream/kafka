@@ -136,8 +136,8 @@ public class FeatureControlManagerTest {
             new FeatureControlManager.Builder().
                 setQuorumFeatures(features(
                     NereusStorageVersion.FEATURE_NAME,
-                    NereusStorageVersion.NSV_0.featureLevel(),
-                    NereusStorageVersion.NSV_1.featureLevel())).
+                    NereusStorageVersion.NSV_2.featureLevel(),
+                    NereusStorageVersion.NSV_2.featureLevel())).
                 build();
         manager.replay(new FeatureLevelRecord().
             setName(MetadataVersion.FEATURE_NAME).
@@ -146,21 +146,36 @@ public class FeatureControlManagerTest {
         ControllerResult<ApiError> result = manager.updateFeatures(
             updateMap(
                 NereusStorageVersion.FEATURE_NAME,
-                NereusStorageVersion.NSV_1.featureLevel()),
+                NereusStorageVersion.NSV_2.featureLevel()),
             Map.of(),
             false,
             0);
-        assertEquals(ApiError.NONE, result.response());
-        assertEquals(
-            List.of(new ApiMessageAndVersion(
-                new FeatureLevelRecord().
-                    setName(NereusStorageVersion.FEATURE_NAME).
-                    setFeatureLevel(
-                        NereusStorageVersion.NSV_1.featureLevel()),
-                (short) 0)),
-            result.records());
-        RecordTestUtils.replayAll(manager, result.records());
+        assertEquals(Errors.INVALID_UPDATE_VERSION, result.response().error());
+        assertTrue(result.response().message().contains("bootstrap-only"));
+        assertEquals(List.of(), result.records());
+
+        manager.replay(new FeatureLevelRecord().
+            setName(NereusStorageVersion.FEATURE_NAME).
+            setFeatureLevel(NereusStorageVersion.NSV_2.featureLevel()));
         assertTrue(manager.isNereusStorageFeatureEnabled());
+    }
+
+    @Test
+    public void testRejectsLegacyNereusStorageFeatureReplay() {
+        FeatureControlManager manager =
+            new FeatureControlManager.Builder().
+                setQuorumFeatures(features(
+                    NereusStorageVersion.FEATURE_NAME,
+                    NereusStorageVersion.NSV_2.featureLevel(),
+                    NereusStorageVersion.NSV_2.featureLevel())).
+                build();
+
+        RuntimeException exception = assertThrows(
+            RuntimeException.class,
+            () -> manager.replay(new FeatureLevelRecord().
+                setName(NereusStorageVersion.FEATURE_NAME).
+                setFeatureLevel(NereusStorageVersion.LEGACY_V1_LEVEL)));
+        assertTrue(exception.getMessage().contains("Tried to apply FeatureLevelRecord"));
     }
 
     @Test

@@ -534,7 +534,7 @@ public class ConfigurationControlManagerTest {
             setFeatureLevel(MetadataVersion.LATEST_PRODUCTION.featureLevel()));
         featureManager.replay(new FeatureLevelRecord().
             setName(NereusStorageVersion.FEATURE_NAME).
-            setFeatureLevel(NereusStorageVersion.NSV_1.featureLevel()));
+            setFeatureLevel(NereusStorageVersion.NSV_2.featureLevel()));
         ConfigurationControlManager manager =
             new ConfigurationControlManager.Builder().
                 setFeatureControl(featureManager).

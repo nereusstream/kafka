@@ -262,7 +262,7 @@ class NereusControllerStorageRuntimeTest {
             enabled
                 ? Map.of(
                     NereusStorageVersion.FEATURE_NAME,
-                    NereusStorageVersion.NSV_1.featureLevel())
+                    NereusStorageVersion.NSV_2.featureLevel())
                 : Map.of(),
             MetadataVersion.latestTesting());
         MetadataImage image = new MetadataImage(

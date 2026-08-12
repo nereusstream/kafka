@@ -1,0 +1,56 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+{
+  "apiKey": 32000,
+  "type": "metadata",
+  "name": "TopicBindingAggregateRecord",
+  "validVersions": "0",
+  "flexibleVersions": "none",
+  "fields": [
+    { "name": "TopicId", "type": "uuid", "versions": "0",
+      "about": "The Kafka topic UUID whose image owns this aggregate." },
+    { "name": "TopicName", "type": "string", "versions": "0", "entityType": "topicName",
+      "about": "The canonical Kafka topic name repeated for identity validation." },
+    { "name": "AggregateSchemaVersion", "type": "int16", "versions": "0",
+      "about": "The closed logical Topic Binding Aggregate schema version." },
+    { "name": "ProtocolKind", "type": "int16", "versions": "0",
+      "about": "The closed protocol discriminator." },
+    { "name": "BindingId", "type": "bytes", "versions": "0",
+      "about": "The exact 32-byte deterministic Topic Binding ID." },
+    { "name": "DeploymentId", "type": "uuid", "versions": "0",
+      "about": "The non-zero 128-bit Deployment ID." },
+    { "name": "KafkaCellId", "type": "uuid", "versions": "0",
+      "about": "The non-zero 128-bit Kafka Protocol Cell ID." },
+    { "name": "StorageEpochId", "type": "bytes", "versions": "0",
+      "about": "The exact 32-byte deterministic initial Storage Epoch ID." },
+    { "name": "EpochOrdinal", "type": "int64", "versions": "0",
+      "about": "The initial Storage Epoch ordinal, exactly zero in v0." },
+    { "name": "StorageProfile", "type": "int16", "versions": "0",
+      "about": "The closed V1 storage-profile discriminator." },
+    { "name": "ProfileOrigin", "type": "int16", "versions": "0",
+      "about": "The closed V1 profile-origin discriminator." },
+    { "name": "PolicyCatalogDigest", "type": "bytes", "versions": "0",
+      "about": "The exact 32-byte SHA-256 identity of the creation policy catalog." },
+    { "name": "FrameEncodingPolicyKind", "type": "int16", "versions": "0",
+      "about": "The closed frame-encoding-policy kind." },
+    { "name": "FrameEncodingPolicyVersion", "type": "int16", "versions": "0",
+      "about": "The closed frame-encoding-policy wire version." },
+    { "name": "FrameEncodingPolicyPayload", "type": "bytes", "versions": "0",
+      "about": "The exact policy payload, empty for every accepted v0 value." },
+    { "name": "InitialSealedEnd", "type": "bytes", "versions": "0", "nullableVersions": "0",
+      "about": "The initial sealed end, which must be absent in v0." }
+  ]
+}
