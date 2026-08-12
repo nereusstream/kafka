@@ -98,6 +98,7 @@ import org.apache.kafka.metadata.nereus.KafkaTopicBindingTestFixtures;
 import org.apache.kafka.metadata.nereus.NereusTopicProfileResolverV1;
 import org.apache.kafka.metadata.placement.StripedReplicaPlacer;
 import org.apache.kafka.metadata.placement.UsableBroker;
+import org.apache.kafka.raft.KafkaRaftClient;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.common.MetadataVersion;
@@ -173,14 +174,15 @@ public class ReplicationControlManagerTest {
     private static final Logger log = LoggerFactory.getLogger(ReplicationControlManagerTest.class);
     private static final int BROKER_SESSION_TIMEOUT_MS = 1000;
 
-    private static class ReplicationControlTestContext {
-        private static class Builder {
+    static class ReplicationControlTestContext {
+        static class Builder {
             private Optional<CreateTopicPolicy> createTopicPolicy = Optional.empty();
             private MetadataVersion metadataVersion = MetadataVersion.latestTesting();
             private MockTime mockTime = new MockTime();
             private boolean isElrEnabled = false;
             private boolean isNereusStorageEnabled = false;
             private int maxRecordsPerBatch = QuorumController.MAX_RECORDS_PER_USER_OP;
+            private int maxBatchSizeBytes = KafkaRaftClient.MAX_BATCH_SIZE_BYTES;
             private final Map<String, Object> staticConfig = new HashMap<>();
 
             Builder setCreateTopicPolicy(CreateTopicPolicy createTopicPolicy) {
@@ -213,6 +215,11 @@ public class ReplicationControlManagerTest {
                 return this;
             }
 
+            Builder setMaxBatchSizeBytes(int maxBatchSizeBytes) {
+                this.maxBatchSizeBytes = maxBatchSizeBytes;
+                return this;
+            }
+
             Builder setMockTime(MockTime mockTime) {
                 this.mockTime = mockTime;
                 return this;
@@ -225,6 +232,7 @@ public class ReplicationControlManagerTest {
                     isElrEnabled,
                     isNereusStorageEnabled,
                     maxRecordsPerBatch,
+                    maxBatchSizeBytes,
                     staticConfig);
             }
         }
@@ -252,6 +260,7 @@ public class ReplicationControlManagerTest {
             boolean isElrEnabled,
             boolean isNereusStorageEnabled,
             int maxRecordsPerBatch,
+            int maxBatchSizeBytes,
             Map<String, Object> staticConfig
         ) {
             this.time = time;
@@ -307,6 +316,7 @@ public class ReplicationControlManagerTest {
                 setNereusMetadataPolicy(isNereusStorageEnabled ?
                     Optional.of(KafkaTopicBindingTestFixtures.metadataPolicy()) : Optional.empty()).
                 setMaxRecordsPerBatch(maxRecordsPerBatch).
+                setMaxBatchSizeBytes(maxBatchSizeBytes).
                 build();
             clusterControl.activate();
         }
