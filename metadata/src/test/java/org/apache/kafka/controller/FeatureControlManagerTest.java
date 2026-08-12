@@ -158,6 +158,26 @@ public class FeatureControlManagerTest {
             setName(NereusStorageVersion.FEATURE_NAME).
             setFeatureLevel(NereusStorageVersion.NSV_2.featureLevel()));
         assertTrue(manager.isNereusStorageFeatureEnabled());
+
+        ControllerResult<ApiError> sameValue = manager.updateFeatures(
+            updateMap(
+                NereusStorageVersion.FEATURE_NAME,
+                NereusStorageVersion.NSV_2.featureLevel()),
+            Map.of(),
+            false,
+            0);
+        assertEquals(Errors.INVALID_UPDATE_VERSION, sameValue.response().error());
+        assertTrue(sameValue.records().isEmpty());
+
+        ControllerResult<ApiError> unsafeDisable = manager.updateFeatures(
+            updateMap(
+                NereusStorageVersion.FEATURE_NAME,
+                NereusStorageVersion.DISABLED_LEVEL),
+            Map.of(NereusStorageVersion.FEATURE_NAME, FeatureUpdate.UpgradeType.UNSAFE_DOWNGRADE),
+            false,
+            0);
+        assertEquals(Errors.INVALID_UPDATE_VERSION, unsafeDisable.response().error());
+        assertTrue(unsafeDisable.records().isEmpty());
     }
 
     @Test

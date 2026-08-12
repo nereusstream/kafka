@@ -22,6 +22,7 @@ import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.ObjectSerializationCache;
 import org.apache.kafka.metadata.MetadataRecordSerde;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
+import org.apache.kafka.server.common.serialization.MetadataParseException;
 
 import com.nereusstream.domain.aggregate.FrameEncodingPolicyCatalogV1;
 import com.nereusstream.domain.aggregate.InitialStorageEpochV1;
@@ -87,6 +88,16 @@ class KafkaTopicBindingAggregateMapperV1Test {
                 "4e8a3d4fbe3eeb31c9204ed80000000000000000000200040000002072993b6cb83904d39a8c73bd0651aa62" +
                 "51288ede5dbc2c7bcbdc54cc5bbf5d770000000000000000ffffffff",
             HexFormat.of().formatHex(bytes.array()));
+
+        ObjectSerializationCache trailingCache = new ObjectSerializationCache();
+        int trailingRecordSize = serde.recordSize(message, trailingCache);
+        ByteBuffer trailing = ByteBuffer.allocate(trailingRecordSize + 1);
+        serde.write(message, trailingCache, new ByteBufferAccessor(trailing));
+        trailing.put((byte) 0);
+        trailing.flip();
+        assertThrows(
+            MetadataParseException.class,
+            () -> serde.read(new ByteBufferAccessor(trailing), trailing.remaining()));
     }
 
     @Test
