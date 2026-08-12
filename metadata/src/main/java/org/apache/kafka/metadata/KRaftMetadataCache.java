@@ -38,6 +38,7 @@ import org.apache.kafka.common.requests.MetadataResponse;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.image.TopicImage;
+import org.apache.kafka.metadata.nereus.NereusTopicProfileProjectionV1;
 import org.apache.kafka.server.common.FinalizedFeatures;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
@@ -488,6 +489,19 @@ public class KRaftMetadataCache implements MetadataCache {
 
     public MetadataImage getImage() {
         return currentImage;
+    }
+
+    @Override
+    public Optional<NereusTopicProfileProjectionV1> nereusTopicProfile(String topicName) {
+        MetadataImage image = currentImage;
+        TopicImage topic = image.topics().getTopic(topicName);
+        if (topic == null) {
+            return Optional.empty();
+        }
+        return topic.nereusAggregate().map(aggregate ->
+            new NereusTopicProfileProjectionV1(
+                aggregate.storageProfile().name(),
+                aggregate.profileOrigin() == com.nereusstream.domain.aggregate.ProfileOriginV1.TOPIC_EXPLICIT));
     }
 
     @Override

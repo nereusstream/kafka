@@ -31,6 +31,7 @@ import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.ApiError;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.metadata.KafkaConfigSchema;
+import org.apache.kafka.metadata.nereus.NereusTopicProfileResolverV1;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.mutable.BoundedList;
@@ -258,6 +259,9 @@ public class ConfigurationControlManager {
         boolean newlyCreatedResource,
         List<ApiMessageAndVersion> outputRecords
     ) {
+        if (isNereusProfileMutation(configResource, keysToOps.keySet())) {
+            return DISALLOWED_NEREUS_PROFILE_MUTATION_ERROR;
+        }
         List<ApiMessageAndVersion> newRecords = new ArrayList<>();
         for (Entry<String, Entry<OpType, String>> keysToOpsEntry : keysToOps.entrySet()) {
             String key = keysToOpsEntry.getKey();
@@ -390,6 +394,16 @@ public class ConfigurationControlManager {
         new ApiError(INVALID_CONFIG, "The configuration value cannot be added because " +
             "it exceeds the maximum value size of " + Short.MAX_VALUE + " bytes.");
 
+    private static final ApiError DISALLOWED_NEREUS_PROFILE_MUTATION_ERROR =
+        new ApiError(INVALID_CONFIG, NereusTopicProfileResolverV1.PROFILE_CONFIG +
+            " is an input-only CreateTopics pseudo-config and cannot be altered or deleted.");
+
+    private boolean isNereusProfileMutation(ConfigResource resource, Collection<String> keys) {
+        return featureControl.isNereusStorageFeatureEnabled() &&
+            resource.type() == Type.TOPIC &&
+            keys.contains(NereusTopicProfileResolverV1.PROFILE_CONFIG);
+    }
+
     boolean isDisallowedBrokerMinIsrTransition(ConfigRecord configRecord) {
         if (configRecord.name().equals(MIN_IN_SYNC_REPLICAS_CONFIG) &&
                 configRecord.resourceType() == BROKER.id() &&
@@ -446,6 +460,10 @@ public class ConfigurationControlManager {
                                            boolean newlyCreatedResource,
                                            List<ApiMessageAndVersion> outputRecords,
                                            Map<ConfigResource, ApiError> outputResults) {
+        if (isNereusProfileMutation(configResource, newConfigs.keySet())) {
+            outputResults.put(configResource, DISALLOWED_NEREUS_PROFILE_MUTATION_ERROR);
+            return;
+        }
         List<ApiMessageAndVersion> recordsExplicitlyAltered = new ArrayList<>();
         Map<String, String> currentConfigs = configData.get(configResource);
         if (currentConfigs == null) {

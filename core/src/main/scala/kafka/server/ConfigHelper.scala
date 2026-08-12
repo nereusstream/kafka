@@ -19,7 +19,7 @@ package kafka.server
 
 import kafka.network.RequestChannel
 
-import java.util.{Collections, Properties}
+import java.util.{ArrayList, Collections, Properties}
 import kafka.utils.Logging
 import org.apache.kafka.common.acl.AclOperation.DESCRIBE_CONFIGS
 import org.apache.kafka.common.config.{ConfigDef, ConfigResource}
@@ -34,6 +34,7 @@ import org.apache.kafka.common.resource.Resource.CLUSTER_NAME
 import org.apache.kafka.common.resource.ResourceType.{CLUSTER, GROUP, TOPIC}
 import org.apache.kafka.coordinator.group.GroupConfig
 import org.apache.kafka.metadata.{ConfigRepository, MetadataCache}
+import org.apache.kafka.metadata.nereus.NereusTopicProfileResolverV1
 import org.apache.kafka.server.ConfigHelperUtils.createResponseConfig
 import org.apache.kafka.server.config.ServerTopicConfigSynonyms
 import org.apache.kafka.server.logger.LoggingController
@@ -91,7 +92,10 @@ class ConfigHelper(metadataCache: MetadataCache, config: KafkaConfig, configRepo
             if (metadataCache.contains(topic)) {
               val topicProps = configRepository.topicConfig(topic)
               val logConfig = LogConfig.fromProps(config.extractLogConfigMap, topicProps)
-              createResponseConfig(resource, logConfig, createTopicConfigEntry(logConfig, topicProps, includeSynonyms, includeDocumentation)(_, _))
+              val result = createResponseConfig(resource, logConfig,
+                createTopicConfigEntry(logConfig, topicProps, includeSynonyms, includeDocumentation)(_, _))
+              addNereusTopicProfileProjection(resource, result, includeDocumentation)
+              result
             } else {
               new DescribeConfigsResponseData.DescribeConfigsResult().setErrorCode(Errors.UNKNOWN_TOPIC_OR_PARTITION.code)
                 .setConfigs(Collections.emptyList[DescribeConfigsResponseData.DescribeConfigsResourceResult])
@@ -182,6 +186,36 @@ class ConfigHelper(metadataCache: MetadataCache, config: KafkaConfig, configRepo
       .setName(name).setValue(valueAsString).setConfigSource(source)
       .setIsSensitive(isSensitive).setReadOnly(false).setSynonyms(synonyms.asJava)
       .setDocumentation(configDocumentation).setConfigType(dataType.id)
+  }
+
+  private def addNereusTopicProfileProjection(
+    resource: DescribeConfigsResource,
+    result: DescribeConfigsResponseData.DescribeConfigsResult,
+    includeDocumentation: Boolean
+  ): Unit = {
+    val requestedKeys = resource.configurationKeys
+    if (requestedKeys == null || requestedKeys.isEmpty ||
+        requestedKeys.contains(NereusTopicProfileResolverV1.PROFILE_CONFIG)) {
+      metadataCache.nereusTopicProfile(resource.resourceName).toScala.foreach { projection =>
+        val source = if (projection.explicitlyConfigured())
+          ConfigSource.TOPIC_CONFIG
+        else
+          ConfigSource.DEFAULT_CONFIG
+        val configs = new ArrayList(result.configs)
+        configs.add(new DescribeConfigsResponseData.DescribeConfigsResourceResult()
+          .setName(NereusTopicProfileResolverV1.PROFILE_CONFIG)
+          .setValue(projection.profileName())
+          .setConfigSource(source.id)
+          .setIsSensitive(false)
+          .setReadOnly(true)
+          .setSynonyms(Collections.emptyList[DescribeConfigsResponseData.DescribeConfigsSynonym]())
+          .setDocumentation(if (includeDocumentation)
+            "Read-only Nereus V2 storage profile projected from TopicBindingAggregateRecord."
+          else null)
+          .setConfigType(DescribeConfigsResponse.ConfigType.STRING.id))
+        result.setConfigs(configs)
+      }
+    }
   }
 
   private def createClientMetricsConfigEntry(clientMetricsConfig: ClientMetricsConfigs, clientMetricsProps: Properties, includeSynonyms: Boolean, includeDocumentation: Boolean)

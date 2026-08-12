@@ -88,6 +88,15 @@ class ControllerConfigurationValidatorTest {
         new ConfigResource(TOPIC, "foo"), config, emptyMap())). getMessage)
   }
 
+  @Test
+  def testUnknownNereusPrefixedTopicConfigUsesNativeValidation(): Unit = {
+    val configs = new util.TreeMap[String, String]()
+    configs.put("nereus.unknown", "value")
+    assertEquals("Unknown topic config name: nereus.unknown",
+      assertThrows(classOf[InvalidConfigurationException], () => validator.validate(
+        new ConfigResource(TOPIC, "foo"), configs, emptyMap())).getMessage)
+  }
+
   @ParameterizedTest(name = "testDisablingRemoteStorageTopicConfig with wasRemoteStorageEnabled: {0}")
   @ValueSource(booleans = Array(true, false))
   def testDisablingRemoteStorageTopicConfig(wasRemoteStorageEnabled: Boolean): Unit = {

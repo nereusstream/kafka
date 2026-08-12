@@ -98,6 +98,7 @@ import org.apache.kafka.metadata.RecordTestUtils;
 import org.apache.kafka.metadata.RecordTestUtils.ImageDeltaPair;
 import org.apache.kafka.metadata.RecordTestUtils.TestThroughAllIntermediateImagesLeadingToFinalImageHelper;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingTestFixtures;
 import org.apache.kafka.metadata.util.BatchFileWriter;
 import org.apache.kafka.raft.Batch;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
@@ -105,6 +106,7 @@ import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.common.Feature;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.NereusStorageVersion;
 import org.apache.kafka.server.common.OffsetAndEpoch;
 import org.apache.kafka.server.common.TopicIdPartition;
 import org.apache.kafka.snapshot.FileRawSnapshotReader;
@@ -171,6 +173,35 @@ public class QuorumControllerTest {
 
     static final BootstrapMetadata SIMPLE_BOOTSTRAP = BootstrapMetadata.
             fromVersion(MetadataVersion.IBP_3_7_IV0, "test-provided bootstrap");
+
+    static final BootstrapMetadata NEREUS_V2_BOOTSTRAP = BootstrapMetadata.fromRecords(
+        List.of(
+            new ApiMessageAndVersion(new FeatureLevelRecord()
+                .setName(MetadataVersion.FEATURE_NAME)
+                .setFeatureLevel(MetadataVersion.LATEST_PRODUCTION.featureLevel()), (short) 0),
+            new ApiMessageAndVersion(new FeatureLevelRecord()
+                .setName(NereusStorageVersion.FEATURE_NAME)
+                .setFeatureLevel(NereusStorageVersion.NSV_2.featureLevel()), (short) 0)),
+        "Nereus V2 test bootstrap");
+
+    @Test
+    public void testNereusV2BootstrapRequiresQualifiedMetadataPolicy() throws Exception {
+        try (MockRaftClientTestEnv clientEnv = new MockRaftClientTestEnv.Builder(1).build()) {
+            assertThrows(IllegalStateException.class, () ->
+                new QuorumControllerTestEnv.Builder(clientEnv)
+                    .setBootstrapMetadata(NEREUS_V2_BOOTSTRAP)
+                    .build());
+        }
+        try (MockRaftClientTestEnv clientEnv = new MockRaftClientTestEnv.Builder(1).build()) {
+            IllegalStateException failure = assertThrows(IllegalStateException.class, () ->
+                new QuorumControllerTestEnv.Builder(clientEnv)
+                    .setBootstrapMetadata(NEREUS_V2_BOOTSTRAP)
+                    .setControllerBuilderInitializer(builder -> builder.setNereusMetadataPolicy(
+                        KafkaTopicBindingTestFixtures.metadataPolicy(true)))
+                    .build());
+            assertTrue(failure.getMessage().contains("remote.log.storage.system.enable=false"));
+        }
+    }
 
     /**
      * Test setting some configuration values and reading them back.

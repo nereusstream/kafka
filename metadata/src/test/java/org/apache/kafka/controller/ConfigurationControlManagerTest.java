@@ -30,6 +30,7 @@ import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.ApiError;
 import org.apache.kafka.metadata.KafkaConfigSchema;
 import org.apache.kafka.metadata.RecordTestUtils;
+import org.apache.kafka.metadata.nereus.NereusTopicProfileResolverV1;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.common.MetadataVersion;
@@ -550,6 +551,24 @@ public class ConfigurationControlManagerTest {
                 true);
         assertEquals(Errors.NONE, result.response().error());
         assertEquals(1, result.records().size());
+
+        ControllerResult<ApiError> rejectedIncremental = manager.incrementalAlterConfig(
+            MYTOPIC,
+            toMap(entry(
+                NereusTopicProfileResolverV1.PROFILE_CONFIG,
+                entry(DELETE, null))),
+            false);
+        assertEquals(Errors.INVALID_CONFIG, rejectedIncremental.response().error());
+        assertTrue(rejectedIncremental.response().message().contains("input-only CreateTopics pseudo-config"));
+        assertTrue(rejectedIncremental.records().isEmpty());
+
+        ControllerResult<Map<ConfigResource, ApiError>> rejectedLegacy = manager.legacyAlterConfigs(
+            Map.of(MYTOPIC, Map.of(
+                NereusTopicProfileResolverV1.PROFILE_CONFIG,
+                "OBJECT_WAL")),
+            false);
+        assertEquals(Errors.INVALID_CONFIG, rejectedLegacy.response().get(MYTOPIC).error());
+        assertTrue(rejectedLegacy.records().isEmpty());
     }
 
     @ParameterizedTest

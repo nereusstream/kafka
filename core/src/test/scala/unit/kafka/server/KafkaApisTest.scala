@@ -83,6 +83,7 @@ import org.apache.kafka.coordinator.share.{ShareCoordinator, ShareCoordinatorTes
 import org.apache.kafka.coordinator.transaction.TransactionLogConfig
 import org.apache.kafka.image.{MetadataDelta, MetadataImage, MetadataProvenance}
 import org.apache.kafka.metadata.{ConfigRepository, KRaftMetadataCache, MetadataCache, MockConfigRepository}
+import org.apache.kafka.metadata.nereus.{NereusTopicProfileProjectionV1, NereusTopicProfileResolverV1}
 import org.apache.kafka.network.Session
 import org.apache.kafka.network.metrics.{RequestChannelMetrics, RequestMetrics}
 import org.apache.kafka.raft.{KRaftConfigs, QuorumConfig}
@@ -277,6 +278,10 @@ class KafkaApisTest extends Logging {
 
     metadataCache = mock(classOf[KRaftMetadataCache])
     when(metadataCache.contains(resourceName)).thenReturn(true)
+    when(metadataCache.nereusTopicProfile(resourceName)).thenReturn(util.Optional.of(
+      new NereusTopicProfileProjectionV1(
+        "BOOKKEEPER_WAL_ONLY",
+        true)))
 
     val describeConfigsRequest = new DescribeConfigsRequest.Builder(new DescribeConfigsRequestData()
       .setIncludeSynonyms(true)
@@ -301,6 +306,13 @@ class KafkaApisTest extends Logging {
     val describeConfigsResponseData = configs.head
     assertEquals(propName, describeConfigsResponseData.name)
     assertEquals(propValue, describeConfigsResponseData.value)
+    val profile = describeConfigsResult.configs.asScala
+      .find(_.name == NereusTopicProfileResolverV1.PROFILE_CONFIG)
+      .getOrElse(fail("missing read-only Nereus profile projection"))
+    assertEquals("BOOKKEEPER_WAL_ONLY", profile.value)
+    assertTrue(profile.readOnly)
+    assertTrue(profile.synonyms.isEmpty)
+    assertEquals(DescribeConfigsResponse.ConfigSource.TOPIC_CONFIG.id, profile.configSource)
   }
 
   @Test

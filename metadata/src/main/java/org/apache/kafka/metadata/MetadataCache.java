@@ -30,6 +30,7 @@ import org.apache.kafka.common.message.DescribeUserScramCredentialsResponseData;
 import org.apache.kafka.common.message.MetadataResponseData;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.metadata.nereus.NereusTopicProfileProjectionV1;
 import org.apache.kafka.server.common.FinalizedFeatures;
 import org.apache.kafka.server.common.MetadataVersion;
 
@@ -49,6 +50,16 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 public interface MetadataCache extends ConfigRepository {
+
+    /**
+     * Return the read-only Nereus profile projection owned by the topic aggregate.
+     *
+     * <p>The projection is intentionally separate from {@link #topicConfig(String)} so an input-only pseudo-config
+     * can never enter LogConfig or become a second configuration authority.</p>
+     */
+    default Optional<NereusTopicProfileProjectionV1> nereusTopicProfile(String topicName) {
+        return Optional.empty();
+    }
 
     /**
      * Return topic metadata for a given set of topics and listener. See KafkaApis#handleTopicMetadataRequest for details

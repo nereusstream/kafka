@@ -68,6 +68,10 @@ public final class KafkaTopicBindingTestFixtures {
     }
 
     public static NereusKafkaMetadataPolicyV1 metadataPolicy() {
+        return metadataPolicy(false);
+    }
+
+    public static NereusKafkaMetadataPolicyV1 metadataPolicy(boolean remoteLogStorageSystemEnabled) {
         return new NereusKafkaMetadataPolicyV1(
             new Uuid(1L, 2L),
             new Uuid(3L, 4L),
@@ -75,6 +79,6 @@ public final class KafkaTopicBindingTestFixtures {
                 "policy-v1".getBytes(StandardCharsets.US_ASCII))).bytes().toByteArray(),
             StorageProfileV1.BOOKKEEPER_WAL_ONLY,
             NereusKafkaMetadataPolicyV1.INTERNAL_TOPIC_POLICY_VERSION,
-            false);
+            remoteLogStorageSystemEnabled);
     }
 }
