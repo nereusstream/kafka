@@ -19,6 +19,7 @@ package org.apache.kafka.clients.producer.internals;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.MetadataSnapshot;
 import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.ProducerResourceGuard;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaException;
@@ -288,6 +289,33 @@ public class RecordAccumulator {
                                      long maxTimeToBlock,
                                      long nowMs,
                                      Cluster cluster) throws InterruptedException {
+        return append(topic, partition, timestamp, key, value, headers, callbacks, maxTimeToBlock, nowMs, cluster,
+                null, null, null);
+    }
+
+    /** Append a record carrying a resource guard; ordinary append callers retain the existing path. */
+    public RecordAppendResult append(String topic,
+                                     int partition,
+                                     long timestamp,
+                                     byte[] key,
+                                     byte[] value,
+                                     Header[] headers,
+                                     AppendCallbacks callbacks,
+                                     long maxTimeToBlock,
+                                     long nowMs,
+                                     Cluster cluster,
+                                     ProducerResourceGuard resourceGuard,
+                                     GuardedCompletion guardedCompletion,
+                                     byte[] valueSha256) throws InterruptedException {
+        if ((resourceGuard == null) != (guardedCompletion == null)) {
+            throw new IllegalArgumentException("a guarded append requires both a guard and completion bridge");
+        }
+        if (guardedCompletion != null && !resourceGuard.equals(guardedCompletion.guard())) {
+            throw new IllegalArgumentException("guard and completion bridge do not identify the same resource");
+        }
+        if (resourceGuard != null && (valueSha256 == null || valueSha256.length != 32)) {
+            throw new IllegalArgumentException("a guarded append requires a SHA-256 value digest");
+        }
         TopicInfo topicInfo = topicInfoMap.computeIfAbsent(topic, k -> new TopicInfo(createBuiltInPartitioner(logContext, k, batchSize, partitionerRackAware, rack)));
 
         // We keep track of the number of appending thread to make sure we do not miss batches in
@@ -322,7 +350,8 @@ public class RecordAccumulator {
                     if (partitionChanged(topic, topicInfo, partitionInfo, dq, nowMs, cluster))
                         continue;
 
-                    RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callbacks, dq, nowMs);
+                    RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callbacks, dq, nowMs,
+                            resourceGuard, guardedCompletion, valueSha256);
                     if (appendResult != null) {
                         // If queue has incomplete batches we disable switch (see comments in updatePartitionInfo).
                         boolean enableSwitch = allBatchesFull(dq);
@@ -348,7 +377,8 @@ public class RecordAccumulator {
                     if (partitionChanged(topic, topicInfo, partitionInfo, dq, nowMs, cluster))
                         continue;
 
-                    RecordAppendResult appendResult = appendNewBatch(topic, effectivePartition, dq, timestamp, key, value, headers, callbacks, buffer, nowMs);
+                    RecordAppendResult appendResult = appendNewBatch(topic, effectivePartition, dq, timestamp, key, value,
+                            headers, callbacks, buffer, nowMs, resourceGuard, guardedCompletion, valueSha256);
                     // Set buffer to null, so that deallocate doesn't return it back to free pool, since it's used in the batch.
                     if (appendResult.newBatchCreated)
                         buffer = null;
@@ -387,19 +417,24 @@ public class RecordAccumulator {
                                               Header[] headers,
                                               AppendCallbacks callbacks,
                                               ByteBuffer buffer,
-                                              long nowMs) {
+                                              long nowMs,
+                                              ProducerResourceGuard resourceGuard,
+                                              GuardedCompletion guardedCompletion,
+                                              byte[] valueSha256) {
         assert partition != RecordMetadata.UNKNOWN_PARTITION;
 
-        RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callbacks, dq, nowMs);
+        RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callbacks, dq, nowMs,
+                resourceGuard, guardedCompletion, valueSha256);
         if (appendResult != null) {
             // Somebody else found us a batch, return the one we waited for! Hopefully this doesn't happen often...
             return appendResult;
         }
 
         MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer);
-        ProducerBatch batch = new ProducerBatch(new TopicPartition(topic, partition), recordsBuilder, nowMs);
+        ProducerBatch batch = new ProducerBatch(new TopicPartition(topic, partition), recordsBuilder, nowMs,
+                resourceGuard);
         FutureRecordMetadata future = Objects.requireNonNull(batch.tryAppend(timestamp, key, value, headers,
-                callbacks, nowMs));
+                callbacks, nowMs, resourceGuard, guardedCompletion, valueSha256));
 
         dq.addLast(batch);
         incomplete.add(batch);
@@ -429,13 +464,17 @@ public class RecordAccumulator {
      *  if it is expired, or when the producer is closed.
      */
     private RecordAppendResult tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers,
-                                         Callback callback, Deque<ProducerBatch> deque, long nowMs) {
+                                         Callback callback, Deque<ProducerBatch> deque, long nowMs,
+                                         ProducerResourceGuard resourceGuard,
+                                         GuardedCompletion guardedCompletion,
+                                         byte[] valueSha256) {
         if (closed)
             throw new KafkaException("Producer closed while send in progress");
         ProducerBatch last = deque.peekLast();
         if (last != null) {
             int initialBytes = last.estimatedSizeInBytes();
-            FutureRecordMetadata future = last.tryAppend(timestamp, key, value, headers, callback, nowMs);
+            FutureRecordMetadata future = last.tryAppend(timestamp, key, value, headers, callback, nowMs,
+                    resourceGuard, guardedCompletion, valueSha256);
             if (future == null) {
                 last.closeForRecordAppends();
             } else {

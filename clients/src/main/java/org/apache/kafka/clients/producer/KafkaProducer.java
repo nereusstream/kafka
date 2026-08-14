@@ -29,6 +29,7 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
 import org.apache.kafka.clients.producer.internals.BufferPool;
 import org.apache.kafka.clients.producer.internals.BuiltInPartitioner;
+import org.apache.kafka.clients.producer.internals.GuardedEvidenceUtils;
 import org.apache.kafka.clients.producer.internals.KafkaProducerMetrics;
 import org.apache.kafka.clients.producer.internals.ProducerInterceptors;
 import org.apache.kafka.clients.producer.internals.ProducerMetadata;
@@ -1110,6 +1111,8 @@ public class KafkaProducer<K, V> implements GuardedProducer<K, V> {
         Objects.requireNonNull(record, "record");
         Objects.requireNonNull(guard, "guard");
         ProducerRecord<K, V> interceptedRecord = this.interceptors.onSend(record);
+        GuardedRecordFuture guardedFuture = new GuardedRecordFuture(guard, callback);
+        AppendCallbacks appendCallbacks = new AppendCallbacks(null, this.interceptors, interceptedRecord);
         try {
             throwIfProducerClosed();
             throwIfInPreparedState();
@@ -1123,8 +1126,40 @@ public class KafkaProducer<K, V> implements GuardedProducer<K, V> {
             ClusterAndWaitTime clusterAndWaitTime = waitOnMetadata(interceptedRecord.topic(),
                     interceptedRecord.partition(), time.milliseconds(), maxBlockTimeMs);
             validateGuardedCluster(clusterAndWaitTime.cluster, guard);
-            throw guardedFailure(ResourceGuardFailureReason.UNSUPPORTED_REQUEST_VERSION, guard,
-                    "guarded produce transport is not wired to the v13 evidence path", null);
+
+            long nowMs = time.milliseconds() + clusterAndWaitTime.waitedOnMetadataMs;
+            long remainingWaitMs = Math.max(0, maxBlockTimeMs - clusterAndWaitTime.waitedOnMetadataMs);
+            byte[] serializedKey;
+            try {
+                serializedKey = keySerializerPlugin.get().serialize(interceptedRecord.topic(),
+                        interceptedRecord.headers(), interceptedRecord.key());
+            } catch (ClassCastException cce) {
+                throw new SerializationException("Can't convert key of class " + interceptedRecord.key().getClass().getName()
+                        + " to the configured key.serializer", cce);
+            }
+            byte[] serializedValue;
+            try {
+                serializedValue = valueSerializerPlugin.get().serialize(interceptedRecord.topic(),
+                        interceptedRecord.headers(), interceptedRecord.value());
+            } catch (ClassCastException cce) {
+                throw new SerializationException("Can't convert value of class " + interceptedRecord.value().getClass().getName()
+                        + " to the configured value.serializer", cce);
+            }
+
+            setReadOnly(interceptedRecord.headers());
+            Header[] headers = interceptedRecord.headers().toArray();
+            int serializedSize = AbstractRecords.estimateSizeInBytesUpperBound(RecordBatch.CURRENT_MAGIC_VALUE,
+                    compression.type(), serializedKey, serializedValue, headers);
+            ensureValidRecordSize(serializedSize);
+            long timestamp = interceptedRecord.timestamp() == null ? nowMs : interceptedRecord.timestamp();
+            RecordAccumulator.RecordAppendResult result = accumulator.append(
+                    interceptedRecord.topic(), guard.partition(), timestamp, serializedKey, serializedValue, headers,
+                    appendCallbacks, remainingWaitMs, nowMs, clusterAndWaitTime.cluster, guard, guardedFuture,
+                    GuardedEvidenceUtils.sha256(java.nio.ByteBuffer.wrap(serializedValue)));
+            if (result.batchIsFull || result.newBatchCreated) {
+                sender.wakeup();
+            }
+            return guardedFuture;
         } catch (ResourceGuardException failure) {
             return completeGuardedFailure(interceptedRecord, callback, failure);
         } catch (InterruptedException failure) {

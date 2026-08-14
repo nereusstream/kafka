@@ -17,6 +17,7 @@
 package org.apache.kafka.clients.producer.internals;
 
 import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.ProducerResourceGuard;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.RecordBatchTooLargeException;
@@ -66,6 +67,7 @@ public final class ProducerBatch {
     final long createdMs;
     final TopicPartition topicPartition;
     final ProduceRequestResult produceFuture;
+    private final ProducerResourceGuard resourceGuard;
 
     private final List<Thunk> thunks = new ArrayList<>();
     private final MemoryRecordsBuilder recordsBuilder;
@@ -83,24 +85,38 @@ public final class ProducerBatch {
     private long drainedMs;
     private boolean retry;
     private boolean reopened;
+    private boolean ambiguousAttemptObserved;
 
     // Tracks the current-leader's epoch to which this batch would be sent, in the current to produce the batch.
     private OptionalInt currentLeaderEpoch;
     // Tracks the attempt in which leader was changed to currentLeaderEpoch for the 1st time.
     private int attemptsWhenLeaderLastChanged;
+    private GuardedCompletion.RequestContext guardedRequestContext;
 
     public ProducerBatch(TopicPartition tp, MemoryRecordsBuilder recordsBuilder, long createdMs) {
-        this(tp, recordsBuilder, createdMs, false);
+        this(tp, recordsBuilder, createdMs, null, false);
     }
 
     public ProducerBatch(TopicPartition tp, MemoryRecordsBuilder recordsBuilder, long createdMs, boolean isSplitBatch) {
+        this(tp, recordsBuilder, createdMs, null, isSplitBatch);
+    }
+
+    ProducerBatch(TopicPartition tp, MemoryRecordsBuilder recordsBuilder, long createdMs,
+                  ProducerResourceGuard resourceGuard) {
+        this(tp, recordsBuilder, createdMs, resourceGuard, false);
+    }
+
+    private ProducerBatch(TopicPartition tp, MemoryRecordsBuilder recordsBuilder, long createdMs,
+                          ProducerResourceGuard resourceGuard, boolean isSplitBatch) {
         this.createdMs = createdMs;
         this.lastAttemptMs = createdMs;
         this.recordsBuilder = recordsBuilder;
         this.topicPartition = tp;
+        this.resourceGuard = resourceGuard;
         this.lastAppendTime = createdMs;
         this.produceFuture = new ProduceRequestResult(topicPartition);
         this.retry = false;
+        this.ambiguousAttemptObserved = false;
         this.isSplitBatch = isSplitBatch;
         float compressionRatioEstimation = CompressionRatioEstimator.estimation(topicPartition.topic(),
                                                                                 recordsBuilder.compression().type());
@@ -145,6 +161,15 @@ public final class ProducerBatch {
      * @return The RecordSend corresponding to this record or null if there isn't sufficient room.
      */
     public FutureRecordMetadata tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers, Callback callback, long now) {
+        return tryAppend(timestamp, key, value, headers, callback, now, null, null, null);
+    }
+
+    FutureRecordMetadata tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers, Callback callback,
+                                   long now, ProducerResourceGuard requestedGuard,
+                                   GuardedCompletion guardedCompletion, byte[] valueSha256) {
+        if (!Objects.equals(resourceGuard, requestedGuard)) {
+            return null;
+        }
         if (!recordsBuilder.hasRoomFor(timestamp, key, value, headers)) {
             return null;
         } else {
@@ -159,7 +184,7 @@ public final class ProducerBatch {
                                                                    Time.SYSTEM);
             // we have to keep every future returned to the users in case the batch needs to be
             // split to several new batches and resent.
-            thunks.add(new Thunk(callback, future));
+            thunks.add(new Thunk(callback, future, guardedCompletion, valueSha256));
             this.recordCount++;
             return future;
         }
@@ -200,7 +225,8 @@ public final class ProducerBatch {
             throw new IllegalStateException("Batch has already been completed in final state " + finalState.get());
 
         log.trace("Aborting batch for partition {}", topicPartition, exception);
-        completeFutureAndFireCallbacks(ProduceResponse.INVALID_OFFSET, RecordBatch.NO_TIMESTAMP, index -> exception);
+        completeFutureAndFireCallbacks(ProduceResponse.INVALID_OFFSET, RecordBatch.NO_TIMESTAMP, index -> exception,
+                null, null);
     }
 
     /**
@@ -219,7 +245,11 @@ public final class ProducerBatch {
      *   if it had been completed previously
      */
     public boolean complete(long baseOffset, long logAppendTime) {
-        return done(baseOffset, logAppendTime, null, null);
+        return done(baseOffset, logAppendTime, null, null, null, null);
+    }
+
+    boolean complete(long baseOffset, long logAppendTime, GuardedCompletion.Evidence guardedEvidence) {
+        return done(baseOffset, logAppendTime, null, null, null, guardedEvidence);
     }
 
     /**
@@ -237,7 +267,19 @@ public final class ProducerBatch {
     ) {
         Objects.requireNonNull(topLevelException);
         Objects.requireNonNull(recordExceptions);
-        return done(ProduceResponse.INVALID_OFFSET, RecordBatch.NO_TIMESTAMP, topLevelException, recordExceptions);
+        return done(ProduceResponse.INVALID_OFFSET, RecordBatch.NO_TIMESTAMP, topLevelException,
+                recordExceptions, null, null);
+    }
+
+    boolean completeExceptionally(
+        RuntimeException topLevelException,
+        Function<Integer, RuntimeException> recordExceptions,
+        GuardedCompletion.Failure guardedFailure
+    ) {
+        Objects.requireNonNull(topLevelException);
+        Objects.requireNonNull(recordExceptions);
+        return done(ProduceResponse.INVALID_OFFSET, RecordBatch.NO_TIMESTAMP, topLevelException,
+                recordExceptions, guardedFailure, null);
     }
 
     /**
@@ -263,7 +305,9 @@ public final class ProducerBatch {
         long baseOffset,
         long logAppendTime,
         RuntimeException topLevelException,
-        Function<Integer, RuntimeException> recordExceptions
+        Function<Integer, RuntimeException> recordExceptions,
+        GuardedCompletion.Failure guardedFailure,
+        GuardedCompletion.Evidence guardedEvidence
     ) {
         final FinalState tryFinalState = (topLevelException == null) ? FinalState.SUCCEEDED : FinalState.FAILED;
         if (tryFinalState == FinalState.SUCCEEDED) {
@@ -273,7 +317,7 @@ public final class ProducerBatch {
         }
 
         if (this.finalState.compareAndSet(null, tryFinalState)) {
-            completeFutureAndFireCallbacks(baseOffset, logAppendTime, recordExceptions);
+            completeFutureAndFireCallbacks(baseOffset, logAppendTime, recordExceptions, guardedFailure, guardedEvidence);
             return true;
         }
 
@@ -297,7 +341,9 @@ public final class ProducerBatch {
     private void completeFutureAndFireCallbacks(
         long baseOffset,
         long logAppendTime,
-        Function<Integer, RuntimeException> recordExceptions
+        Function<Integer, RuntimeException> recordExceptions,
+        GuardedCompletion.Failure guardedFailure,
+        GuardedCompletion.Evidence guardedEvidence
     ) {
         // Set the future before invoking the callbacks as we rely on its state for the `onCompletion` call
         produceFuture.set(baseOffset, logAppendTime, recordExceptions);
@@ -306,6 +352,20 @@ public final class ProducerBatch {
         for (int i = 0; i < thunks.size(); i++) {
             try {
                 Thunk thunk = thunks.get(i);
+                if (thunk.guardedCompletion != null) {
+                    if (recordExceptions == null && guardedEvidence != null) {
+                        thunk.guardedCompletion.complete(thunk.future.value(),
+                                guardedEvidence.forRecord(i, recordCount, thunk.valueSha256));
+                    } else {
+                        GuardedCompletion.Failure failure = guardedFailure != null
+                                ? guardedFailure.forRecord(i, recordCount, thunk.valueSha256)
+                                : new GuardedCompletion.Failure(
+                                        org.apache.kafka.clients.producer.ResourceGuardFailureReason.AMBIGUOUS_PRIOR_ATTEMPT,
+                                        "guarded batch completed without authenticated response evidence",
+                                        null, null, false);
+                        thunk.guardedCompletion.fail(failure);
+                    }
+                }
                 if (thunk.callback != null) {
                     if (recordExceptions == null) {
                         RecordMetadata metadata = thunk.future.value();
@@ -413,7 +473,7 @@ public final class ProducerBatch {
         // with how normal batches are handled).
         MemoryRecordsBuilder builder = MemoryRecords.builder(buffer, magic(), recordsBuilder.compression(),
                 TimestampType.CREATE_TIME, 0L);
-        return new ProducerBatch(topicPartition, builder, this.createdMs, true);
+        return new ProducerBatch(topicPartition, builder, this.createdMs, resourceGuard, true);
     }
 
     public boolean isCompressed() {
@@ -426,10 +486,14 @@ public final class ProducerBatch {
     private static final class Thunk {
         final Callback callback;
         final FutureRecordMetadata future;
+        final GuardedCompletion guardedCompletion;
+        final byte[] valueSha256;
 
-        Thunk(Callback callback, FutureRecordMetadata future) {
+        Thunk(Callback callback, FutureRecordMetadata future, GuardedCompletion guardedCompletion, byte[] valueSha256) {
             this.callback = callback;
             this.future = future;
+            this.guardedCompletion = guardedCompletion;
+            this.valueSha256 = valueSha256 == null ? null : valueSha256.clone();
         }
     }
 
@@ -578,6 +642,36 @@ public final class ProducerBatch {
 
     public boolean isTransactional() {
         return recordsBuilder.isTransactional();
+    }
+
+    boolean isGuarded() {
+        return resourceGuard != null;
+    }
+
+    ProducerResourceGuard resourceGuard() {
+        return resourceGuard;
+    }
+
+    void setGuardedRequestContext(final GuardedCompletion.RequestContext requestContext) {
+        if (!isGuarded()) {
+            throw new IllegalStateException("ordinary batch cannot carry guarded request context");
+        }
+        // A retriable leader/topic-id response starts a new attempt. The final evidence must
+        // therefore retain the context of that attempt, while an already ambiguous attempt
+        // is never re-enqueued by the guarded sender.
+        this.guardedRequestContext = Objects.requireNonNull(requestContext, "requestContext");
+    }
+
+    GuardedCompletion.RequestContext guardedRequestContext() {
+        return guardedRequestContext;
+    }
+
+    void markAmbiguousAttemptObserved() {
+        ambiguousAttemptObserved = true;
+    }
+
+    boolean ambiguousAttemptObserved() {
+        return ambiguousAttemptObserved;
     }
 
     public boolean sequenceHasBeenReset() {

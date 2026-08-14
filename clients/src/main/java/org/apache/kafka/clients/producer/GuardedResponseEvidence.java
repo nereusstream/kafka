@@ -55,7 +55,8 @@ public final class GuardedResponseEvidence {
         this.canonicalTopic = requireText(canonicalTopic, "canonicalTopic");
         this.expectedTopicId = Objects.requireNonNull(expectedTopicId, "expectedTopicId");
         if (Uuid.ZERO_UUID.equals(expectedTopicId) || partition < 0 || requestVersion < 13
-                || baseOffset < 0 || logAppendTimeMs < 0) {
+                || baseOffset < (errorCode == 0 ? 0 : -1)
+                || logAppendTimeMs < (errorCode == 0 ? 0 : -1)) {
             throw new IllegalArgumentException("invalid guarded response identity/evidence");
         }
         this.partition = partition;

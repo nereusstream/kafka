@@ -22,7 +22,6 @@ import org.apache.kafka.clients.KafkaClient;
 import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.clients.MetadataSnapshot;
 import org.apache.kafka.clients.NetworkClientUtils;
-import org.apache.kafka.clients.RequestCompletionHandler;
 import org.apache.kafka.common.InvalidRecordException;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.MetricName;
@@ -46,6 +45,7 @@ import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.metrics.stats.Meter;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.protocol.MessageUtil;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.common.requests.AbstractRequest;
@@ -68,6 +68,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -577,7 +578,12 @@ public class Sender implements Runnable {
     /**
      * Handle a produce response
      */
-    private void handleProduceResponse(ClientResponse response, Map<TopicPartition, ProducerBatch> batches, Map<Uuid, String> topicNames, long now) {
+    private void handleProduceResponse(ClientResponse response, Map<TopicPartition, ProducerBatch> batches,
+                                       Map<Uuid, String> topicNames, long now, boolean guardedRequest) {
+        if (guardedRequest) {
+            handleGuardedProduceResponse(response, batches, now);
+            return;
+        }
         RequestHeader requestHeader = response.requestHeader();
         int correlationId = requestHeader.correlationId();
         if (response.wasTimedOut()) {
@@ -657,6 +663,192 @@ public class Sender implements Runnable {
                 }
             }
         }
+    }
+
+    /**
+     * Complete a guarded request only when the v13 response can be bound to the exact
+     * topic-id/partition that was sent. A guarded request is never retried after an
+     * ambiguous transport outcome and never falls through to ordinary completion.
+     */
+    private void handleGuardedProduceResponse(ClientResponse response,
+                                              Map<TopicPartition, ProducerBatch> batches,
+                                              long now) {
+        RequestHeader requestHeader = response.requestHeader();
+        if (response.wasTimedOut() || response.wasDisconnected()) {
+            String message = response.wasTimedOut()
+                    ? "guarded produce response timed out"
+                    : "guarded produce connection was disconnected";
+            for (ProducerBatch batch : batches.values()) {
+                batch.markAmbiguousAttemptObserved();
+                failGuardedBatch(batch, new GuardedCompletion.Failure(
+                        org.apache.kafka.clients.producer.ResourceGuardFailureReason.AMBIGUOUS_PRIOR_ATTEMPT,
+                        message, null, null, false));
+            }
+            return;
+        }
+        if (response.versionMismatch() != null) {
+            for (ProducerBatch batch : batches.values()) {
+                failGuardedBatch(batch, new GuardedCompletion.Failure(
+                        org.apache.kafka.clients.producer.ResourceGuardFailureReason.UNSUPPORTED_REQUEST_VERSION,
+                        "broker does not support the pinned guarded Produce v13 request", response.versionMismatch(),
+                        null, true));
+            }
+            return;
+        }
+        if (!response.hasResponse()) {
+            for (ProducerBatch batch : batches.values()) {
+                batch.markAmbiguousAttemptObserved();
+                failGuardedBatch(batch, new GuardedCompletion.Failure(
+                        org.apache.kafka.clients.producer.ResourceGuardFailureReason.AMBIGUOUS_PRIOR_ATTEMPT,
+                        "guarded produce completed without an acknowledgement response", null, null, false));
+            }
+            return;
+        }
+        if (requestHeader.apiVersion() != 13) {
+            for (ProducerBatch batch : batches.values()) {
+                failGuardedBatch(batch, new GuardedCompletion.Failure(
+                        org.apache.kafka.clients.producer.ResourceGuardFailureReason.UNSUPPORTED_REQUEST_VERSION,
+                        "guarded produce response was not encoded as v13", null, null, false));
+            }
+            return;
+        }
+
+        for (ProducerBatch batch : batches.values()) {
+            GuardedCompletion.RequestContext context = batch.guardedRequestContext();
+            if (context == null || context.correlationId != requestHeader.correlationId()
+                    || !Integer.toString(context.brokerNodeId).equals(response.destination())) {
+                failGuardedBatch(batch, new GuardedCompletion.Failure(
+                        org.apache.kafka.clients.producer.ResourceGuardFailureReason.RESPONSE_EVIDENCE_INTEGRITY,
+                        "guarded Produce response was not correlated to the sent request and broker",
+                        null, null, false));
+            }
+        }
+        if (batches.values().stream().anyMatch(ProducerBatch::isDone)) {
+            return;
+        }
+
+        ProduceResponse produceResponse = (ProduceResponse) response.responseBody();
+        byte[] responseBodySha256 = GuardedEvidenceUtils.sha256(
+                MessageUtil.toByteBufferAccessor(produceResponse.data(), (short) 13).buffer());
+        Map<ProducerBatch, org.apache.kafka.common.message.ProduceResponseData.PartitionProduceResponse> responses =
+                new HashMap<>();
+        boolean invalidBinding = false;
+        for (org.apache.kafka.common.message.ProduceResponseData.TopicProduceResponse topicResponse
+                : produceResponse.data().responses()) {
+            for (org.apache.kafka.common.message.ProduceResponseData.PartitionProduceResponse partitionResponse
+                    : topicResponse.partitionResponses()) {
+                ProducerBatch batch = findGuardedBatch(batches, topicResponse.topicId(), partitionResponse.index());
+                if (batch == null || responses.put(batch, partitionResponse) != null) {
+                    invalidBinding = true;
+                }
+            }
+        }
+
+        if (invalidBinding || responses.size() != batches.size()) {
+            for (ProducerBatch batch : batches.values()) {
+                failGuardedBatch(batch, new GuardedCompletion.Failure(
+                        org.apache.kafka.clients.producer.ResourceGuardFailureReason.RESPONSE_EVIDENCE_INTEGRITY,
+                        "guarded Produce v13 response did not bind exactly to the requested topic id and partition",
+                        null, null, false));
+            }
+            return;
+        }
+
+        for (Map.Entry<ProducerBatch, org.apache.kafka.common.message.ProduceResponseData.PartitionProduceResponse> entry
+                : responses.entrySet()) {
+            ProducerBatch batch = entry.getKey();
+            org.apache.kafka.common.message.ProduceResponseData.PartitionProduceResponse partitionResponse = entry.getValue();
+            OptionalInt leaderEpoch = partitionResponse.currentLeader().leaderEpoch() < 0
+                    ? OptionalInt.empty()
+                    : OptionalInt.of(partitionResponse.currentLeader().leaderEpoch());
+            GuardedCompletion.Evidence evidence = new GuardedCompletion.Evidence(
+                    batch.guardedRequestContext(), partitionResponse.errorCode(), partitionResponse.baseOffset(),
+                    partitionResponse.logAppendTimeMs(), leaderEpoch, responseBodySha256);
+            if (partitionResponse.errorCode() == Errors.NONE.code()) {
+                if (partitionResponse.baseOffset() < 0 || partitionResponse.logAppendTimeMs() < 0) {
+                    failGuardedBatch(batch, new GuardedCompletion.Failure(
+                            org.apache.kafka.clients.producer.ResourceGuardFailureReason.RESPONSE_EVIDENCE_INTEGRITY,
+                            "successful guarded response did not contain non-negative offset and log append time",
+                            null, evidence, false));
+                } else {
+                    completeGuardedBatch(batch, evidence);
+                }
+            } else if (canRetryGuarded(batch, Errors.forCode(partitionResponse.errorCode()), now)) {
+                batch.setInflight(false);
+                if (Errors.forCode(partitionResponse.errorCode()) == Errors.UNKNOWN_TOPIC_ID) {
+                    metadata.requestUpdate(false);
+                }
+                reenqueueBatch(batch, now);
+                if (guaranteeMessageOrder)
+                    accumulator.unmutePartition(batch.topicPartition);
+            } else {
+                boolean definitiveTopicIdRejection = Errors.forCode(partitionResponse.errorCode())
+                        == Errors.UNKNOWN_TOPIC_ID && !batch.ambiguousAttemptObserved();
+                failGuardedBatch(batch, new GuardedCompletion.Failure(
+                        org.apache.kafka.clients.producer.ResourceGuardFailureReason.AUTHENTICATED_BROKER_REJECTION,
+                        "broker rejected the guarded produce request with error code " + partitionResponse.errorCode(),
+                        Errors.forCode(partitionResponse.errorCode()).exception(partitionResponse.errorMessage()),
+                        evidence, definitiveTopicIdRejection));
+            }
+        }
+    }
+
+    private boolean canRetryGuarded(ProducerBatch batch, Errors error, long now) {
+        if (error != Errors.NOT_LEADER_OR_FOLLOWER && error != Errors.LEADER_NOT_AVAILABLE
+                && error != Errors.UNKNOWN_TOPIC_ID) {
+            return false;
+        }
+        if (error == Errors.UNKNOWN_TOPIC_ID
+                && !batch.resourceGuard().expectedTopicId().equals(
+                metadata.fetchMetadataSnapshot().cluster().topicId(batch.topicPartition.topic()))) {
+            return false;
+        }
+        ProduceResponse.PartitionResponse response = new ProduceResponse.PartitionResponse(error);
+        return canRetry(batch, response, now);
+    }
+
+    private ProducerBatch findGuardedBatch(Map<TopicPartition, ProducerBatch> batches, Uuid topicId, int partition) {
+        for (ProducerBatch batch : batches.values()) {
+            if (batch.resourceGuard().expectedTopicId().equals(topicId)
+                    && batch.resourceGuard().partition() == partition) {
+                return batch;
+            }
+        }
+        return null;
+    }
+
+    private void completeGuardedBatch(ProducerBatch batch, GuardedCompletion.Evidence evidence) {
+        batch.setInflight(false);
+        if (batch.complete(evidence.baseOffset, evidence.logAppendTimeMs, evidence)) {
+            maybeRemoveAndDeallocateBatch(batch);
+        } else {
+            accumulator.deallocate(batch);
+        }
+        if (guaranteeMessageOrder)
+            accumulator.unmutePartition(batch.topicPartition);
+    }
+
+    private void failGuardedBatch(ProducerBatch batch, GuardedCompletion.Failure failure) {
+        if (batch.isDone()) {
+            return;
+        }
+        GuardedCompletion.Failure effectiveFailure = failure;
+        if (failure.definitelyNotPersisted && batch.ambiguousAttemptObserved()) {
+            effectiveFailure = new GuardedCompletion.Failure(
+                    org.apache.kafka.clients.producer.ResourceGuardFailureReason.AMBIGUOUS_PRIOR_ATTEMPT,
+                    "an earlier guarded attempt had an ambiguous transport outcome",
+                    failure.cause, failure.evidence, false);
+        }
+        final GuardedCompletion.Failure completionFailure = effectiveFailure;
+        batch.setInflight(false);
+        RuntimeException topLevelException = new KafkaException(completionFailure.message, completionFailure.cause);
+        if (batch.completeExceptionally(topLevelException, index -> topLevelException, completionFailure)) {
+            maybeRemoveAndDeallocateBatch(batch);
+        } else {
+            accumulator.deallocate(batch);
+        }
+        if (guaranteeMessageOrder)
+            accumulator.unmutePartition(batch.topicPartition);
     }
 
     /**
@@ -886,8 +1078,18 @@ public class Sender implements Runnable {
      * Transfer the record batches into a list of produce requests on a per-node basis
      */
     private void sendProduceRequests(Map<Integer, List<ProducerBatch>> collated, long now) {
-        for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet())
-            sendProduceRequest(now, entry.getKey(), acks, requestTimeoutMs, entry.getValue());
+        for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet()) {
+            List<ProducerBatch> guarded = entry.getValue().stream()
+                    .filter(ProducerBatch::isGuarded)
+                    .collect(Collectors.toList());
+            List<ProducerBatch> ordinary = entry.getValue().stream()
+                    .filter(batch -> !batch.isGuarded())
+                    .collect(Collectors.toList());
+            if (!ordinary.isEmpty())
+                sendProduceRequest(now, entry.getKey(), acks, requestTimeoutMs, ordinary);
+            if (!guarded.isEmpty())
+                sendProduceRequest(now, entry.getKey(), acks, requestTimeoutMs, guarded);
+        }
     }
 
     /**
@@ -897,14 +1099,43 @@ public class Sender implements Runnable {
         if (batches.isEmpty())
             return;
 
+        final boolean guardedRequest = batches.get(0).isGuarded();
+        if (guardedRequest) {
+            if (acks == 0 || batches.stream().anyMatch(batch -> !batch.isGuarded())) {
+                for (ProducerBatch batch : batches) {
+                    failGuardedBatch(batch, new GuardedCompletion.Failure(
+                            org.apache.kafka.clients.producer.ResourceGuardFailureReason.UNSUPPORTED_CONFIGURATION,
+                            "guarded produce requires a non-zero acknowledgement request", null, null, false));
+                }
+                return;
+            }
+
+            MetadataSnapshot snapshot = metadata.fetchMetadataSnapshot();
+            String currentClusterId = snapshot.cluster().clusterResource().clusterId();
+            for (ProducerBatch batch : batches) {
+                if (!batch.resourceGuard().authenticatedClusterId().equals(currentClusterId)) {
+                    failGuardedBatch(batch, new GuardedCompletion.Failure(
+                            org.apache.kafka.clients.producer.ResourceGuardFailureReason.CLUSTER_MISMATCH,
+                            "authenticated cluster identity changed before guarded produce", null, null, true));
+                } else if (!batch.resourceGuard().expectedTopicId().equals(
+                        snapshot.cluster().topicId(batch.topicPartition.topic()))) {
+                    failGuardedBatch(batch, new GuardedCompletion.Failure(
+                            org.apache.kafka.clients.producer.ResourceGuardFailureReason.TOPIC_ID_MISMATCH,
+                            "topic identity changed before guarded produce", null, null, true));
+                }
+            }
+            if (batches.stream().anyMatch(ProducerBatch::isDone))
+                return;
+        }
+
         final Map<TopicPartition, ProducerBatch> recordsByPartition = new HashMap<>(batches.size());
-        Map<String, Uuid> topicIds = topicIdsForBatches(batches);
+        Map<String, Uuid> topicIds = guardedRequest ? Collections.emptyMap() : topicIdsForBatches(batches);
 
         ProduceRequestData.TopicProduceDataCollection tpd = new ProduceRequestData.TopicProduceDataCollection();
         for (ProducerBatch batch : batches) {
             TopicPartition tp = batch.topicPartition;
             MemoryRecords records = batch.records();
-            Uuid topicId = topicIds.get(tp.topic());
+            Uuid topicId = guardedRequest ? batch.resourceGuard().expectedTopicId() : topicIds.get(tp.topic());
             ProduceRequestData.TopicProduceData tpData = tpd.find(tp.topic(), topicId);
 
             if (tpData == null) {
@@ -927,23 +1158,31 @@ public class Sender implements Runnable {
             useTransactionV1Version = !transactionManager.isTransactionV2Enabled();
         }
 
-        ProduceRequest.Builder requestBuilder = ProduceRequest.builder(
-                new ProduceRequestData()
-                        .setAcks(acks)
-                        .setTimeoutMs(timeout)
-                        .setTransactionalId(transactionalId)
-                        .setTopicData(tpd),
-                useTransactionV1Version
-        );
+        ProduceRequestData requestData = new ProduceRequestData()
+                .setAcks(acks)
+                .setTimeoutMs(timeout)
+                .setTransactionalId(transactionalId)
+                .setTopicData(tpd);
+        ProduceRequest.Builder requestBuilder = guardedRequest
+                ? new ProduceRequest.Builder((short) 13, (short) 13, requestData)
+                : ProduceRequest.builder(requestData, useTransactionV1Version);
         // Fetch topic names from metadata outside callback as topic ids may change during the callback
         // for example if topic was recreated.
         Map<Uuid, String> topicNames = metadata.topicNames();
 
-        RequestCompletionHandler callback = response -> handleProduceResponse(response, recordsByPartition, topicNames, time.milliseconds());
-
         String nodeId = Integer.toString(destination);
         ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0,
-                requestTimeoutMs, callback);
+                requestTimeoutMs, response -> handleProduceResponse(response, recordsByPartition, topicNames,
+                        time.milliseconds(), guardedRequest));
+        if (guardedRequest) {
+            byte[] requestBodySha256 = GuardedEvidenceUtils.sha256(
+                    MessageUtil.toByteBufferAccessor(requestData, (short) 13).buffer());
+            for (ProducerBatch batch : batches) {
+                batch.setGuardedRequestContext(new GuardedCompletion.RequestContext(
+                        batch.resourceGuard(), (short) 13, clientRequest.correlationId(), destination,
+                        requestBodySha256, GuardedEvidenceUtils.sha256(batch.records().buffer())));
+            }
+        }
         client.send(clientRequest, now);
         log.trace("Sent produce request to {}: {}", nodeId, requestBuilder);
     }
