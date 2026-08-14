@@ -765,10 +765,10 @@ public class Sender implements Runnable {
                     batch.guardedRequestContext(), partitionResponse.errorCode(), partitionResponse.baseOffset(),
                     partitionResponse.logAppendTimeMs(), leaderEpoch, responseBodySha256);
             if (partitionResponse.errorCode() == Errors.NONE.code()) {
-                if (partitionResponse.baseOffset() < 0 || partitionResponse.logAppendTimeMs() < 0) {
+                if (partitionResponse.baseOffset() < 0 || partitionResponse.logAppendTimeMs() < -1) {
                     failGuardedBatch(batch, new GuardedCompletion.Failure(
                             org.apache.kafka.clients.producer.ResourceGuardFailureReason.RESPONSE_EVIDENCE_INTEGRITY,
-                            "successful guarded response did not contain non-negative offset and log append time",
+                            "successful guarded response did not contain a valid offset or log append time",
                             null, evidence, false));
                 } else {
                     completeGuardedBatch(batch, evidence);
