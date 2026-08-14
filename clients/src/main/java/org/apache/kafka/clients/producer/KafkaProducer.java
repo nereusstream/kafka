@@ -246,7 +246,7 @@ import java.util.stream.Collectors;
  * </p>
  */
 @InterfaceAudience.Public
-public class KafkaProducer<K, V> implements Producer<K, V> {
+public class KafkaProducer<K, V> implements GuardedProducer<K, V> {
 
     private final Logger log;
     private static final String JMX_PREFIX = "kafka.producer";
@@ -1097,6 +1097,90 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         return doSend(interceptedRecord, callback);
     }
 
+    @Override
+    public Future<GuardedRecordMetadata> sendGuarded(final ProducerRecord<K, V> record,
+                                                      final ProducerResourceGuard guard) {
+        return sendGuarded(record, guard, null);
+    }
+
+    @Override
+    public Future<GuardedRecordMetadata> sendGuarded(final ProducerRecord<K, V> record,
+                                                      final ProducerResourceGuard guard,
+                                                      final GuardedCallback callback) {
+        Objects.requireNonNull(record, "record");
+        Objects.requireNonNull(guard, "guard");
+        ProducerRecord<K, V> interceptedRecord = this.interceptors.onSend(record);
+        try {
+            throwIfProducerClosed();
+            throwIfInPreparedState();
+            validateGuardedRecord(interceptedRecord, guard);
+            if (transactionManager != null && transactionManager.isTransactional()
+                    || producerConfig.getString(ProducerConfig.TRANSACTIONAL_ID_CONFIG) != null
+                    || "0".equals(producerConfig.getString(ProducerConfig.ACKS_CONFIG))) {
+                throw guardedFailure(ResourceGuardFailureReason.UNSUPPORTED_CONFIGURATION,
+                        guard, "guarded produce requires a non-transactional producer with acknowledgements", null);
+            }
+            ClusterAndWaitTime clusterAndWaitTime = waitOnMetadata(interceptedRecord.topic(),
+                    interceptedRecord.partition(), time.milliseconds(), maxBlockTimeMs);
+            validateGuardedCluster(clusterAndWaitTime.cluster, guard);
+            throw guardedFailure(ResourceGuardFailureReason.UNSUPPORTED_REQUEST_VERSION, guard,
+                    "guarded produce transport is not wired to the v13 evidence path", null);
+        } catch (ResourceGuardException failure) {
+            return completeGuardedFailure(interceptedRecord, callback, failure);
+        } catch (InterruptedException failure) {
+            throw new InterruptException(failure);
+        } catch (KafkaException failure) {
+            errors.record();
+            this.interceptors.onSendError(interceptedRecord,
+                    new TopicPartition(interceptedRecord.topic(), partitionOrUnknown(interceptedRecord)), failure);
+            throw failure;
+        }
+    }
+
+    private void validateGuardedRecord(final ProducerRecord<K, V> record,
+                                       final ProducerResourceGuard guard) {
+        Integer partition = record.partition();
+        if (!guard.canonicalTopic().equals(record.topic()) || partition == null
+                || partition != guard.partition()) {
+            throw guardedFailure(ResourceGuardFailureReason.INVALID_GUARD, guard,
+                    "guarded record topic/partition does not match the resource guard", null);
+        }
+    }
+
+    private void validateGuardedCluster(final Cluster cluster, final ProducerResourceGuard guard) {
+        String clusterId = cluster.clusterResource().clusterId();
+        if (!guard.authenticatedClusterId().equals(clusterId)) {
+            throw guardedFailure(ResourceGuardFailureReason.CLUSTER_MISMATCH, guard,
+                    "authenticated cluster identity does not match the resource guard", null);
+        }
+        if (!guard.expectedTopicId().equals(cluster.topicId(guard.canonicalTopic()))) {
+            throw guardedFailure(ResourceGuardFailureReason.TOPIC_ID_MISMATCH, guard,
+                    "current topic identity does not match the resource guard", null);
+        }
+    }
+
+    private ResourceGuardException guardedFailure(final ResourceGuardFailureReason reason,
+                                                  final ProducerResourceGuard guard, final String message,
+                                                  final Throwable cause) {
+        return new ResourceGuardException(message, cause, reason, guard, Optional.empty(), true);
+    }
+
+    private Future<GuardedRecordMetadata> completeGuardedFailure(final ProducerRecord<K, V> record,
+                                                                   final GuardedCallback callback,
+                                                                   final ResourceGuardException failure) {
+        errors.record();
+        this.interceptors.onSendError(record,
+                new TopicPartition(record.topic(), partitionOrUnknown(record)), failure);
+        if (callback != null) {
+            callback.onCompletion(null, failure);
+        }
+        return new GuardedFutureFailure(failure);
+    }
+
+    private static int partitionOrUnknown(final ProducerRecord<?, ?> record) {
+        return record.partition() == null ? RecordMetadata.UNKNOWN_PARTITION : record.partition();
+    }
+
     // Verify that this producer instance has not been closed. This method throws IllegalStateException if the producer
     // has already been closed.
     private void throwIfProducerClosed() {
@@ -1708,6 +1792,40 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             return true;
         }
 
+    }
+
+    private static class GuardedFutureFailure implements Future<GuardedRecordMetadata> {
+
+        private final ExecutionException exception;
+
+        GuardedFutureFailure(final Exception failure) {
+            this.exception = new ExecutionException(failure);
+        }
+
+        @Override
+        public boolean cancel(final boolean interrupt) {
+            return false;
+        }
+
+        @Override
+        public GuardedRecordMetadata get() throws ExecutionException {
+            throw exception;
+        }
+
+        @Override
+        public GuardedRecordMetadata get(final long timeout, final TimeUnit unit) throws ExecutionException {
+            throw exception;
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return false;
+        }
+
+        @Override
+        public boolean isDone() {
+            return true;
+        }
     }
 
     /**
