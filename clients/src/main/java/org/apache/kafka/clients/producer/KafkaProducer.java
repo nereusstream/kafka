@@ -247,7 +247,7 @@ import java.util.stream.Collectors;
  * </p>
  */
 @InterfaceAudience.Public
-public class KafkaProducer<K, V> implements GuardedProducer<K, V> {
+public class KafkaProducer<K, V> implements GuardedTransactionalProducer<K, V> {
 
     private final Logger log;
     private static final String JMX_PREFIX = "kafka.producer";
@@ -1108,6 +1108,26 @@ public class KafkaProducer<K, V> implements GuardedProducer<K, V> {
     public Future<GuardedRecordMetadata> sendGuarded(final ProducerRecord<K, V> record,
                                                       final ProducerResourceGuard guard,
                                                       final GuardedCallback callback) {
+        return sendGuarded(record, guard, callback, false);
+    }
+
+    @Override
+    public Future<GuardedRecordMetadata> sendGuardedInTransaction(final ProducerRecord<K, V> record,
+                                                                   final ProducerResourceGuard guard) {
+        return sendGuardedInTransaction(record, guard, null);
+    }
+
+    @Override
+    public Future<GuardedRecordMetadata> sendGuardedInTransaction(final ProducerRecord<K, V> record,
+                                                                   final ProducerResourceGuard guard,
+                                                                   final GuardedCallback callback) {
+        return sendGuarded(record, guard, callback, true);
+    }
+
+    private Future<GuardedRecordMetadata> sendGuarded(final ProducerRecord<K, V> record,
+                                                       final ProducerResourceGuard guard,
+                                                       final GuardedCallback callback,
+                                                       final boolean inTransaction) {
         Objects.requireNonNull(record, "record");
         Objects.requireNonNull(guard, "guard");
         ProducerRecord<K, V> interceptedRecord = this.interceptors.onSend(record);
@@ -1117,12 +1137,7 @@ public class KafkaProducer<K, V> implements GuardedProducer<K, V> {
             throwIfProducerClosed();
             throwIfInPreparedState();
             validateGuardedRecord(interceptedRecord, guard);
-            if (transactionManager != null && transactionManager.isTransactional()
-                    || producerConfig.getString(ProducerConfig.TRANSACTIONAL_ID_CONFIG) != null
-                    || "0".equals(producerConfig.getString(ProducerConfig.ACKS_CONFIG))) {
-                throw guardedFailure(ResourceGuardFailureReason.UNSUPPORTED_CONFIGURATION,
-                        guard, "guarded produce requires a non-transactional producer with acknowledgements", null);
-            }
+            validateGuardedTransactionMode(guard, inTransaction);
             ClusterAndWaitTime clusterAndWaitTime = waitOnMetadata(interceptedRecord.topic(),
                     interceptedRecord.partition(), time.milliseconds(), maxBlockTimeMs);
             validateGuardedCluster(clusterAndWaitTime.cluster, guard);
@@ -1156,6 +1171,11 @@ public class KafkaProducer<K, V> implements GuardedProducer<K, V> {
                     interceptedRecord.topic(), guard.partition(), timestamp, serializedKey, serializedValue, headers,
                     appendCallbacks, remainingWaitMs, nowMs, clusterAndWaitTime.cluster, guard, guardedFuture,
                     GuardedEvidenceUtils.sha256(java.nio.ByteBuffer.wrap(serializedValue)));
+            if (inTransaction) {
+                // The guarded append fixes the partition before this call. Adding it only after the append keeps
+                // the transaction manager and the accumulator in the same ownership order as ordinary sends.
+                transactionManager.maybeAddPartition(appendCallbacks.topicPartition());
+            }
             if (result.batchIsFull || result.newBatchCreated) {
                 sender.wakeup();
             }
@@ -1169,6 +1189,24 @@ public class KafkaProducer<K, V> implements GuardedProducer<K, V> {
             this.interceptors.onSendError(interceptedRecord,
                     new TopicPartition(interceptedRecord.topic(), partitionOrUnknown(interceptedRecord)), failure);
             throw failure;
+        }
+    }
+
+    private void validateGuardedTransactionMode(final ProducerResourceGuard guard, final boolean inTransaction) {
+        boolean configuredTransactionalId = producerConfig.getString(ProducerConfig.TRANSACTIONAL_ID_CONFIG) != null;
+        boolean transactional = transactionManager != null && transactionManager.isTransactional();
+        if (!inTransaction) {
+            if (transactional || configuredTransactionalId || "0".equals(producerConfig.getString(ProducerConfig.ACKS_CONFIG))) {
+                throw guardedFailure(ResourceGuardFailureReason.UNSUPPORTED_CONFIGURATION,
+                        guard, "guarded produce requires a non-transactional producer with acknowledgements", null);
+            }
+            return;
+        }
+
+        if (!transactional || !transactionManager.isTransactionInProgress()
+                || !transactionManager.isTransactionV2Enabled()) {
+            throw guardedFailure(ResourceGuardFailureReason.UNSUPPORTED_CONFIGURATION, guard,
+                    "guarded transactional produce requires an active transaction.version 2 producer", null);
         }
     }
 

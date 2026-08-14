@@ -363,6 +363,14 @@ public class TransactionManager {
     }
 
     /**
+     * Return whether application sends may currently be added to the transaction.
+     * This is intentionally read-only; transaction state transitions remain owned by the public Producer API.
+     */
+    public synchronized boolean isTransactionInProgress() {
+        return isTransactional() && currentState == State.IN_TRANSACTION;
+    }
+
+    /**
      * Prepare a transaction for a two-phase commit.
      * This transitions the transaction to the PREPARED_TRANSACTION state.
      * The preparedTxnState is set with the current producer ID and epoch.

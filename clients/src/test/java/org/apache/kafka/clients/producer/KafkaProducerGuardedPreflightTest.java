@@ -92,6 +92,20 @@ class KafkaProducerGuardedPreflightTest {
     }
 
     @Test
+    void guardedTransactionalProduceRequiresActiveTransactionV2() throws Exception {
+        Map<String, Object> configs = new HashMap<>();
+        configs.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "guarded-transaction");
+        try (KafkaProducer<byte[], byte[]> producer = producer(configs)) {
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> producer.sendGuardedInTransaction(
+                            new ProducerRecord<>("topic", 0, null, new byte[]{1}), guard(0)).get());
+            ResourceGuardException cause = (ResourceGuardException) failure.getCause();
+            assertEquals(ResourceGuardFailureReason.UNSUPPORTED_CONFIGURATION, cause.reason());
+            assertEquals(true, cause.definitelyNotPersisted());
+        }
+    }
+
+    @Test
     @org.junit.jupiter.api.Timeout(5)
     void guardedSuccessReturnsBrokerBoundEvidence() throws Exception {
         MockTime time = new MockTime();

@@ -26,6 +26,7 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.internals.FutureRecordMetadata;
+import org.apache.kafka.clients.producer.internals.GuardedCompletion;
 import org.apache.kafka.clients.producer.internals.ProduceRequestResult;
 import org.apache.kafka.clients.producer.internals.ProducerInterceptors;
 import org.apache.kafka.clients.producer.internals.ProducerMetadata;
@@ -2905,6 +2906,44 @@ public class KafkaProducerTest {
         try (KafkaProducer<String, String> producer = ctx.newKafkaProducer()) {
             assertEquals(future, producer.send(record));
             assertFalse(future.isDone());
+            verify(ctx.transactionManager).maybeAddPartition(topicPartition);
+        }
+    }
+
+    @Test
+    public void testGuardedRecordAddedToTransaction() throws Exception {
+        StringSerializer serializer = new StringSerializer();
+        KafkaProducerTestContext<String> ctx = new KafkaProducerTestContext<>(testInfo, serializer);
+
+        String topic = "guarded-topic";
+        Uuid topicId = new Uuid(21, 22);
+        TopicPartition topicPartition = new TopicPartition(topic, 0);
+        Cluster cluster = new Cluster("guarded-cluster", Collections.singleton(NODE),
+                Collections.singleton(new PartitionInfo(topic, 0, NODE, new Node[]{NODE}, new Node[]{NODE})),
+                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), null,
+                Collections.singletonMap(topic, topicId));
+        ProducerResourceGuard guard = new ProducerResourceGuard("guarded-cluster", topic, topicId, 0);
+
+        when(ctx.sender.isRunning()).thenReturn(true);
+        when(ctx.metadata.fetch()).thenReturn(cluster);
+        when(ctx.transactionManager.isTransactional()).thenReturn(true);
+        when(ctx.transactionManager.isTransactionInProgress()).thenReturn(true);
+        when(ctx.transactionManager.isTransactionV2Enabled()).thenReturn(true);
+
+        ProducerRecord<String, String> record = new ProducerRecord<>(topic, 0, null, "key", "value");
+        FutureRecordMetadata appendedFuture = mock(FutureRecordMetadata.class);
+        when(ctx.accumulator.append(eq(topic), eq(0), anyLong(), any(byte[].class), any(byte[].class),
+                any(), any(RecordAccumulator.AppendCallbacks.class), anyLong(), anyLong(), eq(cluster), eq(guard),
+                any(GuardedCompletion.class), any(byte[].class))).thenAnswer(invocation -> {
+                    RecordAccumulator.AppendCallbacks callbacks =
+                            (RecordAccumulator.AppendCallbacks) invocation.getArguments()[6];
+                    callbacks.setPartition(0);
+                    return new RecordAccumulator.RecordAppendResult(appendedFuture, false, false, 0);
+                });
+
+        try (KafkaProducer<String, String> producer = ctx.newKafkaProducer()) {
+            Future<GuardedRecordMetadata> result = producer.sendGuardedInTransaction(record, guard);
+            assertNotNull(result);
             verify(ctx.transactionManager).maybeAddPartition(topicPartition);
         }
     }
