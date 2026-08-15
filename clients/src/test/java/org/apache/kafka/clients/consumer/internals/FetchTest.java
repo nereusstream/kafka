@@ -17,6 +17,7 @@
 package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.GuardedFetchEvidence;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 
@@ -50,6 +51,19 @@ class FetchTest {
         assertTrue(target.records().containsKey(TP1));
         assertTrue(target.nextOffsets().containsKey(TP0));
         assertTrue(target.nextOffsets().containsKey(TP1));
+    }
+
+    @Test
+    void guardedEvidenceFollowsTheFetchedPartitionWhenFetchesAreMerged() {
+        GuardedFetchEvidence evidence = new GuardedFetchEvidence("cluster", "topic", new org.apache.kafka.common.Uuid(1, 2),
+                0, (short) 13, 1, 2, 3, 0, 0, 0, 1, 1, new byte[32]);
+        Fetch<String, String> target = Fetch.forPartition(TP0,
+                List.of(new ConsumerRecord<>("topic", 0, 0, "key", "value")), true,
+                new OffsetAndMetadata(1, Optional.empty(), ""), evidence);
+
+        assertEquals(evidence, target.guardedFetchEvidence().get(TP0));
+        assertThrows(UnsupportedOperationException.class,
+                () -> target.guardedFetchEvidence().put(TP1, evidence));
     }
 
     @Test

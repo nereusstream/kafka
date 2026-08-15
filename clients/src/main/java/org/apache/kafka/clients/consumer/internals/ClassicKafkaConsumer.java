@@ -677,11 +677,13 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
                                 + "since the consumer's position has advanced for at least one topic partition");
                     }
 
-                    return this.interceptors.onConsume(new ConsumerRecords<>(fetch.records(), fetch.nextOffsets()));
+                    ConsumerRecords<K, V> records = this.interceptors.onConsume(
+                            new ConsumerRecords<>(fetch.records(), fetch.nextOffsets()));
+                    return guardedRecords(fetch, records);
                 }
             } while (timer.notExpired());
 
-            return ConsumerRecords.empty();
+            return guardedRecords(Fetch.empty(), ConsumerRecords.empty());
         } finally {
             release();
             this.kafkaConsumerMetrics.recordPollEnd(timer.currentTimeMs());
@@ -691,6 +693,41 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
     private int sendFetches() {
         offsetFetcher.validatePositionsOnMetadataChange();
         return fetcher.sendFetches();
+    }
+
+    private ConsumerRecords<K, V> guardedRecords(final Fetch<K, V> fetch,
+                                                  final ConsumerRecords<K, V> records) {
+        Optional<org.apache.kafka.clients.consumer.ConsumerResourceGuard> guardedResource =
+                metadata.guardedResourceGuard();
+        if (guardedResource.isEmpty()) {
+            return records;
+        }
+        org.apache.kafka.clients.consumer.ConsumerResourceGuard guard = guardedResource.get();
+        fetch.guardedFetchEvidence().forEach((partition, ignored) -> {
+            if (!partition.equals(guard.topicPartition())) {
+                throw new org.apache.kafka.clients.consumer.ConsumerResourceGuardException(
+                        "guarded Fetch returned evidence for a foreign partition",
+                        org.apache.kafka.clients.consumer.ConsumerResourceGuardFailureReason.RESPONSE_EVIDENCE_INTEGRITY,
+                        guard);
+            }
+        });
+        for (TopicPartition partition : records.partitions()) {
+            if (!partition.equals(guard.topicPartition())) {
+                throw new org.apache.kafka.clients.consumer.ConsumerResourceGuardException(
+                        "guarded consumer returned a foreign partition",
+                        org.apache.kafka.clients.consumer.ConsumerResourceGuardFailureReason.RESPONSE_EVIDENCE_INTEGRITY,
+                        guard);
+            }
+        }
+        org.apache.kafka.clients.consumer.GuardedFetchEvidence evidence =
+                fetch.guardedFetchEvidence().get(guard.topicPartition());
+        if (!records.isEmpty() && evidence == null) {
+            throw new org.apache.kafka.clients.consumer.ConsumerResourceGuardException(
+                    "guarded Fetch records have no response evidence",
+                    org.apache.kafka.clients.consumer.ConsumerResourceGuardFailureReason.RESPONSE_EVIDENCE_MISSING,
+                    guard);
+        }
+        return new org.apache.kafka.clients.consumer.GuardedConsumerRecords<>(records, evidence);
     }
 
     boolean updateAssignmentMetadataIfNeeded(final Timer timer, final boolean waitForJoinGroup) {
@@ -1281,6 +1318,17 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
     private void updateLastSeenEpochIfNewer(TopicPartition topicPartition, OffsetAndMetadata offsetAndMetadata) {
         if (offsetAndMetadata != null)
             offsetAndMetadata.leaderEpoch().ifPresent(epoch -> metadata.updateLastSeenEpochIfNewer(topicPartition, epoch));
+    }
+
+    @Override
+    public void bindResourceGuard(final org.apache.kafka.clients.consumer.ConsumerResourceGuard guard) {
+        metadata.bindResourceGuard(guard);
+    }
+
+    @Override
+    public org.apache.kafka.clients.consumer.ConsumerResourceGuard resourceGuard() {
+        return metadata.guardedResourceGuard().orElseThrow(
+                () -> new IllegalStateException("consumer resource guard has not been bound"));
     }
 
     // Functions below are for testing only

@@ -23,6 +23,10 @@ import org.apache.kafka.clients.KafkaClient;
 import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.clients.NetworkClientUtils;
 import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerResourceGuard;
+import org.apache.kafka.clients.consumer.ConsumerResourceGuardException;
+import org.apache.kafka.clients.consumer.ConsumerResourceGuardFailureReason;
+import org.apache.kafka.clients.consumer.GuardedFetchEvidence;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicPartition;
@@ -31,7 +35,10 @@ import org.apache.kafka.common.errors.AuthenticationException;
 import org.apache.kafka.common.internals.IdempotentCloser;
 import org.apache.kafka.common.message.FetchResponseData;
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.MessageUtil;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.record.internal.Records;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.utils.Time;
@@ -165,6 +172,12 @@ public abstract class AbstractFetch implements Closeable {
 
             final short requestVersion = resp.requestHeader().apiVersion();
 
+            final Optional<ConsumerResourceGuard> guardedResource = metadata.guardedResourceGuard();
+            if (guardedResource.isPresent() && requestVersion < 13) {
+                throw guardedFailure(ConsumerResourceGuardFailureReason.UNSUPPORTED_VERSION,
+                        guardedResource.get(), "guarded Fetch requires Fetch v13 or newer", null);
+            }
+
             if (!handler.handleResponse(response, requestVersion)) {
                 if (response.error() == Errors.FETCH_SESSION_TOPIC_ID_ERROR) {
                     metadata.requestUpdate(false);
@@ -174,6 +187,8 @@ public abstract class AbstractFetch implements Closeable {
             }
 
             final Map<TopicPartition, FetchResponseData.PartitionData> responseData = response.responseData(handler.sessionTopicNames(), requestVersion);
+            final Optional<GuardedFetchEvidence> guardedEvidence = guardedFetchEvidence(
+                    guardedResource, data, response, responseData, requestVersion, resp, fetchTarget);
             final Set<TopicPartition> partitions = new HashSet<>(responseData.keySet());
             final FetchMetricsAggregator metricAggregator = new FetchMetricsAggregator(metricsManager, partitions);
 
@@ -223,7 +238,8 @@ public abstract class AbstractFetch implements Closeable {
                         partition,
                         partitionData,
                         metricAggregator,
-                        fetchOffset);
+                        fetchOffset,
+                        guardedEvidence.filter(evidence -> evidence.topicPartition().equals(partition)).orElse(null));
                 fetchBuffer.add(completedFetch);
                 needsWakeup = false;
             }
@@ -254,6 +270,69 @@ public abstract class AbstractFetch implements Closeable {
         } finally {
             removePendingFetchRequest(fetchTarget, data.metadata().sessionId());
         }
+    }
+
+    private Optional<GuardedFetchEvidence> guardedFetchEvidence(
+            final Optional<ConsumerResourceGuard> guardedResource,
+            final FetchSessionHandler.FetchRequestData request,
+            final FetchResponse response,
+            final Map<TopicPartition, FetchResponseData.PartitionData> responseData,
+            final short requestVersion,
+            final ClientResponse clientResponse,
+            final Node fetchTarget) {
+        if (guardedResource.isEmpty()) {
+            return Optional.empty();
+        }
+
+        ConsumerResourceGuard guard = guardedResource.get();
+        TopicPartition topicPartition = guard.topicPartition();
+        FetchRequest.PartitionData requestPartition = request.sessionPartitions().get(topicPartition);
+        if (requestPartition == null || !guard.expectedTopicId().equals(requestPartition.topicId)) {
+            throw guardedFailure(ConsumerResourceGuardFailureReason.TOPIC_ID_MISMATCH, guard,
+                    "guarded Fetch request did not carry the expected TopicId and partition", null);
+        }
+
+        FetchResponseData.PartitionData partitionData = responseData.get(topicPartition);
+        if (partitionData == null) {
+            return Optional.empty();
+        }
+        if (!response.topicIds().contains(guard.expectedTopicId())) {
+            throw guardedFailure(ConsumerResourceGuardFailureReason.RESPONSE_EVIDENCE_INTEGRITY, guard,
+                    "guarded Fetch response omitted the expected TopicId", null);
+        }
+        Errors partitionError = Errors.forCode(partitionData.errorCode());
+        if (partitionError != Errors.NONE) {
+            throw guardedFailure(ConsumerResourceGuardFailureReason.RESPONSE_EVIDENCE_INTEGRITY, guard,
+                    "guarded Fetch response contains a partition error: " + partitionError, null);
+        }
+
+        Records records = FetchResponse.recordsOrFail(partitionData);
+        long firstRecordOffset = -1L;
+        long lastRecordOffset = -1L;
+        for (RecordBatch batch : records.batches()) {
+            if (firstRecordOffset == -1L) {
+                firstRecordOffset = batch.baseOffset();
+            } else {
+                firstRecordOffset = Math.min(firstRecordOffset, batch.baseOffset());
+            }
+            lastRecordOffset = Math.max(lastRecordOffset, batch.lastOffset());
+        }
+        byte[] responseDigest = GuardedFetchEvidenceUtils.sha256(
+                MessageUtil.toByteBufferAccessor(response.data(), requestVersion).buffer());
+        return Optional.of(new GuardedFetchEvidence(guard.authenticatedClusterId(), guard.canonicalTopic(),
+                guard.expectedTopicId(), guard.partition(), requestVersion,
+                clientResponse.requestHeader().correlationId(), fetchTarget.id(), response.sessionId(),
+                requestPartition.fetchOffset, firstRecordOffset, lastRecordOffset,
+                partitionData.highWatermark(), partitionData.lastStableOffset(), responseDigest));
+    }
+
+    private ConsumerResourceGuardException guardedFailure(final ConsumerResourceGuardFailureReason reason,
+                                                          final ConsumerResourceGuard guard,
+                                                          final String message,
+                                                          final Throwable cause) {
+        return cause == null
+                ? new ConsumerResourceGuardException(message, reason, guard)
+                : new ConsumerResourceGuardException(message, cause, reason, guard);
     }
 
     /**
@@ -439,8 +518,13 @@ public abstract class AbstractFetch implements Closeable {
         }
 
         Set<Integer> bufferedNodes = bufferedNodes(buffered, currentTimeMs);
+        final Optional<ConsumerResourceGuard> guardedResource = metadata.guardedResourceGuard();
 
         for (TopicPartition partition : unbuffered) {
+            if (guardedResource.isPresent() && !partition.equals(guardedResource.get().topicPartition())) {
+                throw guardedFailure(ConsumerResourceGuardFailureReason.INVALID_GUARD, guardedResource.get(),
+                        "guarded consumer assignment contains a foreign topic partition", null);
+            }
             SubscriptionState.FetchPosition position = positionForPartition(partition);
             Optional<Node> nodeOpt = maybeNodeForPosition(partition, position, currentTimeMs);
 
@@ -466,11 +550,27 @@ public abstract class AbstractFetch implements Closeable {
                 log.trace("Skipping fetch for partition {} because its leader node {} hosts buffered partitions", partition, node);
             } else {
                 // if there is a leader and no in-flight requests, issue a new fetch
+                Uuid topicId = topicIds.getOrDefault(partition.topic(), Uuid.ZERO_UUID);
+                if (guardedResource.isPresent()) {
+                    ConsumerResourceGuard guard = guardedResource.get();
+                    String clusterId = metadata.fetch().clusterResource().clusterId();
+                    if (clusterId == null || topicId.equals(Uuid.ZERO_UUID)) {
+                        metadata.requestUpdate(false);
+                        continue;
+                    }
+                    if (!guard.authenticatedClusterId().equals(clusterId)) {
+                        throw guardedFailure(ConsumerResourceGuardFailureReason.CLUSTER_MISMATCH, guard,
+                                "authenticated cluster identity does not match the guarded Fetch metadata", null);
+                    }
+                    if (!guard.expectedTopicId().equals(topicId)) {
+                        throw guardedFailure(ConsumerResourceGuardFailureReason.TOPIC_ID_MISMATCH, guard,
+                                "current topic identity does not match the guarded Fetch resource", null);
+                    }
+                }
                 FetchSessionHandler.Builder builder = fetchable.computeIfAbsent(node, k -> {
                     FetchSessionHandler fetchSessionHandler = sessionHandlers.computeIfAbsent(node.id(), n -> new FetchSessionHandler(logContext, n));
                     return fetchSessionHandler.newBuilder();
                 });
-                Uuid topicId = topicIds.getOrDefault(partition.topic(), Uuid.ZERO_UUID);
                 FetchRequest.PartitionData partitionData = new FetchRequest.PartitionData(topicId,
                         position.offset,
                         FetchRequest.INVALID_LOG_START_OFFSET,

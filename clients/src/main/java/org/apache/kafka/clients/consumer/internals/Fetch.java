@@ -17,6 +17,7 @@
 package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.GuardedFetchEvidence;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 
@@ -30,6 +31,7 @@ import java.util.Objects;
 public class Fetch<K, V> {
     private final Map<TopicPartition, List<ConsumerRecord<K, V>>> records;
     private final Map<TopicPartition, OffsetAndMetadata> nextOffsetAndMetadata;
+    private final Map<TopicPartition, GuardedFetchEvidence> guardedFetchEvidence;
     private boolean positionAdvanced;
     private int numRecords;
 
@@ -43,7 +45,17 @@ public class Fetch<K, V> {
             boolean positionAdvanced,
             OffsetAndMetadata nextOffsetAndMetadata
     ) {
-        return new Fetch<>(positionAdvanced, partition, records, nextOffsetAndMetadata);
+        return forPartition(partition, records, positionAdvanced, nextOffsetAndMetadata, null);
+    }
+
+    public static <K, V> Fetch<K, V> forPartition(
+            TopicPartition partition,
+            List<ConsumerRecord<K, V>> records,
+            boolean positionAdvanced,
+            OffsetAndMetadata nextOffsetAndMetadata,
+            GuardedFetchEvidence guardedFetchEvidence
+    ) {
+        return new Fetch<>(positionAdvanced, partition, records, nextOffsetAndMetadata, guardedFetchEvidence);
     }
 
     private Fetch(
@@ -54,13 +66,15 @@ public class Fetch<K, V> {
         this.positionAdvanced = positionAdvanced;
         this.numRecords = numRecords;
         this.nextOffsetAndMetadata = new HashMap<>();
+        this.guardedFetchEvidence = new HashMap<>();
     }
 
     private Fetch(
             boolean positionAdvanced,
             TopicPartition partition,
             List<ConsumerRecord<K, V>> records,
-            OffsetAndMetadata offsetAndMetadata
+            OffsetAndMetadata offsetAndMetadata,
+            GuardedFetchEvidence guardedFetchEvidence
     ) {
         this.records = new HashMap<>();
         if (!records.isEmpty()) {
@@ -70,6 +84,10 @@ public class Fetch<K, V> {
         this.numRecords = records.size();
         this.nextOffsetAndMetadata = new HashMap<>();
         this.nextOffsetAndMetadata.put(partition, offsetAndMetadata);
+        this.guardedFetchEvidence = new HashMap<>();
+        if (guardedFetchEvidence != null) {
+            this.guardedFetchEvidence.put(partition, guardedFetchEvidence);
+        }
     }
     /**
      * Add another {@link Fetch} to this one; all of its records will be added to this fetch's
@@ -83,6 +101,7 @@ public class Fetch<K, V> {
         addRecords(fetch.records);
         this.positionAdvanced |= fetch.positionAdvanced;
         this.nextOffsetAndMetadata.putAll(fetch.nextOffsetAndMetadata);
+        this.guardedFetchEvidence.putAll(fetch.guardedFetchEvidence);
     }
 
     /**
@@ -113,6 +132,11 @@ public class Fetch<K, V> {
      */
     public Map<TopicPartition, OffsetAndMetadata> nextOffsets() {
         return Map.copyOf(nextOffsetAndMetadata);
+    }
+
+    /** Return the guarded Fetch response proof for each partition in this poll. */
+    public Map<TopicPartition, GuardedFetchEvidence> guardedFetchEvidence() {
+        return Collections.unmodifiableMap(guardedFetchEvidence);
     }
 
     /**

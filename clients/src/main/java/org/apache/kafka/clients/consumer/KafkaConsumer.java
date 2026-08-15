@@ -538,7 +538,7 @@ import static org.apache.kafka.common.utils.Utils.propsToMap;
  * commit.
  */
 @InterfaceAudience.Public
-public class KafkaConsumer<K, V> implements Consumer<K, V> {
+public class KafkaConsumer<K, V> implements GuardedConsumer<K, V> {
 
     private static final ConsumerDelegateCreator CREATOR = new ConsumerDelegateCreator();
 
@@ -917,6 +917,30 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
     @Override
     public ConsumerRecords<K, V> poll(final Duration timeout) {
         return delegate.poll(timeout);
+    }
+
+    @Override
+    public void bindResourceGuard(final ConsumerResourceGuard guard) {
+        delegate.bindResourceGuard(guard);
+    }
+
+    @Override
+    public ConsumerResourceGuard resourceGuard() {
+        return delegate.resourceGuard();
+    }
+
+    @Override
+    public GuardedConsumerRecords<K, V> pollGuarded(final Duration timeout) {
+        ConsumerRecords<K, V> records = delegate.poll(timeout);
+        if (!(records instanceof GuardedConsumerRecords)) {
+            throw new ConsumerResourceGuardException(
+                    "guarded consumer returned records without Fetch evidence",
+                    ConsumerResourceGuardFailureReason.RESPONSE_EVIDENCE_MISSING,
+                    resourceGuard());
+        }
+        @SuppressWarnings("unchecked")
+        GuardedConsumerRecords<K, V> result = (GuardedConsumerRecords<K, V>) records;
+        return result;
     }
 
     /**

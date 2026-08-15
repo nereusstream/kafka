@@ -18,6 +18,7 @@ package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerResourceGuard;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.internals.ClusterResourceListeners;
 import org.apache.kafka.common.requests.MetadataRequest;
@@ -27,12 +28,14 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.Optional;
 
 public class ConsumerMetadata extends Metadata {
     private final boolean includeInternalTopics;
     private final boolean allowAutoTopicCreation;
     private final SubscriptionState subscription;
     private final Set<String> transientTopics;
+    private ConsumerResourceGuard guardedResourceGuard;
 
     public ConsumerMetadata(long refreshBackoffMs,
                             long refreshBackoffMaxMs,
@@ -47,6 +50,20 @@ public class ConsumerMetadata extends Metadata {
         this.allowAutoTopicCreation = allowAutoTopicCreation;
         this.subscription = subscription;
         this.transientTopics = new HashSet<>();
+    }
+
+    public synchronized void bindResourceGuard(final ConsumerResourceGuard guard) {
+        ConsumerResourceGuard requested = java.util.Objects.requireNonNull(guard, "guard");
+        if (guardedResourceGuard != null && !guardedResourceGuard.equals(requested)) {
+            throw new IllegalStateException("consumer resource guard cannot be rebound");
+        }
+        guardedResourceGuard = requested;
+        addTransientTopics(Set.of(requested.canonicalTopic()));
+        requestUpdate(false);
+    }
+
+    public synchronized Optional<ConsumerResourceGuard> guardedResourceGuard() {
+        return Optional.ofNullable(guardedResourceGuard);
     }
 
     public ConsumerMetadata(ConsumerConfig config,

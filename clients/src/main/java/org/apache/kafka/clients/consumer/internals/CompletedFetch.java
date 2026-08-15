@@ -17,6 +17,7 @@
 package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.GuardedFetchEvidence;
 import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
@@ -68,6 +69,7 @@ public class CompletedFetch {
     private final Set<Long> abortedProducerIds;
     private final PriorityQueue<FetchResponseData.AbortedTransaction> abortedTransactions;
     private final FetchMetricsAggregator metricAggregator;
+    private final GuardedFetchEvidence guardedFetchEvidence;
 
     private int recordsRead;
     private int bytesRead;
@@ -89,12 +91,25 @@ public class CompletedFetch {
                    FetchResponseData.PartitionData partitionData,
                    FetchMetricsAggregator metricAggregator,
                    Long fetchOffset) {
+        this(log, subscriptions, decompressionBufferSupplier, partition, partitionData, metricAggregator,
+                fetchOffset, null);
+    }
+
+    CompletedFetch(Logger log,
+                   SubscriptionState subscriptions,
+                   BufferSupplier decompressionBufferSupplier,
+                   TopicPartition partition,
+                   FetchResponseData.PartitionData partitionData,
+                   FetchMetricsAggregator metricAggregator,
+                   Long fetchOffset,
+                   GuardedFetchEvidence guardedFetchEvidence) {
         this.log = log;
         this.subscriptions = subscriptions;
         this.decompressionBufferSupplier = decompressionBufferSupplier;
         this.partition = partition;
         this.partitionData = partitionData;
         this.metricAggregator = metricAggregator;
+        this.guardedFetchEvidence = guardedFetchEvidence;
         this.batches = FetchResponse.recordsOrFail(partitionData).batches().iterator();
         this.nextFetchOffset = fetchOffset;
         this.lastEpoch = Optional.empty();
@@ -108,6 +123,10 @@ public class CompletedFetch {
 
     Optional<Integer> lastEpoch() {
         return lastEpoch;
+    }
+
+    GuardedFetchEvidence guardedFetchEvidence() {
+        return guardedFetchEvidence;
     }
 
     boolean isInitialized() {

@@ -17,6 +17,7 @@
 package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerResourceGuard;
 import org.apache.kafka.clients.consumer.internals.metrics.KafkaConsumerMetrics;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.utils.Timer;
@@ -32,6 +33,10 @@ import org.apache.kafka.common.utils.Timer;
  * the {@link Consumer} API contract that should serve as the caller's interface.
  */
 public interface ConsumerDelegate<K, V> extends Consumer<K, V> {
+
+    void bindResourceGuard(ConsumerResourceGuard guard);
+
+    ConsumerResourceGuard resourceGuard();
 
     String clientId();
 

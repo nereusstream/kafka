@@ -201,7 +201,9 @@ public class FetchCollector<K, V> {
                     metricsManager.recordPartitionLead(tp, lead);
                 }
 
-                return Fetch.forPartition(tp, partRecords, positionAdvanced, new OffsetAndMetadata(nextInLineFetch.nextFetchOffset(), nextInLineFetch.lastEpoch(), ""));
+                return Fetch.forPartition(tp, partRecords, positionAdvanced,
+                        new OffsetAndMetadata(nextInLineFetch.nextFetchOffset(), nextInLineFetch.lastEpoch(), ""),
+                        nextInLineFetch.guardedFetchEvidence());
             } else {
                 // these records aren't next in line based on the last consumed position, ignore them
                 // they must be from an obsolete request

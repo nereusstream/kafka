@@ -26,6 +26,9 @@ import org.apache.kafka.clients.MockClient;
 import org.apache.kafka.clients.NetworkClient;
 import org.apache.kafka.clients.NodeApiVersions;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerResourceGuard;
+import org.apache.kafka.clients.consumer.ConsumerResourceGuardException;
+import org.apache.kafka.clients.consumer.ConsumerResourceGuardFailureReason;
 import org.apache.kafka.clients.consumer.OffsetOutOfRangeException;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.IsolationLevel;
@@ -277,6 +280,45 @@ public class FetcherTest {
             assertEquals(offset, record.offset());
             offset += 1;
         }
+    }
+
+    @Test
+    public void testGuardedFetchCarriesV13ResponseEvidence() {
+        buildFetcher();
+
+        assignFromUser(singleton(tp0));
+        String clusterId = metadata.fetch().clusterResource().clusterId();
+        metadata.bindResourceGuard(new ConsumerResourceGuard(clusterId, topicName, topicId, 0));
+        subscriptions.seek(tp0, 0);
+
+        assertEquals(1, sendFetches());
+        client.prepareResponse(fullFetchResponse(tidp0, records, Errors.NONE, 100L, 0));
+        consumerClient.poll(time.timer(0));
+
+        Fetch<byte[], byte[]> fetch = collectFetch();
+        assertEquals(3, fetch.numRecords());
+        assertEquals(1, fetch.guardedFetchEvidence().size());
+        org.apache.kafka.clients.consumer.GuardedFetchEvidence evidence = fetch.guardedFetchEvidence().get(tp0);
+        assertNotNull(evidence);
+        assertEquals(topicId, evidence.expectedTopicId());
+        assertTrue(evidence.requestVersion() >= 13);
+        assertEquals(0L, evidence.fetchOffset());
+        assertEquals(1L, evidence.firstRecordOffset());
+        assertEquals(3L, evidence.lastRecordOffset());
+        assertEquals(100L, evidence.highWatermark());
+    }
+
+    @Test
+    public void testGuardedFetchRejectsTopicIdentityDriftBeforeSend() {
+        buildFetcher();
+
+        assignFromUser(singleton(tp0));
+        String clusterId = metadata.fetch().clusterResource().clusterId();
+        metadata.bindResourceGuard(new ConsumerResourceGuard(clusterId, topicName, Uuid.randomUuid(), 0));
+        subscriptions.seek(tp0, 0);
+
+        ConsumerResourceGuardException failure = assertThrows(ConsumerResourceGuardException.class, this::sendFetches);
+        assertEquals(ConsumerResourceGuardFailureReason.TOPIC_ID_MISMATCH, failure.reason());
     }
 
     @Test
