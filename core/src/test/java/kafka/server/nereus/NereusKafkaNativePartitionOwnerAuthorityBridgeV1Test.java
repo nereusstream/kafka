@@ -49,6 +49,7 @@ import com.nereusstream.storage.object.control.WalRunObjectSession;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Map;
@@ -74,7 +75,7 @@ import static org.mockito.Mockito.when;
 
 class NereusKafkaNativePartitionOwnerAuthorityBridgeV1Test {
     @Test
-    void executesExactlyOnceUnderTheExactCurrentKafkaAuthority() {
+    void executesExactlyOnceUnderTheExactCurrentKafkaAuthority() throws IOException {
         Facts facts = new Facts(5, 9, 10);
         AtomicInteger callbacks = new AtomicInteger();
         WalRunObjectSession expected = mock(WalRunObjectSession.class);
@@ -90,6 +91,25 @@ class NereusKafkaNativePartitionOwnerAuthorityBridgeV1Test {
 
         assertSame(expected, actual);
         assertEquals(1, callbacks.get());
+    }
+
+    @Test
+    void propagatesProviderIoFailureAndReleasesTheOwnerGuard() throws IOException {
+        Facts facts = new Facts(5, 9, 10);
+        IOException expected = new IOException("provider unavailable");
+
+        IOException actual = assertThrows(IOException.class, () ->
+                facts.bridge.executeWhileCurrentOwner(
+                        facts.fence(9, 5),
+                        () -> {
+                            throw expected;
+                        }));
+        assertSame(expected, actual);
+
+        WalRunObjectSession recovered = mock(WalRunObjectSession.class);
+        assertSame(recovered, facts.bridge.executeWhileCurrentOwner(
+                facts.fence(9, 5),
+                () -> recovered));
     }
 
     @Test

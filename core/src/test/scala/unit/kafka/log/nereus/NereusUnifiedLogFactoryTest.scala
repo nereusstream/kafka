@@ -630,25 +630,28 @@ class NereusUnifiedLogFactoryTest {
       verify(storage).publishDurableLogStart(1L)
 
       val rollbackProducerId = 27L
-      val rollbackRecords = MemoryRecords.withIdempotentRecords(
+      def rollbackRecords(): MemoryRecords = MemoryRecords.withIdempotentRecords(
         0,
         Compression.of(CompressionType.NONE).build(),
         rollbackProducerId,
         1.toShort,
         0,
         7,
-        new SimpleRecord(3900, "known-not-committed".getBytes))
+        new SimpleRecord(
+          3900,
+          "rollback-key".getBytes,
+          "known-not-committed".getBytes))
       val beforeFailedAppend = snapshot.get()
       val beforeFailedBytes = stableBytes.get().clone()
       failNextStableAppend.set(true)
       assertThrows(classOf[ThrottlingQuotaExceededException], () =>
-        nereusLog.appendAsLeader(rollbackRecords, 7))
+        nereusLog.appendAsLeader(rollbackRecords(), 7))
       assertEquals(6L, nereusLog.logEndOffset)
       assertEquals(beforeFailedAppend, snapshot.get())
       assertTrue(java.util.Arrays.equals(beforeFailedBytes, stableBytes.get()))
       verify(storage, never()).resign()
 
-      val retryInfo = nereusLog.appendAsLeader(rollbackRecords, 7)
+      val retryInfo = nereusLog.appendAsLeader(rollbackRecords(), 7)
       assertEquals(6L, retryInfo.firstOffset())
       assertEquals(6L, retryInfo.lastOffset())
       assertEquals(7L, nereusLog.logEndOffset)

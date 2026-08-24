@@ -50,6 +50,17 @@ def nereusDevelopmentEnabled = nereusDevelopmentRepository.isPresent() && nereus
 if (nereusDevelopmentRepository.isPresent() != nereusDevelopmentVersion.isPresent()) {
   throw new GradleException('nereusDevelopmentRepository and nereusDevelopmentVersion must be provided together')
 }
+def nereusM3DevelopmentRepository = providers.gradleProperty('nereusM3DevelopmentRepository')
+def nereusM3DevelopmentVersion = providers.gradleProperty('nereusM3DevelopmentVersion')
+def nereusM3DevelopmentEnabled = nereusM3DevelopmentRepository.isPresent() && nereusM3DevelopmentVersion.isPresent()
+if (nereusM3DevelopmentRepository.isPresent() != nereusM3DevelopmentVersion.isPresent()) {
+  throw new GradleException(
+    'nereusM3DevelopmentRepository and nereusM3DevelopmentVersion must be provided together')
+}
+if (nereusDevelopmentEnabled != nereusM3DevelopmentEnabled) {
+  throw new GradleException(
+    'the legacy Nereus product and V2 M3 development inputs must be provided together')
+}
 // Nereus inject end: isolated development artifact inputs
 
 // Nereus V2 K1 inject start: immutable N1 domain input
@@ -186,19 +197,21 @@ allprojects {
 
   repositories {
     // Nereus V2 K1 inject start: the Kafka metadata authority consumes only the exact N1 domain module.
-    exclusiveContent {
-      forRepository {
-        maven {
-          name = 'nereusN1Domain'
-          url = uri(nereusN1Repository)
-          metadataSources {
-            gradleMetadata()
-            mavenPom()
+    if (!nereusM3DevelopmentEnabled) {
+      exclusiveContent {
+        forRepository {
+          maven {
+            name = 'nereusN1Domain'
+            url = uri(nereusN1Repository)
+            metadataSources {
+              gradleMetadata()
+              mavenPom()
+            }
           }
         }
-      }
-      filter {
-        includeModule 'com.nereusstream', 'nereus-domain'
+        filter {
+          includeModule 'com.nereusstream', 'nereus-domain'
+        }
       }
     }
     // Nereus V2 K1 inject end: immutable N1 domain input
@@ -208,11 +221,36 @@ allprojects {
         name = 'nereusDevelopment'
         url = uri(nereusDevelopmentRepository.get())
         content {
-          includeGroup 'com.nereusstream'
+          includeModule 'com.nereusstream', 'nereus-api'
+          includeModule 'com.nereusstream', 'nereus-bookkeeper'
+          includeModule 'com.nereusstream', 'nereus-core'
+          includeModule 'com.nereusstream', 'nereus-kafka-adapter'
+          includeModule 'com.nereusstream', 'nereus-materialization'
+          includeModule 'com.nereusstream', 'nereus-metadata-oxia'
+          includeModule 'com.nereusstream', 'nereus-object-store'
         }
       }
     }
     // Nereus inject end: isolated development repository
+    // Nereus V2 M3 inject start: exact current-source Object-WAL modules.
+    if (nereusM3DevelopmentEnabled) {
+      exclusiveContent {
+        forRepository {
+          maven {
+            name = 'nereusM3Development'
+            url = uri(nereusM3DevelopmentRepository.get())
+          }
+        }
+        filter {
+          includeModule 'com.nereusstream', 'nereus-domain'
+          includeModule 'com.nereusstream', 'nereus-storage-api'
+          includeModule 'com.nereusstream', 'nereus-storage-bookkeeper'
+          includeModule 'com.nereusstream', 'nereus-storage-object'
+          includeModule 'com.nereusstream', 'nereus-kafka-bookkeeper'
+        }
+      }
+    }
+    // Nereus V2 M3 inject end: exact current-source Object-WAL modules.
     mavenCentral()
   }
   // Nereus inject start: always resolve the just-published isolated development bytes
@@ -1219,6 +1257,9 @@ project(':core') {
         changing = true
       }
       implementation("com.nereusstream:nereus-object-store:${nereusDevelopmentVersion.get()}") {
+        changing = true
+      }
+      implementation("com.nereusstream:nereus-kafka-bookkeeper:${nereusM3DevelopmentVersion.get()}") {
         changing = true
       }
     }

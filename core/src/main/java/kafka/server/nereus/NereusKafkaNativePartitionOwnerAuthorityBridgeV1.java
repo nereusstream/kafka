@@ -39,6 +39,7 @@ import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
 import com.nereusstream.kafka.partition.KafkaPartitionLeaderOpenRequest;
 import com.nereusstream.storage.object.control.WalRunObjectSession;
 
+import java.io.IOException;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
@@ -103,7 +104,7 @@ public final class NereusKafkaNativePartitionOwnerAuthorityBridgeV1
     public WalRunObjectSession executeWhileCurrentOwner(
             KafkaPartitionFenceV1 exactCurrentFence,
             SynchronousOwnerCallback callback
-    ) {
+    ) throws IOException {
         Objects.requireNonNull(exactCurrentFence, "exactCurrentFence");
         Objects.requireNonNull(callback, "callback");
         if (!executing.compareAndSet(false, true)) {
@@ -111,23 +112,42 @@ public final class NereusKafkaNativePartitionOwnerAuthorityBridgeV1
         }
         Thread callingThread = Thread.currentThread();
         try {
-            return partitionAuthority.capture(expectedOpen.leaderEpoch(), () -> {
-                if (Thread.currentThread() != callingThread) {
-                    throw new IllegalStateException(
-                            "Kafka partition authority changed thread before native owner callback");
-                }
-                requireCurrent(exactCurrentFence);
-                WalRunObjectSession result = Objects.requireNonNull(
-                        callback.execute(), "Kafka native owner callback result");
-                if (Thread.currentThread() != callingThread) {
-                    throw new IllegalStateException(
-                            "Kafka native owner callback changed thread");
-                }
-                requireCurrent(exactCurrentFence);
-                return result;
-            });
+            try {
+                return partitionAuthority.capture(expectedOpen.leaderEpoch(), () -> {
+                    if (Thread.currentThread() != callingThread) {
+                        throw new IllegalStateException(
+                                "Kafka partition authority changed thread before native owner callback");
+                    }
+                    requireCurrent(exactCurrentFence);
+                    WalRunObjectSession result;
+                    try {
+                        result = Objects.requireNonNull(
+                                callback.execute(), "Kafka native owner callback result");
+                    } catch (IOException failure) {
+                        throw new OwnerCallbackIOException(failure);
+                    }
+                    if (Thread.currentThread() != callingThread) {
+                        throw new IllegalStateException(
+                                "Kafka native owner callback changed thread");
+                    }
+                    requireCurrent(exactCurrentFence);
+                    return result;
+                });
+            } catch (OwnerCallbackIOException failure) {
+                throw failure.ioCause();
+            }
         } finally {
             executing.set(false);
+        }
+    }
+
+    private static final class OwnerCallbackIOException extends RuntimeException {
+        private OwnerCallbackIOException(IOException cause) {
+            super(cause);
+        }
+
+        private IOException ioCause() {
+            return (IOException) getCause();
         }
     }
 
@@ -136,19 +156,36 @@ public final class NereusKafkaNativePartitionOwnerAuthorityBridgeV1
         KafkaPartitionIdentity identity = expectedAuthority.identity();
         TopicPartition topicPartition = new TopicPartition(
                 identity.observedTopicName(), identity.partition());
+        Uuid topicId = requireTopicId(identity);
+
+        requireExactFence(fence, expectedAuthority, topicId);
+        requireProcessAuthority(expectedAuthority);
+        requireMetadataAuthority(expectedAuthority, identity, topicId);
+        requirePartitionAuthority(expectedAuthority, topicPartition, topicId);
+    }
+
+    private static Uuid requireTopicId(KafkaPartitionIdentity identity) {
         Uuid topicId;
         try {
             topicId = Uuid.fromString(identity.topicId());
         } catch (RuntimeException failure) {
             throw fenced("Kafka native Object-WAL owner has an invalid topic ID");
         }
+        return topicId;
+    }
 
-        requireExactFence(fence, expectedAuthority, topicId);
+    private void requireProcessAuthority(KafkaLeaderAuthority expectedAuthority) {
         long processBrokerEpoch = brokerEpochSupplier.getAsLong();
         if (processBrokerEpoch != expectedAuthority.brokerEpoch()) {
             throw fenced("Kafka broker registration epoch superseded the Object-WAL owner");
         }
+    }
 
+    private void requireMetadataAuthority(
+            KafkaLeaderAuthority expectedAuthority,
+            KafkaPartitionIdentity identity,
+            Uuid topicId
+    ) {
         MetadataImage image = metadataCache.currentImage();
         if (image.provenance().lastContainedOffset() < expectedOpen.metadataOffset()) {
             throw fenced("KRaft metadata image regressed behind the Object-WAL owner-open offset");
@@ -169,7 +206,13 @@ public final class NereusKafkaNativePartitionOwnerAuthorityBridgeV1
                 || registration.leaderEpoch != expectedAuthority.leaderEpoch()) {
             throw fenced("KRaft partition registration no longer matches the Object-WAL owner");
         }
+    }
 
+    private void requirePartitionAuthority(
+            KafkaLeaderAuthority expectedAuthority,
+            TopicPartition topicPartition,
+            Uuid topicId
+    ) {
         scala.Option<Partition> current = replicaManager.onlinePartition(topicPartition);
         if (current.isEmpty()
                 || current.get() != expectedPartition

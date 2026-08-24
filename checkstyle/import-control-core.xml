@@ -95,7 +95,12 @@
       <allow pkg="com.nereusstream.api" />
       <allow pkg="com.nereusstream.bookkeeper" />
       <allow pkg="com.nereusstream.core" />
+      <allow pkg="com.nereusstream.domain.bytes" />
+      <allow pkg="com.nereusstream.domain.identity" />
+      <allow pkg="com.nereusstream.domain.protocol" />
       <allow pkg="com.nereusstream.kafka.activation" />
+      <allow pkg="com.nereusstream.kafka.bookkeeper.object.recovery" />
+      <allow pkg="com.nereusstream.kafka.bookkeeper.protocol" />
       <allow pkg="com.nereusstream.kafka.checkpoint" />
       <allow pkg="com.nereusstream.kafka.compaction" />
       <allow pkg="com.nereusstream.kafka.partition" />
@@ -106,6 +111,7 @@
       <allow pkg="com.nereusstream.metadata.oxia" />
       <allow pkg="com.nereusstream.metadata.oxia.records" />
       <allow pkg="com.nereusstream.objectstore" />
+      <allow pkg="com.nereusstream.storage.object.control" />
     </subpackage>
     <!-- Nereus inject end: exact adapter-backed broker runtime -->
   </subpackage>
