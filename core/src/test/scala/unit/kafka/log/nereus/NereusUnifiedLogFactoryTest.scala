@@ -17,7 +17,7 @@
 
 package kafka.log.nereus
 
-import com.nereusstream.api.{AppendAuthority, AppendResult, Checksum, ChecksumType, OffsetRange}
+import com.nereusstream.api.{AppendAuthority, AppendOutcome, AppendResult, Checksum, ChecksumType, ErrorCode, NereusException, OffsetRange}
 import com.nereusstream.kafka.checkpoint.{KafkaCanonicalCheckpointState, KafkaCheckpointSourceState, KafkaVirtualSegmentState}
 import com.nereusstream.kafka.codec.{KafkaAppendBatchEncoder, KafkaFetchAssembly, KafkaRecordBatchCodec}
 import com.nereusstream.kafka.compaction.{
@@ -38,6 +38,7 @@ import kafka.utils.TestUtils
 import org.apache.kafka.common.{DirectoryId, TopicPartition, Uuid}
 import org.apache.kafka.common.compress.Compression
 import org.apache.kafka.common.errors.KafkaStorageException
+import org.apache.kafka.common.errors.ThrottlingQuotaExceededException
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.record.{
   CompressionType,
@@ -62,7 +63,7 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertSame, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
 import org.mockito.ArgumentMatchers.{any, anyLong}
-import org.mockito.Mockito.{mock, verify, when}
+import org.mockito.Mockito.{mock, never, verify, when}
 
 import java.nio.ByteBuffer
 import java.nio.file.Files
@@ -149,6 +150,7 @@ class NereusUnifiedLogFactoryTest {
       val snapshot = new atomic.AtomicReference(KafkaStableSnapshot.nonTransactional(0, 0, 1))
       val stableBytes = new atomic.AtomicReference(Array.emptyByteArray)
       val appendAcks = new atomic.AtomicReference[Short]()
+      val failNextStableAppend = new atomic.AtomicBoolean()
       val corruptNextStableResult = new atomic.AtomicBoolean()
       when(storage.identity()).thenReturn(nereusLog.nereusIdentity())
       when(storage.leaderEpoch()).thenReturn(7)
@@ -183,27 +185,35 @@ class NereusUnifiedLogFactoryTest {
       when(storage.append(any(classOf[ByteBuffer]), any(classOf[KafkaAppendContext]))).thenAnswer(invocation => {
         val records = invocation.getArgument[ByteBuffer](0)
         val context = invocation.getArgument[KafkaAppendContext](1)
-        val encoded = new KafkaAppendBatchEncoder(new KafkaRecordBatchCodec)
-          .encode(records, context.expectedStartOffset())
-        val owned = new Array[Byte](records.remaining())
-        records.duplicate().get(owned)
-        stableBytes.set(stableBytes.get() ++ owned)
-        appendAcks.set(context.requiredAcks())
-        val current = snapshot.get()
-        val next = new KafkaStableSnapshot(
-          current.logStartOffset(),
-          encoded.range().endOffset(),
-          current.highWatermark(),
-          current.lastStableOffset(),
-          current.commitVersion() + 1)
-        snapshot.set(next)
-        val appendResult = mock(classOf[AppendResult])
-        when(appendResult.committedEndOffset()).thenReturn(encoded.range().endOffset())
-        val returnedAcks =
-          if (corruptNextStableResult.compareAndSet(true, false)) (context.requiredAcks() + 1).toShort
-          else context.requiredAcks()
-        CompletableFuture.completedFuture(
-          new KafkaStableAppendResult(appendResult, encoded, next, returnedAcks))
+        if (failNextStableAppend.compareAndSet(true, false)) {
+          CompletableFuture.failedFuture(new NereusException(
+            ErrorCode.BACKPRESSURE_REJECTED,
+            true,
+            "deterministic known-not-committed append failure",
+            AppendOutcome.KNOWN_NOT_COMMITTED))
+        } else {
+          val encoded = new KafkaAppendBatchEncoder(new KafkaRecordBatchCodec)
+            .encode(records, context.expectedStartOffset())
+          val owned = new Array[Byte](records.remaining())
+          records.duplicate().get(owned)
+          stableBytes.set(stableBytes.get() ++ owned)
+          appendAcks.set(context.requiredAcks())
+          val current = snapshot.get()
+          val next = new KafkaStableSnapshot(
+            current.logStartOffset(),
+            encoded.range().endOffset(),
+            current.highWatermark(),
+            current.lastStableOffset(),
+            current.commitVersion() + 1)
+          snapshot.set(next)
+          val appendResult = mock(classOf[AppendResult])
+          when(appendResult.committedEndOffset()).thenReturn(encoded.range().endOffset())
+          val returnedAcks =
+            if (corruptNextStableResult.compareAndSet(true, false)) (context.requiredAcks() + 1).toShort
+            else context.requiredAcks()
+          CompletableFuture.completedFuture(
+            new KafkaStableAppendResult(appendResult, encoded, next, returnedAcks))
+        }
       })
       when(storage.read(any(classOf[KafkaStorageReadRequest]))).thenAnswer(invocation => {
         val request = invocation.getArgument[KafkaStorageReadRequest](0)
@@ -619,6 +629,31 @@ class NereusUnifiedLogFactoryTest {
       assertEquals(1, durableLogStartPublications.get())
       verify(storage).publishDurableLogStart(1L)
 
+      val rollbackProducerId = 27L
+      val rollbackRecords = MemoryRecords.withIdempotentRecords(
+        0,
+        Compression.of(CompressionType.NONE).build(),
+        rollbackProducerId,
+        1.toShort,
+        0,
+        7,
+        new SimpleRecord(3900, "known-not-committed".getBytes))
+      val beforeFailedAppend = snapshot.get()
+      val beforeFailedBytes = stableBytes.get().clone()
+      failNextStableAppend.set(true)
+      assertThrows(classOf[ThrottlingQuotaExceededException], () =>
+        nereusLog.appendAsLeader(rollbackRecords, 7))
+      assertEquals(6L, nereusLog.logEndOffset)
+      assertEquals(beforeFailedAppend, snapshot.get())
+      assertTrue(java.util.Arrays.equals(beforeFailedBytes, stableBytes.get()))
+      verify(storage, never()).resign()
+
+      val retryInfo = nereusLog.appendAsLeader(rollbackRecords, 7)
+      assertEquals(6L, retryInfo.firstOffset())
+      assertEquals(6L, retryInfo.lastOffset())
+      assertEquals(7L, nereusLog.logEndOffset)
+      assertEquals(7L, snapshot.get().stableEndOffset())
+
       corruptNextStableResult.set(true)
       assertThrows(classOf[KafkaStorageException], () =>
         nereusLog.appendAsLeader(
@@ -626,7 +661,7 @@ class NereusUnifiedLogFactoryTest {
             Compression.NONE,
             new SimpleRecord(4000, "key".getBytes, "invalid-stable-result".getBytes)),
           7))
-      assertEquals(6L, nereusLog.logEndOffset)
+      assertEquals(7L, nereusLog.logEndOffset)
       verify(storage).resign()
 
       nereusLog.removeStorage(7, storage)
