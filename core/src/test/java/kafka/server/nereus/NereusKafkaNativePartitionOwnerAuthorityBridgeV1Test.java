@@ -151,6 +151,7 @@ class NereusKafkaNativePartitionOwnerAuthorityBridgeV1Test {
         CountDownLatch callbackEntered = new CountDownLatch(1);
         CountDownLatch releaseCallback = new CountDownLatch(1);
         CountDownLatch takeoverAttempted = new CountDownLatch(1);
+        CountDownLatch takeoverBlocked = new CountDownLatch(1);
         CountDownLatch takeoverFinished = new CountDownLatch(1);
         ExecutorService executor = Executors.newFixedThreadPool(2);
         try {
@@ -166,7 +167,11 @@ class NereusKafkaNativePartitionOwnerAuthorityBridgeV1Test {
 
             Future<?> takeover = executor.submit(() -> {
                 takeoverAttempted.countDown();
-                facts.partitionLock.writeLock().lock();
+                boolean acquired = facts.partitionLock.writeLock().tryLock();
+                if (!acquired) {
+                    takeoverBlocked.countDown();
+                    facts.partitionLock.writeLock().lock();
+                }
                 try {
                     facts.liveLeaderEpoch.set(6);
                 } finally {
@@ -175,7 +180,8 @@ class NereusKafkaNativePartitionOwnerAuthorityBridgeV1Test {
                 }
             });
             assertTrue(takeoverAttempted.await(5, TimeUnit.SECONDS));
-            assertFalse(takeoverFinished.await(100, TimeUnit.MILLISECONDS));
+            assertTrue(takeoverBlocked.await(5, TimeUnit.SECONDS));
+            assertEquals(1, takeoverFinished.getCount());
 
             releaseCallback.countDown();
             ownerOpen.get(5, TimeUnit.SECONDS);
