@@ -16,33 +16,28 @@
  */
 package kafka.log.nereus;
 
-import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.errors.OffsetOutOfRangeException;
 import org.apache.kafka.common.record.FileRecords;
 import org.apache.kafka.common.record.MemoryRecords;
-import org.apache.kafka.common.record.Record;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.requests.ListOffsetsRequest;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.common.RequestLocal;
 import org.apache.kafka.server.storage.log.FetchIsolation;
 import org.apache.kafka.server.util.Scheduler;
-import org.apache.kafka.storage.internals.log.AbortedTxn;
 import org.apache.kafka.storage.internals.log.AppendOrigin;
 import org.apache.kafka.storage.internals.log.AsyncOffsetReader;
 import org.apache.kafka.storage.internals.log.BrokerStorageManagedLog;
-import org.apache.kafka.storage.internals.log.CleanedTransactionMetadata;
 import org.apache.kafka.storage.internals.log.FetchDataInfo;
-import org.apache.kafka.storage.internals.log.LastRecord;
 import org.apache.kafka.storage.internals.log.LogAppendInfo;
 import org.apache.kafka.storage.internals.log.LogConfig;
 import org.apache.kafka.storage.internals.log.LogDirFailureChannel;
 import org.apache.kafka.storage.internals.log.LogOffsetMetadata;
 import org.apache.kafka.storage.internals.log.LogOffsetsListener;
 import org.apache.kafka.storage.internals.log.LogSegments;
-import org.apache.kafka.storage.internals.log.LogStartOffsetIncrementReason;
 import org.apache.kafka.storage.internals.log.OffsetResultHolder;
 import org.apache.kafka.storage.internals.log.PartitionLeaderAuthority;
 import org.apache.kafka.storage.internals.log.ProducerStateManagerConfig;
@@ -50,1480 +45,502 @@ import org.apache.kafka.storage.internals.log.RequiredAcksAwareAppend;
 import org.apache.kafka.storage.internals.log.UnifiedLog;
 import org.apache.kafka.storage.internals.log.VerificationGuard;
 
-import com.nereusstream.api.AppendOutcome;
-import com.nereusstream.api.ErrorCode;
-import com.nereusstream.api.NereusException;
-import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointState;
-import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
-import com.nereusstream.kafka.checkpoint.KafkaDerivedIndexState;
-import com.nereusstream.kafka.checkpoint.KafkaLeaderEpochState;
-import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
-import com.nereusstream.kafka.checkpoint.KafkaVirtualSegmentState;
-import com.nereusstream.kafka.compaction.KafkaCompactionPartitionPass;
-import com.nereusstream.kafka.compaction.KafkaCompactionPassOneCollector;
-import com.nereusstream.kafka.compaction.KafkaCompactionPassOneCollector.AbortedTransactionRange;
-import com.nereusstream.kafka.compaction.KafkaCompactionPassOneCollector.MarkerDecision;
-import com.nereusstream.kafka.compaction.KafkaCompactionPassOneCollector.OpenTransactionRange;
-import com.nereusstream.kafka.compaction.KafkaCompactionPlanner;
-import com.nereusstream.kafka.compaction.KafkaCompactionStrategyV1.MarkerStatus;
-import com.nereusstream.kafka.partition.KafkaAppendContext;
-import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
-import com.nereusstream.kafka.partition.KafkaPartitionState;
-import com.nereusstream.kafka.partition.KafkaPartitionStorage;
-import com.nereusstream.kafka.partition.KafkaStableAppendResult;
-import com.nereusstream.kafka.partition.KafkaStableSnapshot;
-import com.nereusstream.kafka.partition.KafkaStorageReadRequest;
-import com.nereusstream.kafka.partition.KafkaStorageReadResult;
-import com.nereusstream.kafka.retention.KafkaDeleteRecordsCoordinator;
-import com.nereusstream.kafka.retention.KafkaPartitionMaintenance;
-import com.nereusstream.kafka.retention.KafkaTrimBarrier;
-import com.nereusstream.materialization.MaterializationPolicy;
-import com.nereusstream.metadata.oxia.VersionedKafkaPartitionBinding;
+import com.nereusstream.domain.bytes.CanonicalBytes;
+import com.nereusstream.kafka.bookkeeper.adapter.KafkaNativeAssignedRecordBatchV1;
+import com.nereusstream.kafka.bookkeeper.adapter.KafkaRawAssignedRecordBatchFactsV1;
+import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaBatchDuplicateIdentityV1;
+import com.nereusstream.kafka.bookkeeper.pipeline.KafkaOrderedAppendOutcomeV1;
+import com.nereusstream.kafka.bookkeeper.protocol.KafkaReadIsolationV1;
+import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadBatchV1;
+import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadOutcomeV1;
+import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperSequentialReadRequestV1;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-/**
- * Per-partition stock UnifiedLog shell whose durable state is published only after exact Nereus recovery.
- *
- * <p>Stock validation and offset assignment stay in UnifiedLog. The final LocalLog append and read are redirected to
- * the exact recovered Nereus storage; the synthetic local segment remains empty and is never durable truth.
- */
-public final class NereusUnifiedLog extends UnifiedLog
-        implements RequiredAcksAwareAppend, BrokerStorageManagedLog {
-    private final Object nereusGuard = new Object();
-    private final KafkaPartitionIdentity identity;
+/** Native validation and producer state over the one shared BK commit and closed-history recovery path. */
+public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAwareAppend, BrokerStorageManagedLog {
+    private final Object guard = new Object();
+    private final TopicIdPartition identity;
     private final Duration appendTimeout;
     private final Duration fetchTimeout;
     private final int hardMaxFetchBytes;
-    private final NereusProducerStateManager producerStateManager;
-    private final NereusLocalLog nereusLocalLog;
-    private final NereusCanonicalLogState canonicalState;
-    private final Time time;
-    private final ThreadLocal<AppendInvocation> appendInvocation = new ThreadLocal<>();
-
-    private NereusKafkaRecoveredState recoveredState;
-    private KafkaPartitionStorage storage;
-    private long latestConfigMetadataOffset = -1;
+    private final NereusListOffsetsScanConfig timestampScan;
+    private final NereusProducerStateManager producers;
+    private final ThreadLocal<KafkaBookKeeperPartitionV1.AdmittedAppend> admission = new ThreadLocal<>();
+    private KafkaBookKeeperPartitionV1 storage;
+    private int publishedEpoch = -1;
+    private java.util.function.BooleanSupplier currentOwner = () -> false;
+    private long configMetadataOffset = -1;
+    private final ThreadLocal<Boolean> physicallyDispatched = new ThreadLocal<>();
 
     private NereusUnifiedLog(
             Parts parts,
-            org.apache.kafka.storage.log.metrics.BrokerTopicStats brokerTopicStats,
-            int producerIdExpirationCheckIntervalMs,
-            Optional<Uuid> topicId,
-            KafkaPartitionIdentity identity,
+            org.apache.kafka.storage.log.metrics.BrokerTopicStats statistics,
+            int expirationInterval,
+            Uuid topicId,
+            TopicIdPartition identity,
             Duration appendTimeout,
             Duration fetchTimeout,
             int hardMaxFetchBytes,
-            LogOffsetsListener logOffsetsListener
-    ) throws IOException {
+            NereusListOffsetsScanConfig timestampScan,
+            LogOffsetsListener listener)
+            throws IOException {
         super(
-                0L,
-                parts.localLog,
-                brokerTopicStats,
-                producerIdExpirationCheckIntervalMs,
-                parts.leaderEpochCache,
-                parts.producerStateManager,
-                topicId,
+                0,
+                parts.local(),
+                statistics,
+                expirationInterval,
+                parts.epochs(),
+                parts.producers(),
+                Optional.of(topicId),
                 false,
-                logOffsetsListener);
-        this.identity = Objects.requireNonNull(identity, "identity");
-        this.appendTimeout = positive(appendTimeout, "appendTimeout");
-        this.fetchTimeout = positive(fetchTimeout, "fetchTimeout");
-        if (hardMaxFetchBytes <= 0) {
-            throw new IllegalArgumentException("hardMaxFetchBytes must be positive");
-        }
+                listener);
+        this.identity = identity;
+        this.appendTimeout = appendTimeout;
+        this.fetchTimeout = fetchTimeout;
         this.hardMaxFetchBytes = hardMaxFetchBytes;
-        this.producerStateManager = parts.producerStateManager;
-        this.nereusLocalLog = parts.localLog;
-        this.canonicalState = parts.canonicalState;
-        this.time = parts.localLog.time();
-        parts.localLog.bindStableAppend(this::appendStable);
+        this.timestampScan = java.util.Objects.requireNonNull(timestampScan, "timestampScan");
+        producers = parts.producers();
+        parts.local().bindStableAppend(this::appendStable);
     }
 
     public static NereusUnifiedLog create(
             File dir,
             LogConfig config,
             Scheduler scheduler,
-            org.apache.kafka.storage.log.metrics.BrokerTopicStats brokerTopicStats,
+            org.apache.kafka.storage.log.metrics.BrokerTopicStats statistics,
             Time time,
-            int maxTransactionTimeoutMs,
-            ProducerStateManagerConfig producerStateManagerConfig,
-            int producerIdExpirationCheckIntervalMs,
-            LogDirFailureChannel logDirFailureChannel,
+            int maximumTransactionTimeout,
+            ProducerStateManagerConfig producerConfig,
+            int expirationInterval,
+            LogDirFailureChannel failures,
             Uuid topicId,
-            KafkaPartitionIdentity identity,
+            TopicIdPartition identity,
             Duration appendTimeout,
             Duration fetchTimeout,
             int hardMaxFetchBytes,
-            LogOffsetsListener logOffsetsListener
-    ) throws IOException {
-        Objects.requireNonNull(topicId, "topicId");
-        Objects.requireNonNull(identity, "identity");
-        if (Uuid.ZERO_UUID.equals(topicId)
-                || !topicId.toString().equals(identity.topicId())) {
-            throw invariant("Nereus log requires one exact non-zero topic ID");
+            NereusListOffsetsScanConfig timestampScan,
+            LogOffsetsListener listener)
+            throws IOException {
+        if (topicId.equals(Uuid.ZERO_UUID) || !identity.topicId().equals(topicId)) {
+            throw new IllegalArgumentException("shared BK log requires the exact nonzero native topic ID");
+        }
+        if (appendTimeout.isNegative()
+                || appendTimeout.isZero()
+                || fetchTimeout.isNegative()
+                || fetchTimeout.isZero()
+                || hardMaxFetchBytes <= 0) {
+            throw new IllegalArgumentException("shared BK log bounds must be positive");
         }
         return new NereusUnifiedLog(
-                createParts(
-                        dir,
-                        config,
-                        scheduler,
-                        time,
-                        maxTransactionTimeoutMs,
-                        producerStateManagerConfig,
-                        logDirFailureChannel,
-                        identity),
-                brokerTopicStats,
-                producerIdExpirationCheckIntervalMs,
-                Optional.of(topicId),
+                parts(dir, config, scheduler, time, maximumTransactionTimeout, producerConfig, failures),
+                statistics,
+                expirationInterval,
+                topicId,
                 identity,
                 appendTimeout,
                 fetchTimeout,
                 hardMaxFetchBytes,
-                logOffsetsListener);
+                timestampScan,
+                listener);
     }
 
-    public void installRecoveredState(
-            int leaderEpoch,
-            NereusKafkaRecoveredState state
-    ) throws IOException {
-        Objects.requireNonNull(state, "state");
-        synchronized (nereusGuard) {
-            requireExactState(leaderEpoch, state);
-            if (storage != null) {
-                throw invariant("Cannot replace recovered state while Nereus storage is published");
+    /** Called under the current lifecycle slot guard after asynchronous checkpoint and tail recovery, before request readiness. */
+    public NereusKafkaRecoveredState installRecoveredState(
+            int epoch, KafkaBookKeeperPartitionV1 candidate, java.util.function.BooleanSupplier currentOwner)
+            throws IOException {
+        synchronized (guard) {
+            if (storage != null) throw new KafkaStorageException("shared BK log already has a published owner");
+            var snapshot = candidate.capture();
+            if (snapshot.root().fence().kafkaLeaderEpoch() != epoch
+                    || snapshot.root().frontiers().trimStartOffset() != 0) {
+                throw new KafkaStorageException(
+                        "shared BK recovered partition has a foreign epoch or unsupported prefix");
             }
-            if (recoveredState != null && recoveredState != state) {
-                throw fenced("A different Nereus recovered state is already installed");
+            long end = snapshot.root().frontiers().durableEndOffset();
+            super.truncateFullyAndStartAt(end, Optional.of(0L));
+            producers.loadSharedState(snapshot);
+            if (producers.mapEndOffset() != end) {
+                throw new KafkaStorageException("native producer replay does not cover the shared BK prefix");
             }
-            if (recoveredState == null) {
-                super.truncateFullyAndStartAt(
-                        state.stableEndOffset(),
-                        Optional.of(state.logStartOffset()));
-                producerStateManager.restoreCanonical(
-                        state.producerTransactionState());
-                state.leaderEpochRanges().forEach(range ->
-                        super.assignEpochStartOffset(
-                                range.leaderEpoch(),
-                                range.startOffset()));
-                super.updateHighWatermark(state.stableEndOffset());
-                canonicalState.restore(
-                        state.logStartOffset(),
-                        state.stableEndOffset(),
-                        state.checkpointState(),
-                        state.committedTail(),
-                        config(),
-                        Math.max(0, latestConfigMetadataOffset),
-                        time.milliseconds());
-                nereusLocalLog.installCanonicalSegments(
-                        canonicalState.segmentBaseOffsets(state.stableEndOffset()));
-                recoveredState = state;
+            snapshot.leaderEpochIndex().startOffsets().forEach(super::assignEpochStartOffset);
+            super.assignEpochStartOffset(epoch, end);
+            super.updateHighWatermark(end);
+            if (lastStableOffset() != snapshot.root().frontiers().lastStableOffset()) {
+                throw new KafkaStorageException("native transaction replay differs from the shared BK LSO");
             }
-        }
-    }
-
-    public NereusProducerStateManager prepareProducerRecovery(
-            int leaderEpoch,
-            long logStartOffset
-    ) {
-        synchronized (nereusGuard) {
-            if (leaderEpoch < 0 || logStartOffset < 0) {
-                throw new IllegalArgumentException(
-                        "Kafka recovery bounds must be non-negative");
-            }
-            if (storage != null || recoveredState != null) {
-                throw fenced(
-                        "Kafka producer recovery cannot replace published state");
-            }
-            return producerStateManager;
-        }
-    }
-
-    public void installStorage(
-            int leaderEpoch,
-            KafkaPartitionStorage candidate
-    ) {
-        Objects.requireNonNull(candidate, "candidate");
-        synchronized (nereusGuard) {
-            if (recoveredState == null) {
-                throw invariant("Nereus storage cannot publish before recovered Kafka state");
-            }
-            requireExactState(leaderEpoch, recoveredState);
-            KafkaStableSnapshot published = candidate.publishDerivedOffsets(
-                    recoveredState.stableEndOffset(),
-                    recoveredState.stableEndOffset(),
-                    recoveredState.lastStableOffset());
-            KafkaStableSnapshot snapshot = candidate.stableSnapshot();
-            if (!snapshot.equals(published)
-                    || !matchesStorage(candidate, leaderEpoch, snapshot)) {
-                throw invariant("Nereus storage snapshot does not match recovered Kafka state");
-            }
-            if (storage != null && storage != candidate) {
-                throw fenced("A different Nereus storage instance is already published");
-            }
+            var state = new NereusKafkaRecoveredState(identity.topicPartition(), identity.topicId(), epoch, snapshot);
+            this.currentOwner = currentOwner;
             storage = candidate;
+            publishedEpoch = epoch;
+            return state;
         }
     }
 
-    public void removeStorage(
-            int leaderEpoch,
-            KafkaPartitionStorage expected
-    ) {
-        synchronized (nereusGuard) {
-            if (recoveredState == null || recoveredState.leaderEpoch() != leaderEpoch) {
-                return;
-            }
-            if (expected == null || storage == expected) {
+    public void removeStorage(int epoch, KafkaBookKeeperPartitionV1 expected) {
+        synchronized (guard) {
+            if (publishedEpoch == epoch && (expected == null || storage == expected)) {
                 storage = null;
-                recoveredState = null;
+                publishedEpoch = -1;
             }
         }
     }
 
-    public boolean nereusWritable(int leaderEpoch) {
-        synchronized (nereusGuard) {
-            return storage != null
-                    && recoveredState != null
-                    && recoveredState.leaderEpoch() == leaderEpoch
-                    && storage.state() == KafkaPartitionState.LEADER_WRITABLE;
+    public boolean nereusWritable(int epoch) {
+        synchronized (guard) {
+            return storage != null && publishedEpoch == epoch;
         }
     }
 
-    public KafkaPartitionIdentity nereusIdentity() {
+    public TopicIdPartition nereusIdentity() {
         return identity;
     }
 
     @Override
-    public LogConfig updateConfig(LogConfig newConfig) {
-        synchronized (nereusGuard) {
-            if (recoveredState == null
-                    || canonicalState.matchesCurrentConfig(newConfig)) {
-                return super.updateConfig(newConfig);
-            }
-            long metadataOffset = canonicalState.nextSyntheticMetadataOffset();
-            return updateConfigLocked(newConfig, metadataOffset);
-        }
-    }
-
-    @Override
-    public LogConfig updateConfigAtMetadataOffset(
-            LogConfig newConfig,
-            long metadataOffset
-    ) {
-        if (metadataOffset < 0) {
-            throw new IllegalArgumentException(
-                    "Kafka config metadata offset must be non-negative");
-        }
-        synchronized (nereusGuard) {
-            if (latestConfigMetadataOffset >= 0
-                    && metadataOffset < latestConfigMetadataOffset) {
-                throw invariant("Kafka config metadata offset regressed");
-            }
-            return updateConfigLocked(newConfig, metadataOffset);
-        }
-    }
-
-    private LogConfig updateConfigLocked(
-            LogConfig newConfig,
-            long metadataOffset
-    ) {
-        Objects.requireNonNull(newConfig, "newConfig");
-        if (recoveredState != null) {
-            canonicalState.updateConfig(newConfig, metadataOffset);
-        }
-        latestConfigMetadataOffset = metadataOffset;
-        return super.updateConfig(newConfig);
-    }
-
-    @Override
     public LogAppendInfo appendAsLeader(
             MemoryRecords records,
-            int leaderEpoch,
+            int epoch,
             AppendOrigin origin,
             RequestLocal requestLocal,
             VerificationGuard verificationGuard,
-            short transactionVersion
-    ) {
-        return appendAsLeader(
-                records,
-                leaderEpoch,
-                origin,
-                requestLocal,
-                verificationGuard,
-                transactionVersion,
-                (short) 1);
+            short transactionVersion) {
+        return appendAsLeader(records, epoch, origin, requestLocal, verificationGuard, transactionVersion, (short) 1);
     }
 
     @Override
     public LogAppendInfo appendAsLeader(
             MemoryRecords records,
-            int leaderEpoch,
+            int epoch,
             AppendOrigin origin,
             RequestLocal requestLocal,
             VerificationGuard verificationGuard,
             short transactionVersion,
-            short requiredAcks
-    ) {
-        if (origin != AppendOrigin.CLIENT
-                && origin != AppendOrigin.COORDINATOR) {
-            throw NereusKafkaExceptionMapper.map(unsupported(
-                    "Nereus append accepts only client or coordinator records"));
+            short requiredAcks) {
+        if (origin != AppendOrigin.CLIENT && origin != AppendOrigin.COORDINATOR) {
+            throw new KafkaStorageException("shared BK accepts only native client/coordinator appends");
         }
-        if (requiredAcks != 0 && requiredAcks != 1 && requiredAcks != -1) {
-            throw new IllegalArgumentException("Kafka requiredAcks must be 0, 1, or -1");
-        }
-        if (appendInvocation.get() != null) {
-            throw new IllegalStateException("Nested Nereus append invocation is not supported");
-        }
-        AppendInvocation invocation = new AppendInvocation(leaderEpoch, requiredAcks);
-        appendInvocation.set(invocation);
-        try {
-            synchronized (nereusGuard) {
-                requirePublished(leaderEpoch);
+        if (requiredAcks != 0 && requiredAcks != 1 && requiredAcks != -1)
+            throw new IllegalArgumentException("invalid acks");
+        synchronized (guard) {
+            var exact = requireStorage(epoch);
+            var lengths = new ArrayList<Integer>();
+            boolean duplicate = true;
+            for (var batch : records.batches()) {
+                batch.ensureValid();
+                if (batch.magic() != RecordBatch.MAGIC_VALUE_V2) {
+                    throw new org.apache.kafka.common.errors.UnsupportedForMessageFormatException(
+                            "shared BK requires magic-v2");
+                }
+                lengths.add(config().maxMessageSize());
+                duplicate &= batch.hasProducerId()
+                        && !batch.isControlBatch()
+                        && producers.activeProducers().containsKey(batch.producerId())
+                        && exact.capture()
+                                .committedProducerState()
+                                .findDuplicate(new KafkaBatchDuplicateIdentityV1(
+                                        batch.producerId(),
+                                        batch.producerEpoch(),
+                                        batch.baseSequence(),
+                                        batch.lastSequence()))
+                                .isPresent();
+            }
+            if (lengths.isEmpty())
+                return super.appendAsLeader(
+                        records, epoch, origin, requestLocal, verificationGuard, transactionVersion);
+            if (admission.get() != null) throw new IllegalStateException("nested shared BK append");
+            try (var reserved = duplicate ? null : exact.admit(lengths)) {
+                if (reserved != null) admission.set(reserved);
                 LogAppendInfo result = super.appendAsLeader(
-                        records,
-                        leaderEpoch,
-                        origin,
-                        requestLocal,
-                        verificationGuard,
-                        transactionVersion);
-                if (invocation.committedStorage != null) {
-                    long stableEndOffset = Math.addExact(result.lastOffset(), 1);
-                    observeCommittedAppend(invocation);
-                    advanceHighWatermarkToStableEnd(stableEndOffset);
-                    KafkaStableSnapshot published =
-                            invocation.committedStorage.publishDerivedOffsets(
-                                    stableEndOffset,
-                                    highWatermark(),
-                                    lastStableOffset());
-                    if (published.stableEndOffset()
-                            != stableEndOffset) {
-                        throw invariant(
-                                "Nereus derived offset publication returned a mismatched end");
+                        records, epoch, origin, requestLocal, verificationGuard, transactionVersion);
+                if (reserved != null) {
+                    var published = exact.capture();
+                    long end = published.root().frontiers().durableEndOffset();
+                    super.updateHighWatermark(end);
+                    if (end != logEndOffset()
+                            || lastStableOffset()
+                                    != published.root().frontiers().lastStableOffset()) {
+                        throw new KafkaStorageException("native append differs from coherent BK publication");
                     }
                 }
                 return result;
-            }
-        } catch (RuntimeException | Error failure) {
-            if (invocation.committedStorage != null) {
-                fenceUnknownAppend(invocation.committedStorage);
-            }
-            throw failure;
-        } finally {
-            appendInvocation.remove();
-        }
-    }
-
-    private void advanceHighWatermarkToStableEnd(long stableEndOffset) {
-        try {
-            long updatedHighWatermark = super.updateHighWatermark(stableEndOffset);
-            if (updatedHighWatermark != stableEndOffset) {
-                throw invariant(
-                        "Nereus stable append did not advance the Kafka high watermark");
-            }
-        } catch (IOException failure) {
-            throw new KafkaStorageException(
-                    "Failed to publish the Nereus stable append as Kafka high watermark",
-                    failure);
-        }
-    }
-
-    @Override
-    public LogAppendInfo appendAsFollower(MemoryRecords records, int leaderEpoch) {
-        throw new KafkaStorageException(
-                "Nereus authoritative storage does not accept Kafka follower appends");
-    }
-
-    /**
-     * Executes the product-owned checkpoint-before-trim flow outside the Kafka partition lock.
-     *
-     * <p>The supplied publisher reacquires the exact partition lock before exposing the durable
-     * log start and waking delayed Fetch/DeleteRecords operations.
-     */
-    @Override
-    public long deleteRecords(
-            int leaderEpoch,
-            long normalizedOffset,
-            PartitionLeaderAuthority authority
-    ) {
-        if (leaderEpoch < 0 || normalizedOffset < 0) {
-            throw new IllegalArgumentException(
-                    "Kafka DeleteRecords leader epoch and normalized offset must be non-negative");
-        }
-        Objects.requireNonNull(authority, "authority");
-        KafkaPartitionStorage exactStorage;
-        KafkaPartitionMaintenance maintenance;
-        synchronized (nereusGuard) {
-            requirePublished(leaderEpoch);
-            exactStorage = storage;
-            maintenance = exactStorage.maintenance().orElseThrow(() ->
-                    new KafkaStorageException(
-                            "Nereus partition maintenance is not configured"));
-        }
-        KafkaPartitionMaintenance.Hooks hooks =
-                maintenanceHooks(exactStorage, leaderEpoch, authority);
-        CompletableFuture<KafkaDeleteRecordsCoordinator.Result> deletion;
-        try {
-            deletion = Objects.requireNonNull(
-                    maintenance.deleteRecords(hooks, normalizedOffset),
-                    "Nereus DeleteRecords future");
-        } catch (Throwable failure) {
-            throw NereusKafkaExceptionMapper.map(failure);
-        }
-        KafkaDeleteRecordsCoordinator.Result result;
-        try {
-            result = deletion.get(appendTimeout.toMillis(), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException failure) {
-            Thread.currentThread().interrupt();
-            throw NereusKafkaExceptionMapper.map(new NereusException(
-                    ErrorCode.CANCELLED,
-                    true,
-                    "Nereus DeleteRecords wait was interrupted",
-                    failure));
-        } catch (TimeoutException failure) {
-            throw NereusKafkaExceptionMapper.map(new NereusException(
-                    ErrorCode.TIMEOUT,
-                    true,
-                    "Nereus DeleteRecords did not finish before the configured timeout",
-                    failure));
-        } catch (ExecutionException failure) {
-            throw NereusKafkaExceptionMapper.map(failure);
-        }
-        synchronized (nereusGuard) {
-            requireSamePublishedStorage(exactStorage);
-            if (result.requestedOffset() != normalizedOffset
-                    || result.durableLowWatermark() < normalizedOffset
-                    || result.durableLowWatermark()
-                            != exactStorage.stableSnapshot().logStartOffset()) {
-                throw invariant(
-                        "Nereus DeleteRecords result does not match durable partition state");
-            }
-        }
-        return result.durableLowWatermark();
-    }
-
-    /** Creates authority-fenced hooks for the product-owned periodic retention runtime. */
-    public KafkaPartitionMaintenance.Hooks maintenanceHooks(
-            int leaderEpoch,
-            PartitionLeaderAuthority authority
-    ) {
-        Objects.requireNonNull(authority, "authority");
-        KafkaPartitionStorage exactStorage;
-        synchronized (nereusGuard) {
-            requirePublished(leaderEpoch);
-            exactStorage = storage;
-            if (exactStorage.maintenance().isEmpty()) {
-                throw new KafkaStorageException(
-                        "Nereus partition maintenance is not configured");
-            }
-        }
-        return maintenanceHooks(exactStorage, leaderEpoch, authority);
-    }
-
-    /**
-     * Creates one product capture provider backed by the exact stock transaction-cleaner oracle.
-     *
-     * <p>The initial canonical state and the active-producer snapshot are taken under the current
-     * Partition lock. The selected decision horizon is then read from Nereus outside that lock,
-     * and the same producer snapshot is revalidated before the capture is returned.
-     */
-    public KafkaCompactionPartitionPass.CaptureProvider compactionCaptureProvider(
-            int leaderEpoch,
-            PartitionLeaderAuthority authority,
-            CompactionConfiguration configuration
-    ) {
-        Objects.requireNonNull(authority, "authority");
-        CompactionConfiguration exactConfiguration =
-                Objects.requireNonNull(configuration, "configuration");
-        KafkaPartitionStorage exactStorage;
-        KafkaPartitionMaintenance maintenance;
-        synchronized (nereusGuard) {
-            requirePublished(leaderEpoch);
-            exactStorage = storage;
-            maintenance = exactStorage.maintenance().orElseThrow(() ->
-                    new KafkaStorageException(
-                            "Nereus partition maintenance is not configured"));
-        }
-        KafkaPartitionMaintenance.CompactionHooks hooks =
-                compactionHooks(
-                        exactStorage,
-                        leaderEpoch,
-                        authority,
-                        exactConfiguration);
-        return partition -> {
-            if (!partition.equals(identity.durableId())) {
-                return CompletableFuture.failedFuture(
-                        invariant("Kafka compaction requested another partition identity"));
-            }
-            return maintenance.captureCompaction(hooks);
-        };
-    }
-
-    public void publishDurableLogStart(
-            KafkaPartitionStorage expectedStorage,
-            int expectedLeaderEpoch,
-            long durableOffset
-    ) {
-        Objects.requireNonNull(expectedStorage, "expectedStorage");
-        synchronized (nereusGuard) {
-            if (storage != expectedStorage
-                    || recoveredState == null
-                    || recoveredState.leaderEpoch() != expectedLeaderEpoch
-                    || expectedStorage.state() != KafkaPartitionState.LEADER_WRITABLE) {
-                throw fenced(
-                        "Nereus DeleteRecords completion belongs to a stale leader");
-            }
-            KafkaStableSnapshot durableSnapshot =
-                    expectedStorage.publishDurableLogStart(durableOffset);
-            if (durableSnapshot.logStartOffset() != durableOffset) {
-                throw invariant(
-                        "Nereus durable trim did not publish the exact partition log start");
-            }
-            canonicalState.advanceLogStart(durableOffset);
-            try {
-                nereusLocalLog.installCanonicalSegments(
-                        canonicalState.segmentBaseOffsets(
-                                expectedStorage.stableSnapshot().stableEndOffset()));
             } catch (IOException failure) {
-                fenceUnknownAppend(expectedStorage);
-                throw new KafkaStorageException(
-                        "Failed to rebuild Nereus virtual segment shells after durable trim",
-                        failure);
+                exact.fence();
+                throw new KafkaStorageException("shared BK native frontier publication failed", failure);
+            } catch (RuntimeException | Error failure) {
+                // Native validation before any stable append leaves the old published prefix intact. A physical
+                // failure fences inside the pipeline; an uncertain wait must also prevent further native allocation.
+                if (Boolean.TRUE.equals(physicallyDispatched.get())) exact.fence();
+                throw failure;
+            } finally {
+                admission.remove();
+                physicallyDispatched.remove();
             }
-            super.maybeIncrementLogStartOffset(
-                    durableOffset,
-                    LogStartOffsetIncrementReason.ClientRecordDeletion);
-        }
-    }
-
-    private KafkaPartitionMaintenance.Hooks maintenanceHooks(
-            KafkaPartitionStorage exactStorage,
-            int leaderEpoch,
-            PartitionLeaderAuthority authority
-    ) {
-        return new KafkaPartitionMaintenance.Hooks() {
-            @Override
-            public CompletableFuture<KafkaPartitionMaintenance.Capture> capture(
-                KafkaCheckpointSourceState currentSource
-            ) {
-                try {
-                    KafkaPartitionMaintenance.Capture captured =
-                            authority.capture(
-                                    leaderEpoch,
-                                    () -> {
-                                        synchronized (nereusGuard) {
-                                            requireSamePublishedStorage(exactStorage);
-                                            KafkaStableSnapshot snapshot =
-                                                    exactStorage.stableSnapshot();
-                                            return new KafkaPartitionMaintenance.Capture(
-                                                    canonicalCheckpoint(
-                                                            currentSource, snapshot),
-                                                    snapshot.highWatermark(),
-                                                    snapshot.lastStableOffset());
-                                        }
-                                    });
-                    return CompletableFuture.completedFuture(captured);
-                } catch (Throwable failure) {
-                    return CompletableFuture.failedFuture(failure);
-                }
-            }
-
-            @Override
-            public CompletableFuture<Void> advanceLogStart(
-                    KafkaTrimBarrier.Snapshot revalidated,
-                    long durableTrimOffset,
-                    VersionedKafkaPartitionBinding publishedBinding
-            ) {
-                try {
-                    if (!revalidated.identity().equals(identity)
-                            || publishedBinding.value().observedLeaderEpoch() != leaderEpoch) {
-                        throw fenced(
-                                "Nereus durable trim completion changed partition authority");
-                    }
-                    authority.publish(
-                            leaderEpoch,
-                            () -> publishDurableLogStart(
-                                    exactStorage,
-                                    leaderEpoch,
-                                    durableTrimOffset));
-                    return CompletableFuture.completedFuture(null);
-                } catch (Throwable failure) {
-                    return CompletableFuture.failedFuture(failure);
-                }
-            }
-        };
-    }
-
-    private KafkaPartitionMaintenance.CompactionHooks compactionHooks(
-            KafkaPartitionStorage exactStorage,
-            int leaderEpoch,
-            PartitionLeaderAuthority authority,
-            CompactionConfiguration configuration
-    ) {
-        return new KafkaPartitionMaintenance.CompactionHooks() {
-            @Override
-            public CompletableFuture<KafkaPartitionMaintenance.CompactionState> capture(
-                    KafkaCheckpointSourceState currentSource
-            ) {
-                try {
-                    KafkaPartitionMaintenance.CompactionState captured =
-                            authority.capture(
-                                    leaderEpoch,
-                                    () -> {
-                                        synchronized (nereusGuard) {
-                                            requireSamePublishedStorage(exactStorage);
-                                            KafkaStableSnapshot snapshot =
-                                                    exactStorage.stableSnapshot();
-                                            return new KafkaPartitionMaintenance.CompactionState(
-                                                    canonicalCheckpoint(
-                                                            currentSource, snapshot),
-                                                    snapshot.highWatermark(),
-                                                    snapshot.lastStableOffset(),
-                                                    configuration.outputPolicy(),
-                                                    configuration.writeSettings());
-                                        }
-                                    });
-                    return CompletableFuture.completedFuture(captured);
-                } catch (Throwable failure) {
-                    return CompletableFuture.failedFuture(failure);
-                }
-            }
-
-            @Override
-            public CompletableFuture<KafkaCompactionPartitionPass.PassOneInputs> capturePassOne(
-                    KafkaCheckpointSourceState currentSource,
-                    KafkaCompactionPlanner.Candidate candidate,
-                    KafkaPartitionMaintenance.CompactionState state
-            ) {
-                try {
-                    return CompletableFuture.completedFuture(
-                            scanCompactionPassOne(
-                                    exactStorage,
-                                    leaderEpoch,
-                                    authority,
-                                    currentSource,
-                                    candidate,
-                                    state,
-                                    configuration));
-                } catch (Throwable failure) {
-                    return CompletableFuture.failedFuture(failure);
-                }
-            }
-        };
-    }
-
-    private KafkaCompactionPartitionPass.PassOneInputs scanCompactionPassOne(
-            KafkaPartitionStorage exactStorage,
-            int leaderEpoch,
-            PartitionLeaderAuthority authority,
-            KafkaCheckpointSourceState currentSource,
-            KafkaCompactionPlanner.Candidate candidate,
-            KafkaPartitionMaintenance.CompactionState state,
-            CompactionConfiguration configuration
-    ) {
-        if (candidate.shouldCompact()
-                && candidate.decisionHorizon().recordCount()
-                > configuration.maxDecodedRecords()) {
-            throw invariant(
-                    "Kafka compaction decision horizon exceeds the decoded-record limit");
-        }
-        CompactionTransactionState before =
-                captureCompactionTransactions(
-                        exactStorage,
-                        leaderEpoch,
-                        authority,
-                        currentSource,
-                        state);
-        List<MarkerDecision> markers =
-                candidate.shouldCompact()
-                        ? scanMarkerDecisions(candidate, before)
-                        : List.of();
-        CompactionTransactionState after =
-                captureCompactionTransactions(
-                        exactStorage,
-                        leaderEpoch,
-                        authority,
-                        currentSource,
-                        state);
-        if (!after.equals(before)) {
-            throw fenced(
-                    "Kafka producer/transaction state changed during compaction pre-scan");
-        }
-        KafkaProducerTransactionState producerState = before.producerState();
-        List<AbortedTransactionRange> aborted =
-                producerState.abortedTransactions().stream()
-                        .filter(transaction ->
-                                transaction.lastOffset()
-                                        >= candidate.decisionHorizon().startOffset()
-                                && transaction.firstOffset()
-                                        < candidate.decisionHorizon().endOffset())
-                        .map(transaction ->
-                                new AbortedTransactionRange(
-                                        transaction.producerId(),
-                                        transaction.firstOffset(),
-                                        transaction.lastOffset()))
-                        .toList();
-        List<OpenTransactionRange> open =
-                producerState.openTransactions().stream()
-                        .filter(transaction ->
-                                transaction.firstOffset()
-                                        < candidate.decisionHorizon().endOffset())
-                        .map(transaction ->
-                                new OpenTransactionRange(
-                                        transaction.producerId(),
-                                        transaction.firstOffset()))
-                        .toList();
-        if (aborted.size() > KafkaCompactionPassOneCollector.MAX_TRANSACTION_FACTS
-                || open.size() > KafkaCompactionPassOneCollector.MAX_TRANSACTION_FACTS) {
-            throw invariant(
-                    "Kafka compaction transaction facts exceed the pass-one limit");
-        }
-        return new KafkaCompactionPartitionPass.PassOneInputs(
-                currentSource.endOffset(),
-                configuration.maxDecodedRecords(),
-                configuration.maxKeyBytes(),
-                configuration.maxInMemoryKeyBytes(),
-                aborted,
-                open,
-                markers);
-    }
-
-    private CompactionTransactionState captureCompactionTransactions(
-            KafkaPartitionStorage exactStorage,
-            int leaderEpoch,
-            PartitionLeaderAuthority authority,
-            KafkaCheckpointSourceState source,
-            KafkaPartitionMaintenance.CompactionState state
-    ) {
-        return authority.capture(
-                leaderEpoch,
-                () -> {
-                    synchronized (nereusGuard) {
-                        requireSamePublishedStorage(exactStorage);
-                        KafkaStableSnapshot current = exactStorage.stableSnapshot();
-                        KafkaProducerTransactionState producerState =
-                                producerStateManager.exportCanonical(source.endOffset());
-                        if (current.logStartOffset() != source.trimOffset()
-                                || current.stableEndOffset() != source.endOffset()
-                                || !producerState.equals(
-                                        state.canonicalState().producerTransactionState())) {
-                            throw fenced(
-                                    "Kafka compaction transaction capture changed stable source");
-                        }
-                        return new CompactionTransactionState(
-                                producerState,
-                                Map.copyOf(lastRecordsOfActiveProducers()));
-                    }
-                });
-    }
-
-    private List<MarkerDecision> scanMarkerDecisions(
-            KafkaCompactionPlanner.Candidate candidate,
-            CompactionTransactionState transactionState
-    ) {
-        CleanedTransactionMetadata cleaned = new CleanedTransactionMetadata();
-        cleaned.addAbortedTransactions(
-                transactionState.producerState().abortedTransactions().stream()
-                        .map(transaction ->
-                                new AbortedTxn(
-                                        transaction.producerId(),
-                                        transaction.firstOffset(),
-                                        transaction.lastOffset(),
-                                        transaction.lastStableOffset()))
-                        .toList());
-        long nextOffset = candidate.decisionHorizon().startOffset();
-        long endOffset = candidate.decisionHorizon().endOffset();
-        ArrayList<MarkerDecision> markers = new ArrayList<>();
-        while (nextOffset < endOffset) {
-            FetchDataInfo page =
-                    read(
-                            nextOffset,
-                            hardMaxFetchBytes,
-                            FetchIsolation.LOG_END,
-                            true);
-            long pageStart = nextOffset;
-            for (RecordBatch batch : page.records.batches()) {
-                if (batch.baseOffset() >= endOffset) {
-                    break;
-                }
-                if (batch.baseOffset() != nextOffset
-                        || batch.nextOffset() > endOffset) {
-                    throw invariant(
-                            "Kafka compaction transaction pre-scan is not dense");
-                }
-                if (batch.isControlBatch()) {
-                    if (markers.size()
-                            >= KafkaCompactionPassOneCollector.MAX_TRANSACTION_FACTS) {
-                        throw invariant(
-                                "Kafka compaction marker facts exceed the pass-one limit");
-                    }
-                    boolean discardable = cleaned.onControlBatchRead(batch);
-                    boolean activeLastMarker =
-                            isActiveLastMarker(
-                                    batch,
-                                    transactionState.activeProducerLastRecords());
-                    markers.add(
-                            new MarkerDecision(
-                                    batch.lastOffset(),
-                                    discardable && !activeLastMarker
-                                            ? MarkerStatus.DELETE_ELIGIBLE
-                                            : MarkerStatus.RETAIN_REQUIRED));
-                } else {
-                    cleaned.onBatchRead(batch);
-                }
-                nextOffset = batch.nextOffset();
-            }
-            if (nextOffset == pageStart) {
-                throw invariant(
-                        "Kafka compaction transaction pre-scan made no progress");
-            }
-        }
-        return List.copyOf(markers);
-    }
-
-    private static boolean isActiveLastMarker(
-            RecordBatch batch,
-            Map<Long, LastRecord> activeProducerLastRecords
-    ) {
-        LastRecord last = activeProducerLastRecords.get(batch.producerId());
-        return last != null
-                && last.lastDataOffset().isEmpty()
-                && last.producerEpoch() == batch.producerEpoch();
-    }
-
-    private KafkaCanonicalCheckpointState canonicalCheckpoint(
-            KafkaCheckpointSourceState source,
-            KafkaStableSnapshot snapshot
-    ) {
-        Objects.requireNonNull(source, "source");
-        if (source.trimOffset() != snapshot.logStartOffset()
-                || source.endOffset() != snapshot.stableEndOffset()
-                || source.stateMapEndOffset() != source.endOffset()
-                || source.appendInFlight()
-                || producerStateManager.mapEndOffset() != source.endOffset()) {
-            throw invariant(
-                    "Nereus maintenance capture does not match the exact stable source"
-                            + " [sourceTrim=" + source.trimOffset()
-                            + ", snapshotLogStart=" + snapshot.logStartOffset()
-                            + ", sourceEnd=" + source.endOffset()
-                            + ", snapshotStableEnd=" + snapshot.stableEndOffset()
-                            + ", sourceStateMapEnd=" + source.stateMapEndOffset()
-                            + ", producerStateMapEnd=" + producerStateManager.mapEndOffset()
-                            + ", appendInFlight=" + source.appendInFlight()
-                            + "]");
-        }
-        KafkaVirtualSegmentState virtualSegments = canonicalState.virtualSegments();
-        KafkaDerivedIndexState derivedIndexes = canonicalState.derivedIndexes();
-        virtualSegments.requireBounds(source.trimOffset(), source.endOffset());
-        derivedIndexes.requireBounds(source.trimOffset(), source.endOffset());
-        return new KafkaCanonicalCheckpointState(
-                source.endOffset(),
-                source.trimOffset(),
-                source.endOffset(),
-                producerStateManager.exportCanonical(source.endOffset()),
-                new KafkaLeaderEpochState(
-                        source.trimOffset(),
-                        source.endOffset(),
-                        canonicalLeaderEpochs(source.trimOffset())),
-                virtualSegments,
-                derivedIndexes);
-    }
-
-    private List<KafkaLeaderEpochState.LeaderEpochRange> canonicalLeaderEpochs(
-            long logStartOffset
-    ) {
-        List<NereusKafkaRecoveredState.LeaderEpochRange> recovered =
-                recoveredState.leaderEpochRanges();
-        int first = 0;
-        for (int index = 0; index < recovered.size(); index++) {
-            if (recovered.get(index).startOffset() <= logStartOffset) {
-                first = index;
-            }
-        }
-        return recovered.subList(first, recovered.size()).stream()
-                .map(range -> new KafkaLeaderEpochState.LeaderEpochRange(
-                        range.leaderEpoch(), range.startOffset()))
-                .toList();
-    }
-
-    private void observeCommittedAppend(AppendInvocation invocation) {
-        canonicalState.commitStable(invocation.batches, time.milliseconds());
-        nereusLocalLog.updateLogEndOffset(logEndOffset());
-    }
-
-    @Override
-    public OffsetResultHolder fetchOffsetByTimestamp(
-            long targetTimestamp,
-            Optional<AsyncOffsetReader> remoteOffsetReader
-    ) {
-        Objects.requireNonNull(remoteOffsetReader, "remoteOffsetReader");
-        if (targetTimestamp == ListOffsetsRequest.EARLIEST_TIMESTAMP
-                || targetTimestamp == ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP) {
-            return timestampResult(RecordBatch.NO_TIMESTAMP, logStartOffset());
-        }
-        if (targetTimestamp == ListOffsetsRequest.LATEST_TIMESTAMP) {
-            return timestampResult(RecordBatch.NO_TIMESTAMP, logEndOffset());
-        }
-        if (targetTimestamp == ListOffsetsRequest.LATEST_TIERED_TIMESTAMP
-                || targetTimestamp == ListOffsetsRequest.EARLIEST_PENDING_UPLOAD_TIMESTAMP) {
-            return timestampResult(RecordBatch.NO_TIMESTAMP, -1);
-        }
-        if (targetTimestamp == ListOffsetsRequest.MAX_TIMESTAMP) {
-            synchronized (nereusGuard) {
-                requireReadable();
-                return new OffsetResultHolder(
-                        canonicalState.maxTimestampPosition()
-                                .map(position -> new FileRecords.TimestampAndOffset(
-                                        position.timestamp(),
-                                        position.offset(),
-                                        Optional.empty())));
-            }
-        }
-        if (targetTimestamp < 0) {
-            return new OffsetResultHolder(Optional.empty());
-        }
-        return new OffsetResultHolder(scanOffsetByTimestamp(targetTimestamp));
-    }
-
-    private Optional<FileRecords.TimestampAndOffset> scanOffsetByTimestamp(
-            long targetTimestamp
-    ) {
-        long nextOffset;
-        long maximumOffset;
-        synchronized (nereusGuard) {
-            requireReadable();
-            nextOffset = canonicalState.timestampScanCandidate(targetTimestamp);
-            maximumOffset = storage.stableSnapshot().stableEndOffset();
-        }
-        long scannedBytes = 0;
-        long scanLimit = Math.max(
-                (long) hardMaxFetchBytes,
-                64L * 1024 * 1024);
-        while (nextOffset < maximumOffset) {
-            FetchDataInfo page = read(
-                    nextOffset,
-                    hardMaxFetchBytes,
-                    FetchIsolation.LOG_END,
-                    true);
-            MemoryRecords records = (MemoryRecords) page.records;
-            if (records.sizeInBytes() == 0) {
-                throw NereusKafkaExceptionMapper.map(invariant(
-                        "Nereus timestamp scan made no progress before stable end"));
-            }
-            for (RecordBatch batch : records.batches()) {
-                for (Record record : batch) {
-                    if (record.timestamp() >= targetTimestamp) {
-                        Optional<Integer> epoch =
-                                batch.partitionLeaderEpoch() < 0
-                                        ? Optional.empty()
-                                        : Optional.of(batch.partitionLeaderEpoch());
-                        return Optional.of(new FileRecords.TimestampAndOffset(
-                                record.timestamp(), record.offset(), epoch));
-                    }
-                }
-                nextOffset = Math.addExact(batch.lastOffset(), 1);
-            }
-            scannedBytes = Math.addExact(scannedBytes, records.sizeInBytes());
-            if (scannedBytes > scanLimit && nextOffset < maximumOffset) {
-                throw NereusKafkaExceptionMapper.map(new NereusException(
-                        ErrorCode.READ_LIMIT_TOO_SMALL,
-                        true,
-                        "Nereus timestamp lookup exceeded the bounded scan budget"));
-            }
-        }
-        return Optional.empty();
-    }
-
-    private static OffsetResultHolder timestampResult(
-            long timestamp,
-            long offset
-    ) {
-        return new OffsetResultHolder(new FileRecords.TimestampAndOffset(
-                timestamp, offset, Optional.empty()));
-    }
-
-    @Override
-    public LogOffsetMetadata maybeConvertToOffsetMetadata(long offset) {
-        synchronized (nereusGuard) {
-            if (storage == null
-                    || recoveredState == null
-                    || offset < logStartOffset()
-                    || offset > logEndOffset()) {
-                return new LogOffsetMetadata(offset);
-            }
-            NereusCanonicalLogState.Position position =
-                    canonicalState.positionForOffset(offset);
-            return new LogOffsetMetadata(
-                    offset,
-                    position.segmentBaseOffset(),
-                    Math.toIntExact(position.relativeLogicalBytes()));
-        }
-    }
-
-    private void requireReadable() {
-        if (storage == null
-                || recoveredState == null
-                || storage.state() != KafkaPartitionState.LEADER_WRITABLE) {
-            throw new KafkaStorageException(
-                    "Nereus partition storage is not recovered and published");
-        }
-    }
-
-    @Override
-    public FetchDataInfo read(
-            long startOffset,
-            int maxLength,
-            FetchIsolation isolation,
-            boolean minOneMessage
-    ) {
-        Objects.requireNonNull(isolation, "isolation");
-        KafkaPartitionStorage exactStorage;
-        KafkaStableSnapshot snapshot;
-        long maxOffsetExclusive;
-        synchronized (nereusGuard) {
-            if (storage == null
-                    || recoveredState == null
-                    || storage.state() != KafkaPartitionState.LEADER_WRITABLE) {
-                throw new KafkaStorageException(
-                        "Nereus partition storage is not recovered and published");
-            }
-            exactStorage = storage;
-            snapshot = exactStorage.stableSnapshot();
-            maxOffsetExclusive = switch (isolation) {
-                case LOG_END -> logEndOffset();
-                case HIGH_WATERMARK -> highWatermark();
-                case TXN_COMMITTED -> lastStableOffset();
-            };
-        }
-        if (startOffset < snapshot.logStartOffset()
-                || startOffset > snapshot.stableEndOffset()) {
-            throw new OffsetOutOfRangeException(
-                    "Nereus Fetch offset " + startOffset + " is outside stable range ["
-                            + snapshot.logStartOffset() + ", "
-                            + snapshot.stableEndOffset() + "]");
-        }
-        if (maxLength <= 0 || startOffset >= maxOffsetExclusive) {
-            requireSamePublishedStorage(exactStorage);
-            return new FetchDataInfo(
-                    new LogOffsetMetadata(startOffset),
-                    MemoryRecords.EMPTY,
-                    false,
-                    isolation == FetchIsolation.TXN_COMMITTED
-                            ? Optional.of(List.of())
-                            : Optional.empty());
-        }
-
-        NereusCanonicalLogState.Position requestedPosition;
-        synchronized (nereusGuard) {
-            requireSamePublishedStorage(exactStorage);
-            requestedPosition = canonicalState.positionForOffset(startOffset);
-        }
-        KafkaStorageReadRequest request = new KafkaStorageReadRequest(
-                startOffset,
-                maxOffsetExclusive,
-                Math.max(1, maxLength),
-                maxLength,
-                hardMaxFetchBytes,
-                minOneMessage,
-                requestedPosition.segmentBaseOffset(),
-                requestedPosition.relativeLogicalBytes(),
-                fetchTimeout);
-        KafkaStorageReadResult result = awaitRead(exactStorage, request);
-        com.nereusstream.kafka.codec.KafkaFetchAssembly assembly = result.fetchAssembly();
-        requireSamePublishedStorage(exactStorage);
-        validateReadResult(snapshot, maxOffsetExclusive, maxLength, minOneMessage, result);
-        MemoryRecords records = MemoryRecords.readableRecords(assembly.recordsBuffer());
-        Optional<List<org.apache.kafka.common.message.FetchResponseData.AbortedTransaction>>
-                abortedTransactions = abortedTransactionsForRead(
-                        exactStorage,
-                        isolation,
-                        startOffset,
-                        assembly.nextLogicalOffset(),
-                        assembly.sizeInBytes());
-        long actualFirstOffset = assembly.actualFirstBatchBaseOffset().orElse(startOffset);
-        NereusCanonicalLogState.Position actualPosition;
-        synchronized (nereusGuard) {
-            requireSamePublishedStorage(exactStorage);
-            actualPosition = canonicalState.positionForOffset(actualFirstOffset);
-        }
-        int relativePosition = Math.toIntExact(actualPosition.relativeLogicalBytes());
-        LogOffsetMetadata fetchOffset = new LogOffsetMetadata(
-                actualFirstOffset,
-                actualPosition.segmentBaseOffset(),
-                relativePosition);
-        return new FetchDataInfo(
-                fetchOffset, records, false, abortedTransactions);
-    }
-
-    private Optional<List<org.apache.kafka.common.message.FetchResponseData.AbortedTransaction>>
-            abortedTransactionsForRead(
-                    KafkaPartitionStorage exactStorage,
-                    FetchIsolation isolation,
-                    long startOffset,
-                    long upperBoundOffset,
-                    int sizeInBytes
-    ) {
-        if (isolation != FetchIsolation.TXN_COMMITTED) {
-            return Optional.empty();
-        }
-        if (sizeInBytes == 0 || upperBoundOffset <= startOffset) {
-            return Optional.of(List.of());
-        }
-        synchronized (nereusGuard) {
-            requireSamePublishedStorage(exactStorage);
-            return Optional.of(producerStateManager.collectAbortedTransactions(
-                    startOffset, upperBoundOffset).stream()
-                    .map(AbortedTxn::asAbortedTransaction)
-                    .toList());
         }
     }
 
     private void appendStable(long lastOffset, MemoryRecords records) {
-        AppendInvocation invocation = appendInvocation.get();
-        if (invocation == null) {
-            throw new KafkaStorageException("Nereus append reached LocalLog without exact request context");
+        var reserved = admission.get();
+        if (reserved == null) throw new KafkaStorageException("native append has no pre-offset BK admission");
+        var batches = new ArrayList<KafkaNativeAssignedRecordBatchV1>();
+        for (var batch : records.batches()) {
+            var bytes = ByteBuffer.allocate(batch.sizeInBytes());
+            batch.writeTo(bytes);
+            var raw = CanonicalBytes.copyOf(bytes.array());
+            batches.add(KafkaNativeAssignedRecordBatchV1.validate(KafkaRawAssignedRecordBatchFactsV1.parse(raw)));
         }
-        KafkaPartitionStorage exactStorage;
-        long expectedStartOffset;
-        synchronized (nereusGuard) {
-            if (!nereusWritable(invocation.leaderEpoch)) {
-                throw new KafkaStorageException(
-                        "Nereus partition storage is no longer writable for the append");
-            }
-            exactStorage = storage;
-            expectedStartOffset = exactStorage.stableSnapshot().stableEndOffset();
+        physicallyDispatched.set(true);
+        var result = await(storage.appendAssigned(reserved, batches), appendTimeout);
+        if (result.outcome() != KafkaOrderedAppendOutcomeV1.COMMITTED_ORDERED
+                || result.endOffsetExclusive().orElseThrow() != lastOffset + 1) {
+            storage.fence();
+            throw new KafkaStorageException("shared BK append did not commit the exact native batch range");
         }
-        KafkaAppendContext context = new KafkaAppendContext(
-                expectedStartOffset,
-                invocation.leaderEpoch,
-                invocation.requiredAcks,
-                appendTimeout,
-                Map.of(
-                        "topic", identity.observedTopicName(),
-                        "partition", Integer.toString(identity.partition())));
-        CompletableFuture<KafkaStableAppendResult> append;
-        try {
-            append = Objects.requireNonNull(
-                    exactStorage.append(records.buffer().duplicate(), context),
-                    "Nereus partition storage append future");
-        } catch (Throwable failure) {
-            throw NereusKafkaExceptionMapper.map(failure);
-        }
+    }
 
-        KafkaStableAppendResult result;
+    @Override
+    public LogAppendInfo appendAsFollower(MemoryRecords records, int epoch) {
+        throw new KafkaStorageException("RF=1 shared BK has no native follower append path");
+    }
+
+    private static KafkaReadIsolationV1 readIsolation(FetchIsolation isolation) {
+        return switch (isolation) {
+            case LOG_END -> KafkaReadIsolationV1.REPLICA;
+            case HIGH_WATERMARK -> KafkaReadIsolationV1.READ_UNCOMMITTED;
+            case TXN_COMMITTED -> KafkaReadIsolationV1.READ_COMMITTED;
+        };
+    }
+
+    @Override
+    public FetchDataInfo read(long offset, int maximumBytes, FetchIsolation isolation, boolean minOneMessage) {
+        synchronized (guard) {
+            var exact = requireStorage(publishedEpoch);
+            var mode = readIsolation(isolation);
+            var snapshot = exact.capture();
+            if (offset < snapshot.root().frontiers().trimStartOffset()
+                    || offset > snapshot.root().frontiers().readableEndOffset()) {
+                throw new OffsetOutOfRangeException("shared BK Fetch offset is outside the captured range");
+            }
+            if (maximumBytes <= 0 || offset >= snapshot.root().readUpperBound(mode)) {
+                return new FetchDataInfo(
+                        new LogOffsetMetadata(offset),
+                        MemoryRecords.EMPTY,
+                        false,
+                        isolation == FetchIsolation.TXN_COMMITTED ? Optional.of(List.of()) : Optional.empty());
+            }
+            var result = await(
+                    exact.read(new KafkaBookKeeperSequentialReadRequestV1(
+                            offset, mode, Math.min(maximumBytes, hardMaxFetchBytes), Optional.empty())),
+                    fetchTimeout);
+            if (result.outcome() != KafkaBookKeeperReadOutcomeV1.FOUND) {
+                if (result.outcome() == KafkaBookKeeperReadOutcomeV1.END_OF_SNAPSHOT) {
+                    return new FetchDataInfo(new LogOffsetMetadata(offset), MemoryRecords.EMPTY);
+                }
+                throw new KafkaStorageException("shared BK Fetch failed: " + result.outcome());
+            }
+            int bytes = result.batches().stream()
+                    .mapToInt(batch -> batch.rawAssignedRecordBatch().length())
+                    .sum();
+            if (bytes > hardMaxFetchBytes)
+                throw new KafkaStorageException("shared BK Fetch exceeds the hard response cap");
+            if (bytes > maximumBytes && !minOneMessage)
+                return new FetchDataInfo(new LogOffsetMetadata(offset), MemoryRecords.EMPTY);
+            var buffer = ByteBuffer.allocate(bytes);
+            result.batches()
+                    .forEach(batch -> buffer.put(batch.rawAssignedRecordBatch().toByteArray()));
+            buffer.flip();
+            var aborted = isolation == FetchIsolation.TXN_COMMITTED
+                    ? Optional.of(result.abortedTransactions().stream()
+                            .map(transaction ->
+                                    new org.apache.kafka.common.message.FetchResponseData.AbortedTransaction()
+                                            .setProducerId(transaction.producerId())
+                                            .setFirstOffset(transaction.firstOffset()))
+                            .toList())
+                    : Optional.<List<org.apache.kafka.common.message.FetchResponseData.AbortedTransaction>>empty();
+            return new FetchDataInfo(
+                    new LogOffsetMetadata(result.batches().get(0).startOffset(), 0, 0),
+                    MemoryRecords.readableRecords(buffer),
+                    false,
+                    aborted);
+        }
+    }
+
+    @Override
+    public LogOffsetMetadata maybeConvertToOffsetMetadata(long offset) {
+        return new LogOffsetMetadata(offset, 0, 0);
+    }
+
+    public CompletionStage<Optional<FileRecords.TimestampAndOffset>> lookupTimestamp(long timestamp, int epoch) {
+        synchronized (guard) {
+            var exact = requireStorage(epoch);
+            var snapshot = exact.capture();
+            if (timestamp == ListOffsetsRequest.EARLIEST_TIMESTAMP
+                    || timestamp == ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP) {
+                return java.util.concurrent.CompletableFuture.completedFuture(
+                        Optional.of(new FileRecords.TimestampAndOffset(
+                                RecordBatch.NO_TIMESTAMP, logStartOffset(), Optional.empty())));
+            }
+            if (timestamp == ListOffsetsRequest.LATEST_TIMESTAMP) {
+                return java.util.concurrent.CompletableFuture.completedFuture(
+                        Optional.of(new FileRecords.TimestampAndOffset(
+                                RecordBatch.NO_TIMESTAMP,
+                                snapshot.root().frontiers().highWatermark(),
+                                Optional.of(epoch))));
+            }
+            if (timestamp < 0 && timestamp != ListOffsetsRequest.MAX_TIMESTAMP) {
+                return java.util.concurrent.CompletableFuture.completedFuture(Optional.empty());
+            }
+            return exact.read(new KafkaBookKeeperSequentialReadRequestV1(
+                            snapshot.root().frontiers().trimStartOffset(),
+                            KafkaReadIsolationV1.READ_UNCOMMITTED,
+                            timestampScan.maxScanBytes(),
+                            Optional.empty()))
+                    .toCompletableFuture()
+                    .orTimeout(timestampScan.timeout().toMillis(), TimeUnit.MILLISECONDS)
+                    .thenApply(result -> {
+                        synchronized (guard) {
+                            if (requireStorage(epoch) != exact)
+                                throw new KafkaStorageException("timestamp scan owner changed");
+                        }
+                        if (result.outcome() == KafkaBookKeeperReadOutcomeV1.END_OF_SNAPSHOT) return Optional.empty();
+                        if (result.outcome() != KafkaBookKeeperReadOutcomeV1.FOUND)
+                            throw new KafkaStorageException("shared BK timestamp scan failed");
+                        return scanTimestamp(
+                                result.batches(),
+                                snapshot.root().frontiers().highWatermark(),
+                                timestamp,
+                                timestampScan);
+                    });
+        }
+    }
+
+    static Optional<FileRecords.TimestampAndOffset> scanTimestamp(
+            List<KafkaBookKeeperReadBatchV1> batches,
+            long upperBound,
+            long timestamp,
+            NereusListOffsetsScanConfig limits) {
+        FileRecords.TimestampAndOffset found = null;
+        long scannedRecords = 0;
+        long scannedBytes = 0;
+        long scannedThrough = 0;
+        for (var raw : batches) {
+            if (raw.startOffset() >= upperBound) break;
+            scannedBytes =
+                    Math.addExact(scannedBytes, raw.rawAssignedRecordBatch().length());
+            if (scannedBytes > limits.maxScanBytes()) throw scanLimitExceeded();
+            var records = MemoryRecords.readableRecords(
+                    ByteBuffer.wrap(raw.rawAssignedRecordBatch().toByteArray()));
+            for (var batch : records.batches()) {
+                for (var record : batch) {
+                    if (record.offset() >= upperBound) break;
+                    if (++scannedRecords > limits.maxScanRecords()) throw scanLimitExceeded();
+                    if (timestamp != ListOffsetsRequest.MAX_TIMESTAMP && record.timestamp() >= timestamp) {
+                        return Optional.of(new FileRecords.TimestampAndOffset(
+                                record.timestamp(), record.offset(), Optional.of(batch.partitionLeaderEpoch())));
+                    }
+                    if (timestamp == ListOffsetsRequest.MAX_TIMESTAMP
+                            && (found == null || record.timestamp() > found.timestamp)) {
+                        found = new FileRecords.TimestampAndOffset(
+                                record.timestamp(), record.offset(), Optional.of(batch.partitionLeaderEpoch()));
+                    }
+                }
+            }
+            scannedThrough = raw.endOffsetExclusive();
+        }
+        if (scannedThrough < upperBound) throw scanLimitExceeded();
+        return Optional.ofNullable(found);
+    }
+
+    private static org.apache.kafka.common.errors.ThrottlingQuotaExceededException scanLimitExceeded() {
+        return new org.apache.kafka.common.errors.ThrottlingQuotaExceededException(
+                "shared BK timestamp scan exceeds its bounded prefix");
+    }
+
+    @Override
+    public OffsetResultHolder fetchOffsetByTimestamp(long timestamp, Optional<AsyncOffsetReader> remote) {
+        return new OffsetResultHolder(await(lookupTimestamp(timestamp, publishedEpoch), fetchTimeout));
+    }
+
+    @Override
+    public LogConfig updateConfigAtMetadataOffset(LogConfig config, long metadataOffset) {
+        synchronized (guard) {
+            if (metadataOffset < configMetadataOffset) throw new KafkaStorageException("stale metadata config update");
+            var previous = super.updateConfig(config);
+            configMetadataOffset = metadataOffset;
+            return previous;
+        }
+    }
+
+    @Override
+    public long deleteRecords(int epoch, long offset, PartitionLeaderAuthority authority) {
+        throw new org.apache.kafka.common.errors.UnsupportedVersionException(
+                "durable BK prefix trim requires the M4/M5 lifecycle gate");
+    }
+
+    private KafkaBookKeeperPartitionV1 requireStorage(int epoch) {
+        if (storage != null && !currentOwner.getAsBoolean()) {
+            storage.fence();
+            throw new org.apache.kafka.common.errors.FencedLeaderEpochException("native BK assignment was revoked");
+        }
+        if (storage == null || publishedEpoch != epoch)
+            throw new KafkaStorageException("shared BK partition is not recovered for this epoch");
+        return storage;
+    }
+
+    private <T> T await(CompletionStage<T> stage, Duration timeout) {
         try {
-            result = append.get(appendTimeout.toMillis(), TimeUnit.MILLISECONDS);
+            return stage.toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException failure) {
             Thread.currentThread().interrupt();
-            fenceUnknownAppend(exactStorage);
-            throw NereusKafkaExceptionMapper.map(new NereusException(
-                    ErrorCode.CANCELLED,
-                    true,
-                    "Nereus stable append wait was interrupted",
-                    failure,
-                    AppendOutcome.MAY_HAVE_COMMITTED));
+            if (storage != null && Boolean.TRUE.equals(physicallyDispatched.get())) storage.fence();
+            throw new KafkaStorageException("shared BK operation interrupted", failure);
         } catch (TimeoutException failure) {
-            fenceUnknownAppend(exactStorage);
-            throw NereusKafkaExceptionMapper.map(new NereusException(
-                    ErrorCode.TIMEOUT,
-                    true,
-                    "Nereus stable append did not finish before the configured timeout",
-                    failure,
-                    AppendOutcome.MAY_HAVE_COMMITTED));
+            if (storage != null && Boolean.TRUE.equals(physicallyDispatched.get())) storage.fence();
+            throw new KafkaStorageException("shared BK operation timed out with unresolved outcome", failure);
         } catch (ExecutionException failure) {
-            throw NereusKafkaExceptionMapper.map(failure);
-        }
-        try {
-            validateAppendResult(exactStorage, context, records, lastOffset, result);
-        } catch (RuntimeException | Error failure) {
-            fenceUnknownAppend(exactStorage);
-            throw failure;
-        }
-        invocation.markStable(exactStorage, records);
-    }
-
-    private KafkaStorageReadResult awaitRead(
-            KafkaPartitionStorage exactStorage,
-            KafkaStorageReadRequest request
-    ) {
-        CompletableFuture<KafkaStorageReadResult> read;
-        try {
-            read = Objects.requireNonNull(
-                    exactStorage.read(request),
-                    "Nereus partition storage read future");
-        } catch (Throwable failure) {
-            throw NereusKafkaExceptionMapper.map(failure);
-        }
-        try {
-            return read.get(fetchTimeout.toMillis(), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException failure) {
-            Thread.currentThread().interrupt();
-            throw NereusKafkaExceptionMapper.map(new NereusException(
-                    ErrorCode.CANCELLED,
-                    true,
-                    "Nereus Fetch wait was interrupted",
-                    failure));
-        } catch (TimeoutException failure) {
-            throw NereusKafkaExceptionMapper.map(new NereusException(
-                    ErrorCode.TIMEOUT,
-                    true,
-                    "Nereus Fetch did not finish before the configured timeout",
-                    failure));
-        } catch (ExecutionException failure) {
-            throw NereusKafkaExceptionMapper.map(failure);
+            Throwable cause = failure.getCause();
+            if (cause instanceof RuntimeException runtime) throw runtime;
+            throw new KafkaStorageException("shared BK operation failed", cause);
         }
     }
 
-    private static void validateAppendResult(
-            KafkaPartitionStorage exactStorage,
-            KafkaAppendContext context,
-            MemoryRecords records,
-            long lastOffset,
-            KafkaStableAppendResult result
-    ) {
-        Objects.requireNonNull(result, "result");
-        KafkaStableSnapshot snapshot = result.stableSnapshot();
-        boolean encodedMatches = result.requiredAcks() == context.requiredAcks()
-                && result.encodedAppend().range().startOffset() == context.expectedStartOffset()
-                && result.encodedAppend().range().endOffset() == lastOffset + 1
-                && result.encodedAppend().encodedBytes() == records.sizeInBytes();
-        boolean storageMatches = snapshot.stableEndOffset() == lastOffset + 1
-                && snapshot.equals(exactStorage.stableSnapshot())
-                && exactStorage.state() == KafkaPartitionState.LEADER_WRITABLE;
-        if (!encodedMatches || !storageMatches) {
-            throw NereusKafkaExceptionMapper.map(invariant(
-                    "Nereus stable append result does not match the stock validated append"));
-        }
-    }
-
-    private static void validateReadResult(
-            KafkaStableSnapshot requestedSnapshot,
-            long maxOffsetExclusive,
-            int maxLength,
-            boolean minOneMessage,
-            KafkaStorageReadResult result
-    ) {
-        Objects.requireNonNull(result, "result");
-        com.nereusstream.kafka.codec.KafkaFetchAssembly assembly = result.fetchAssembly();
-        KafkaStableSnapshot resultSnapshot = result.stableSnapshot();
-        boolean snapshotMatches = resultSnapshot.logStartOffset() == requestedSnapshot.logStartOffset()
-                && resultSnapshot.stableEndOffset() >= requestedSnapshot.stableEndOffset();
-        boolean boundsMatch = assembly.nextLogicalOffset() <= maxOffsetExclusive
-                && assembly.sourceCoverageEndOffset() <= maxOffsetExclusive
-                && assembly.abortedTransactions().isEmpty();
-        boolean overflowMatches = !assembly.firstEntryOverflow()
-                ? assembly.sizeInBytes() <= maxLength
-                : minOneMessage;
-        if (!snapshotMatches || !boundsMatch || !overflowMatches) {
-            throw NereusKafkaExceptionMapper.map(invariant(
-                    "Nereus Fetch result violates the exact stock read bounds"));
-        }
-    }
-
-    private static void fenceUnknownAppend(KafkaPartitionStorage exactStorage) {
-        try {
-            exactStorage.resign();
-        } catch (Throwable ignored) {
-            // The protocol response is already fenced by the unknown append outcome.
-        }
-    }
-
-    private void requirePublished(int leaderEpoch) {
-        synchronized (nereusGuard) {
-            if (!nereusWritable(leaderEpoch)) {
-                throw new KafkaStorageException(
-                        "Nereus partition storage is not writable for leader epoch "
-                                + leaderEpoch);
-            }
-        }
-    }
-
-    private void requireSamePublishedStorage(KafkaPartitionStorage exactStorage) {
-        synchronized (nereusGuard) {
-            if (storage != exactStorage
-                    || recoveredState == null
-                    || exactStorage.state() != KafkaPartitionState.LEADER_WRITABLE) {
-                throw new KafkaStorageException(
-                        "Nereus partition storage changed while serving Fetch");
-            }
-        }
-    }
-
-    private void requireExactState(
-            int leaderEpoch,
-            NereusKafkaRecoveredState state
-    ) {
-        if (!state.frozen()
-                || !state.identity().equals(identity)
-                || state.leaderEpoch() != leaderEpoch
-                || !state.topicPartition().equals(topicPartition())
-                || !state.topicId().equals(topicId().orElse(Uuid.ZERO_UUID))
-                || state.producerStateManager() != producerStateManager) {
-            throw invariant("Nereus recovered state does not match the exact log shell");
-        }
-    }
-
-    private boolean matchesStorage(
-            KafkaPartitionStorage candidate,
-            int leaderEpoch,
-            KafkaStableSnapshot snapshot
-    ) {
-        if (!candidate.identity().equals(identity)
-                || candidate.leaderEpoch() != leaderEpoch
-                || candidate.state() != KafkaPartitionState.LEADER_WRITABLE) {
-            return false;
-        }
-        return snapshot.logStartOffset() == recoveredState.logStartOffset()
-                && snapshot.stableEndOffset() == recoveredState.stableEndOffset()
-                && snapshot.highWatermark() == recoveredState.stableEndOffset()
-                && snapshot.lastStableOffset() == recoveredState.lastStableOffset();
-    }
-
-    private static Parts createParts(
+    private static Parts parts(
             File dir,
             LogConfig config,
             Scheduler scheduler,
             Time time,
-            int maxTransactionTimeoutMs,
-            ProducerStateManagerConfig producerStateManagerConfig,
-            LogDirFailureChannel logDirFailureChannel,
-            KafkaPartitionIdentity identity
-    ) throws IOException {
+            int transactionTimeout,
+            ProducerStateManagerConfig producerConfig,
+            LogDirFailureChannel failures)
+            throws IOException {
         Files.createDirectories(dir.toPath());
-        TopicPartition topicPartition = UnifiedLog.parseTopicPartitionName(dir);
-        LogSegments segments = new LogSegments(topicPartition);
-        NereusCanonicalLogState canonicalState = new NereusCanonicalLogState(
-                identity.durableId().canonicalIdentity());
-        NereusTransactionIndex transactionIndex = new NereusTransactionIndex(
-                0L,
-                org.apache.kafka.storage.internals.log.LogFileUtils
-                        .transactionIndexFile(dir, 0L));
-        NereusLogSegment segment = NereusLogSegment.open(
-                dir, 0L, config, time, transactionIndex, canonicalState);
-        segments.add(segment);
-        NereusLocalLog localLog = new NereusLocalLog(
-                dir,
-                config,
-                segments,
-                0L,
-                new LogOffsetMetadata(0L),
-                scheduler,
-                time,
-                topicPartition,
-                logDirFailureChannel,
-                transactionIndex,
-                canonicalState);
-        org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache leaderEpochCache =
-                UnifiedLog.createLeaderEpochCache(
-                dir,
-                topicPartition,
-                logDirFailureChannel,
-                Optional.empty(),
-                scheduler);
-        NereusProducerStateManager producerStateManager =
-                new NereusProducerStateManager(
-                topicPartition,
-                dir,
-                maxTransactionTimeoutMs,
-                producerStateManagerConfig,
-                time,
-                transactionIndex);
-        return new Parts(
-                localLog, leaderEpochCache, producerStateManager, canonicalState);
-    }
-
-    private static Duration positive(Duration value, String name) {
-        Objects.requireNonNull(value, name);
-        if (value.isZero() || value.isNegative() || value.toMillis() <= 0) {
-            throw new IllegalArgumentException(name + " must be positive and millisecond-representable");
-        }
-        return value;
-    }
-
-    private static NereusException fenced(String message) {
-        return new NereusException(ErrorCode.FENCED_APPEND, false, message);
-    }
-
-    private static NereusException invariant(String message) {
-        return new NereusException(
-                ErrorCode.METADATA_INVARIANT_VIOLATION,
-                false,
-                message);
-    }
-
-    private static NereusException unsupported(String message) {
-        return new NereusException(ErrorCode.UNSUPPORTED_FORMAT, false, message);
+        var identity = UnifiedLog.parseTopicPartitionName(dir);
+        var segments = new LogSegments(identity);
+        var transactions = new NereusTransactionIndex(
+                0, org.apache.kafka.storage.internals.log.LogFileUtils.transactionIndexFile(dir, 0));
+        segments.add(NereusLogSegment.open(dir, 0, config, time, transactions));
+        var local = new NereusLocalLog(dir, config, segments, scheduler, time, identity, failures, transactions);
+        var epochs = UnifiedLog.createLeaderEpochCache(dir, identity, failures, Optional.empty(), scheduler);
+        var producers =
+                new NereusProducerStateManager(identity, dir, transactionTimeout, producerConfig, time, transactions);
+        return new Parts(local, epochs, producers);
     }
 
     private record Parts(
-            NereusLocalLog localLog,
-            org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache leaderEpochCache,
-            NereusProducerStateManager producerStateManager,
-            NereusCanonicalLogState canonicalState
-    ) { }
-
-    private static final class AppendInvocation {
-        private final int leaderEpoch;
-        private final short requiredAcks;
-        private KafkaPartitionStorage committedStorage;
-        private List<NereusCanonicalLogState.BatchObservation> batches = List.of();
-
-        private AppendInvocation(int leaderEpoch, short requiredAcks) {
-            this.leaderEpoch = leaderEpoch;
-            this.requiredAcks = requiredAcks;
-        }
-
-        private void markStable(
-                KafkaPartitionStorage exactStorage,
-                MemoryRecords records
-        ) {
-            committedStorage = exactStorage;
-            batches = NereusCanonicalLogState.observe(records);
-        }
-    }
-
-    public record CompactionConfiguration(
-            MaterializationPolicy outputPolicy,
-            long maxDecodedRecords,
-            int maxKeyBytes,
-            long maxInMemoryKeyBytes,
-            KafkaCompactionPartitionPass.WriteSettings writeSettings
-    ) {
-        public CompactionConfiguration {
-            Objects.requireNonNull(outputPolicy, "outputPolicy");
-            Objects.requireNonNull(writeSettings, "writeSettings");
-            if (maxDecodedRecords <= 0
-                    || maxKeyBytes <= 0
-                    || maxInMemoryKeyBytes <= 0) {
-                throw new IllegalArgumentException(
-                        "Kafka compaction capture limits must be positive");
-            }
-        }
-    }
-
-    public record CompactionTransactionState(
-            KafkaProducerTransactionState producerState,
-            Map<Long, LastRecord> activeProducerLastRecords
-    ) {
-        public CompactionTransactionState {
-            Objects.requireNonNull(producerState, "producerState");
-            activeProducerLastRecords =
-                    Map.copyOf(
-                            Objects.requireNonNull(
-                                    activeProducerLastRecords,
-                                    "activeProducerLastRecords"));
-        }
+            NereusLocalLog local,
+            org.apache.kafka.storage.internals.epoch.LeaderEpochFileCache epochs,
+            NereusProducerStateManager producers) {
+        // The local shell and native protocol state have one owner.
     }
 }

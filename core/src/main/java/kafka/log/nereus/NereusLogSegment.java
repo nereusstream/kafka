@@ -17,94 +17,45 @@
 package kafka.log.nereus;
 
 import org.apache.kafka.common.record.FileRecords;
+import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.storage.internals.log.LazyIndex;
 import org.apache.kafka.storage.internals.log.LogConfig;
 import org.apache.kafka.storage.internals.log.LogFileUtils;
 import org.apache.kafka.storage.internals.log.LogSegment;
-import org.apache.kafka.storage.internals.log.RollParams;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.Objects;
 
-/**
- * Ephemeral stock segment facade backed by canonical Nereus virtual-segment facts.
- *
- * <p>Its files and stock indexes are compatibility shells only. Size and roll decisions come from
- * the partition-lock-owned canonical state.
- */
+/** Local position bookkeeping for stock append machinery; no RecordBatch is persisted here. */
 final class NereusLogSegment extends LogSegment {
-    private final NereusCanonicalLogState canonicalState;
+    private long logicalBytes;
 
-    private NereusLogSegment(
-            FileRecords records,
-            LazyIndex<org.apache.kafka.storage.internals.log.OffsetIndex> offsetIndex,
-            LazyIndex<org.apache.kafka.storage.internals.log.TimeIndex> timeIndex,
-            NereusTransactionIndex transactionIndex,
-            long baseOffset,
-            int indexIntervalBytes,
-            long rollJitterMillis,
-            Time time,
-            NereusCanonicalLogState canonicalState
-    ) {
+    private NereusLogSegment(File dir, long offset, LogConfig config, Time time, NereusTransactionIndex transactions)
+            throws IOException {
         super(
-                records,
-                offsetIndex,
-                timeIndex,
-                transactionIndex,
-                baseOffset,
-                indexIntervalBytes,
-                rollJitterMillis,
+                FileRecords.open(LogFileUtils.logFile(dir, offset), false, 0, false),
+                LazyIndex.forOffset(LogFileUtils.offsetIndexFile(dir, offset), offset, config.maxIndexSize),
+                LazyIndex.forTime(LogFileUtils.timeIndexFile(dir, offset), offset, config.maxIndexSize),
+                transactions,
+                offset,
+                config.indexInterval,
+                config.randomSegmentJitter(),
                 time);
-        this.canonicalState = Objects.requireNonNull(canonicalState, "canonicalState");
     }
 
     static NereusLogSegment open(
-            File directory,
-            long baseOffset,
-            LogConfig config,
-            Time time,
-            NereusTransactionIndex transactionIndex,
-            NereusCanonicalLogState canonicalState
-    ) throws IOException {
-        long rollJitterMillis = canonicalState.segmentRollJitter(baseOffset);
-        return new NereusLogSegment(
-                FileRecords.open(
-                        LogFileUtils.logFile(directory, baseOffset),
-                        false,
-                        config.initFileSize(),
-                        config.preallocate),
-                LazyIndex.forOffset(
-                        LogFileUtils.offsetIndexFile(directory, baseOffset),
-                        baseOffset,
-                        config.maxIndexSize),
-                LazyIndex.forTime(
-                        LogFileUtils.timeIndexFile(directory, baseOffset),
-                        baseOffset,
-                        config.maxIndexSize),
-                transactionIndex,
-                baseOffset,
-                config.indexInterval,
-                rollJitterMillis,
-                time,
-                canonicalState);
+            File dir, long offset, LogConfig config, Time time, NereusTransactionIndex transactions)
+            throws IOException {
+        return new NereusLogSegment(dir, offset, config, time, transactions);
+    }
+
+    void observe(MemoryRecords records) {
+        logicalBytes = Math.addExact(logicalBytes, records.sizeInBytes());
     }
 
     @Override
     public int size() {
-        return Math.toIntExact(Math.min(
-                Integer.MAX_VALUE,
-                canonicalState.segmentLogicalBytes(baseOffset())));
-    }
-
-    @Override
-    public long rollJitterMs() {
-        return canonicalState.segmentRollJitter(baseOffset());
-    }
-
-    @Override
-    public boolean shouldRoll(RollParams rollParams) {
-        return canonicalState.prepareRoll(baseOffset(), rollParams);
+        return Math.toIntExact(Math.min(Integer.MAX_VALUE, logicalBytes));
     }
 }

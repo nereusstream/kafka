@@ -324,6 +324,7 @@ public class ProducerStateManager {
         long producerId = entry.producerId();
         addProducerId(producerId, entry);
         entry.currentTxnFirstOffset().ifPresent(offset -> ongoingTxns.put(offset, new TxnMetadata(producerId, offset)));
+        updateOldestTxnTimestamp();
     }
 
     private boolean isProducerExpired(long currentTimeMs, ProducerStateEntry producerState) {

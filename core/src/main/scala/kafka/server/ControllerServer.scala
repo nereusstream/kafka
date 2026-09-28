@@ -278,6 +278,7 @@ class ControllerServer(
           setControllerPerformanceSamplePeriodMs(config.controllerPerformanceSamplePeriodMs).
           setControllerPerformanceAlwaysLogThresholdMs(config.controllerPerformanceAlwaysLogThresholdMs)
       }
+      controllerStorageRuntimeFactory.metadataPolicy(config).foreach(controllerBuilder.setNereusMetadataPolicy)
       controller = controllerBuilder.build()
 
       // If we are using a ClusterMetadataAuthorizer, requests to add or remove ACLs must go

@@ -61,10 +61,8 @@ public final class NereusTransactionIndex extends TransactionIndex {
         if (exact.version() != AbortedTxn.CURRENT_VERSION) {
             throw new IllegalArgumentException("Unsupported Kafka aborted transaction version");
         }
-        if (!transactions.isEmpty()
-                && transactions.get(transactions.size() - 1).lastOffset() >= exact.lastOffset()) {
-            throw new IllegalArgumentException(
-                    "Nereus aborted transaction marker offsets must be strictly increasing");
+        if (!transactions.isEmpty() && transactions.get(transactions.size() - 1).lastOffset() >= exact.lastOffset()) {
+            throw new IllegalArgumentException("Nereus aborted transaction marker offsets must be strictly increasing");
         }
         transactions.add(exact);
     }
@@ -108,15 +106,11 @@ public final class NereusTransactionIndex extends TransactionIndex {
     }
 
     @Override
-    public synchronized TxnIndexSearchResult collectAbortedTxns(
-            long fetchOffset,
-            long upperBoundOffset
-    ) {
+    public synchronized TxnIndexSearchResult collectAbortedTxns(long fetchOffset, long upperBoundOffset) {
         ArrayList<AbortedTxn> selected = new ArrayList<>();
         boolean complete = false;
         for (AbortedTxn transaction : transactions) {
-            if (transaction.lastOffset() >= fetchOffset
-                    && transaction.firstOffset() < upperBoundOffset) {
+            if (transaction.lastOffset() >= fetchOffset && transaction.firstOffset() < upperBoundOffset) {
                 selected.add(copy(transaction));
             }
             if (transaction.lastStableOffset() >= upperBoundOffset) {
@@ -131,8 +125,7 @@ public final class NereusTransactionIndex extends TransactionIndex {
     public synchronized void sanityCheck() {
         long previousLastOffset = -1;
         for (AbortedTxn transaction : transactions) {
-            if (transaction.lastOffset() < startOffset
-                    || transaction.lastOffset() <= previousLastOffset) {
+            if (transaction.lastOffset() < startOffset || transaction.lastOffset() <= previousLastOffset) {
                 throw new CorruptIndexException("Invalid Nereus aborted transaction index order");
             }
             previousLastOffset = transaction.lastOffset();

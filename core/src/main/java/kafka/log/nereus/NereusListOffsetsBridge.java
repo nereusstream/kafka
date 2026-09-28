@@ -14,146 +14,49 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package kafka.log.nereus;
 
 import org.apache.kafka.common.errors.ApiException;
-import org.apache.kafka.common.protocol.Errors;
-import org.apache.kafka.common.record.FileRecords;
-import org.apache.kafka.common.record.RecordBatch;
-import org.apache.kafka.common.requests.ListOffsetsRequest;
 import org.apache.kafka.storage.internals.log.AsyncOffsetReadFutureHolder;
 import org.apache.kafka.storage.internals.log.LeaderEpochAwareOffsetLookup;
 import org.apache.kafka.storage.internals.log.OffsetResultHolder;
 
-import com.nereusstream.kafka.partition.KafkaListOffsetQuery;
-import com.nereusstream.kafka.partition.KafkaListOffsetResult;
-import com.nereusstream.kafka.partition.KafkaListOffsetsRequest;
-import com.nereusstream.kafka.partition.KafkaListOffsetsResolver;
-
-import java.util.Objects;
 import java.util.Optional;
-import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 
-/** Adapts asynchronous exact Nereus ListOffsets results to Kafka's existing delayed-offset holder contract. */
+/** Uses the current recovered shared prefix; stock delayed ListOffsets owns completion wakeups. */
 public final class NereusListOffsetsBridge implements LeaderEpochAwareOffsetLookup {
-    @FunctionalInterface
-    interface Lookup {
-        CompletableFuture<Optional<KafkaListOffsetResult>> resolve(KafkaListOffsetsRequest request);
-    }
+    private final NereusUnifiedLog log;
 
-    private final Lookup lookup;
-    private final NereusListOffsetsScanConfig config;
-
-    public NereusListOffsetsBridge(
-            KafkaListOffsetsResolver resolver,
-            NereusListOffsetsScanConfig config
-    ) {
-        this(Objects.requireNonNull(resolver, "resolver")::resolve, config);
-    }
-
-    NereusListOffsetsBridge(Lookup lookup, NereusListOffsetsScanConfig config) {
-        this.lookup = Objects.requireNonNull(lookup, "lookup");
-        this.config = Objects.requireNonNull(config, "config");
+    public NereusListOffsetsBridge(NereusUnifiedLog log) {
+        this.log = java.util.Objects.requireNonNull(log);
     }
 
     @Override
-    public OffsetResultHolder fetchOffsetByTimestamp(
-            long targetTimestamp,
-            int expectedLeaderEpoch,
-            Runnable completionWakeup
-    ) {
-        Objects.requireNonNull(completionWakeup, "completionWakeup");
-        KafkaListOffsetQuery query = query(targetTimestamp);
-        OptionalLong target = query == KafkaListOffsetQuery.TIMESTAMP
-                ? OptionalLong.of(targetTimestamp)
-                : OptionalLong.empty();
-        CompletableFuture<Optional<KafkaListOffsetResult>> result;
+    public OffsetResultHolder fetchOffsetByTimestamp(long timestamp, int expectedEpoch, Runnable wakeup) {
+        var task = new CompletableFuture<OffsetResultHolder.FileRecordsOrError>();
+        var job = new CompletableFuture<Void>();
         try {
-            result = Objects.requireNonNull(
-                    lookup.resolve(config.request(query, target, expectedLeaderEpoch)),
-                    "Nereus ListOffsets lookup returned a null future");
-        } catch (Throwable failure) {
-            throw NereusKafkaExceptionMapper.map(failure);
-        }
-
-        if (result.isDone()) {
-            try {
-                return new OffsetResultHolder(result.join().map(NereusListOffsetsBridge::toKafka));
-            } catch (Throwable failure) {
-                throw NereusKafkaExceptionMapper.map(failure);
-            }
-        }
-        return async(result, completionWakeup);
-    }
-
-    private static OffsetResultHolder async(
-            CompletableFuture<Optional<KafkaListOffsetResult>> result,
-            Runnable completionWakeup
-    ) {
-        CompletableFuture<Void> jobFuture = new CompletableFuture<>();
-        CompletableFuture<OffsetResultHolder.FileRecordsOrError> taskFuture = new CompletableFuture<>();
-        jobFuture.whenComplete((ignored, failure) -> {
-            if (jobFuture.isCancelled()) {
-                result.cancel(false);
-            }
-        });
-        result.whenComplete((value, failure) -> {
-            try {
-                if (failure == null) {
-                    Optional<FileRecords.TimestampAndOffset> timestampAndOffset = Objects.requireNonNull(
-                            value, "Nereus ListOffsets lookup returned a null result")
-                            .map(NereusListOffsetsBridge::toKafka);
-                    taskFuture.complete(new OffsetResultHolder.FileRecordsOrError(
-                            Optional.empty(), timestampAndOffset));
-                } else {
-                    taskFuture.complete(failure(failure));
-                }
-            } catch (Throwable conversionFailure) {
-                taskFuture.complete(failure(conversionFailure));
-            } finally {
-                jobFuture.complete(null);
+            log.lookupTimestamp(timestamp, expectedEpoch).whenComplete((result, failure) -> {
                 try {
-                    completionWakeup.run();
-                } catch (Throwable ignored) {
-                    // The completed task remains observable by the delayed-operation polling path.
+                    task.complete(
+                            failure == null
+                                    ? new OffsetResultHolder.FileRecordsOrError(Optional.empty(), result)
+                                    : failed(failure));
+                } finally {
+                    job.complete(null);
+                    wakeup.run();
                 }
-            }
-        });
-        AsyncOffsetReadFutureHolder<OffsetResultHolder.FileRecordsOrError> async =
-                new AsyncOffsetReadFutureHolder<>(jobFuture, taskFuture);
-        return new OffsetResultHolder(Optional.empty(), Optional.of(async));
+            });
+        } catch (Throwable failure) {
+            task.complete(failed(failure));
+            job.complete(null);
+        }
+        return new OffsetResultHolder(Optional.empty(), Optional.of(new AsyncOffsetReadFutureHolder<>(job, task)));
     }
 
-    private static OffsetResultHolder.FileRecordsOrError failure(Throwable failure) {
+    private static OffsetResultHolder.FileRecordsOrError failed(Throwable failure) {
         ApiException mapped = NereusKafkaExceptionMapper.map(failure);
-        return new OffsetResultHolder.FileRecordsOrError(
-                Optional.of(mapped), Optional.empty());
-    }
-
-    private static FileRecords.TimestampAndOffset toKafka(KafkaListOffsetResult result) {
-        long timestamp = result.timestampMillis().orElse(RecordBatch.NO_TIMESTAMP);
-        Optional<Integer> leaderEpoch = result.leaderEpoch().isPresent()
-                ? Optional.of(result.leaderEpoch().orElseThrow())
-                : Optional.empty();
-        return new FileRecords.TimestampAndOffset(timestamp, result.offset(), leaderEpoch);
-    }
-
-    private static KafkaListOffsetQuery query(long targetTimestamp) {
-        if (targetTimestamp == ListOffsetsRequest.EARLIEST_TIMESTAMP) {
-            return KafkaListOffsetQuery.EARLIEST;
-        }
-        if (targetTimestamp == ListOffsetsRequest.LATEST_TIMESTAMP) {
-            return KafkaListOffsetQuery.LATEST;
-        }
-        if (targetTimestamp == ListOffsetsRequest.MAX_TIMESTAMP) {
-            return KafkaListOffsetQuery.MAX_TIMESTAMP;
-        }
-        if (targetTimestamp >= 0) {
-            return KafkaListOffsetQuery.TIMESTAMP;
-        }
-        throw Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT.exception(
-                "Nereus storage does not expose local/tiered ListOffsets sentinels");
+        return new OffsetResultHolder.FileRecordsOrError(Optional.of(mapped), Optional.empty());
     }
 }

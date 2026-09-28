@@ -363,6 +363,14 @@ public class ConfigurationControlManager {
             // As per KAFKA-14195, do not include implicit deletions caused by using the legacy AlterConfigs API
             // in the list passed to the policy in order to maintain backwards compatibility
         }
+        if (featureControl.isNereusStorageFeatureEnabled()
+                && (configResource.type() == Type.TOPIC || configResource.type() == Type.BROKER)) {
+            ConfigEntry minIsr = computeEffectiveTopicConfigs(allConfigs).get(MIN_IN_SYNC_REPLICAS_CONFIG);
+            if (minIsr == null || !"1".equals(minIsr.value())) {
+                return new ApiError(INVALID_CONFIG,
+                    MIN_IN_SYNC_REPLICAS_CONFIG + " must resolve to 1 for Nereus single-owner storage.");
+            }
+        }
         try {
             validator.validate(configResource, allConfigs, existingConfigsMap);
             if (!newlyCreatedResource) {

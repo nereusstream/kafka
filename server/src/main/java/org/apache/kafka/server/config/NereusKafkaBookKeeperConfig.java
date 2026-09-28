@@ -26,9 +26,6 @@ public record NereusKafkaBookKeeperConfig(
         String deploymentId,
         String clusterAlias,
         String providerScopeSha256,
-        int ledgerIdPrefixBits,
-        long ledgerIdPrefixValue,
-        String ledgerIdNamespaceReservationId,
         int ensembleSize,
         int writeQuorumSize,
         int ackQuorumSize,
@@ -53,18 +50,12 @@ public record NereusKafkaBookKeeperConfig(
         Duration readerLeaseRenewInterval,
         Duration retentionScanInterval,
         int retentionPageSize,
-        long readinessEpoch,
-        String readinessSha256,
-        int persistentBrokerCount,
         LedgerGc ledgerGc
 ) {
     public NereusKafkaBookKeeperConfig {
         deploymentId = nonblank(deploymentId, "deploymentId");
         clusterAlias = nonblank(clusterAlias, "clusterAlias");
         providerScopeSha256 = sha256(providerScopeSha256, "providerScopeSha256");
-        ledgerIdNamespaceReservationId = nonblank(
-                ledgerIdNamespaceReservationId,
-                "ledgerIdNamespaceReservationId");
         digestType = nonblank(digestType, "digestType");
         passwordFile = Objects.requireNonNull(passwordFile, "passwordFile")
                 .toAbsolutePath()
@@ -79,16 +70,6 @@ public record NereusKafkaBookKeeperConfig(
         Objects.requireNonNull(readerLeaseRenewInterval, "readerLeaseRenewInterval");
         Objects.requireNonNull(retentionScanInterval, "retentionScanInterval");
         ledgerGc = Objects.requireNonNull(ledgerGc, "ledgerGc");
-        readinessSha256 = sha256(readinessSha256, "readinessSha256");
-        if (ledgerIdPrefixBits < 8 || ledgerIdPrefixBits > 24) {
-            throw new IllegalArgumentException("ledgerIdPrefixBits must be in [8,24]");
-        }
-        long prefixLimit = 1L << ledgerIdPrefixBits;
-        long prefixFloor = 1L << (ledgerIdPrefixBits - 1);
-        if (ledgerIdPrefixValue < prefixFloor || ledgerIdPrefixValue >= prefixLimit) {
-            throw new IllegalArgumentException(
-                    "ledgerIdPrefixValue must be canonical with its highest prefix bit set");
-        }
         if (ensembleSize < writeQuorumSize
                 || writeQuorumSize < ackQuorumSize
                 || ackQuorumSize <= 0) {
@@ -102,10 +83,6 @@ public record NereusKafkaBookKeeperConfig(
         if (readerLeaseRenewInterval.compareTo(readerLeaseTtl) >= 0) {
             throw new IllegalArgumentException(
                     "BookKeeper reader lease renewal must be shorter than its TTL");
-        }
-        if ((long) persistentBrokerCount + 1L > maxReaderLeasesPerLedger) {
-            throw new IllegalArgumentException(
-                    "BookKeeper reader leases cannot cover the broker set plus restart overlap");
         }
         ledgerGc.validateAgainst(readerLeaseTtl);
     }

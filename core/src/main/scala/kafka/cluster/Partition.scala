@@ -641,6 +641,9 @@ class Partition(val topicPartition: TopicPartition,
       createLogInAssignedDirectoryId(isNew, highWatermarkCheckpoints, topicId, targetDirectoryId)
 
       val leaderLog = localLogOrException
+      if (leaderLog.isInstanceOf[BrokerStorageManagedLog]) {
+        partitionState = new CommittedPartitionState(isr.map(Int.box).asJava, partitionRegistration.leaderRecoveryState)
+      }
 
       // We update the epoch start offset and the replicas' state only if the leader epoch
       // has changed.
@@ -1525,6 +1528,41 @@ class Partition(val topicPartition: TopicPartition,
         s"Recovered Nereus state does not match the exact Kafka partition $topicPartition")
     }
     nereusRecoveredState = Some(expectedLeaderEpoch -> state)
+  }
+
+  /** Completes the native recovery state only after the storage carrier has been installed for this leader. */
+  def completeNereusRecovery(expectedLeaderEpoch: Int): CompletableFuture[Void] = {
+    val pending = inWriteLock(leaderIsrUpdateLock) {
+      if (!isLeader || leaderEpoch != expectedLeaderEpoch || !nereusRecoveredState.exists(_._1 == expectedLeaderEpoch)) {
+        throw new FencedLeaderEpochException("Nereus recovered state belongs to a stale native leader")
+      }
+      leaderEpochStartOffsetOpt = Some(localLogOrException.logEndOffset)
+      partitionState match {
+        case state: CommittedPartitionState if state.leaderRecoveryState == LeaderRecoveryState.RECOVERING =>
+          val sent = new LeaderAndIsr(localBrokerId, leaderEpoch, LeaderRecoveryState.RECOVERED,
+            addBrokerEpochToIsr(state.isr.asScala.map(_.toInt).toList).asJava, partitionEpoch)
+          val change = new PendingPartitionChange {
+            override def lastCommittedState(): CommittedPartitionState = state
+            override def sentLeaderAndIsr(): LeaderAndIsr = sent
+            override def isr(): util.Set[Integer] = state.isr
+            override def maximalIsr(): util.Set[Integer] = state.maximalIsr
+            override def leaderRecoveryState(): LeaderRecoveryState = LeaderRecoveryState.RECOVERING
+            override def isInflight(): Boolean = true
+          }
+          partitionState = change
+          Some(change)
+        case state if state.leaderRecoveryState == LeaderRecoveryState.RECOVERED => None
+        case _ => throw new KafkaStorageException("Nereus recovery conflicts with an in-flight partition change")
+      }
+    }
+    pending.map(change => submitAlterPartition(change).thenApply[Void] { result =>
+      inReadLock(leaderIsrUpdateLock) {
+        if (!isLeader || leaderEpoch != expectedLeaderEpoch || result.leaderRecoveryState != LeaderRecoveryState.RECOVERED) {
+          throw new FencedLeaderEpochException("Controller recovery response belongs to a stale native leader")
+        }
+      }
+      null
+    }).getOrElse(CompletableFuture.completedFuture(null))
   }
 
   def currentNereusRecoveredState(expectedLeaderEpoch: Int): Optional[LeaderEpochAwareRecoveryState] = {

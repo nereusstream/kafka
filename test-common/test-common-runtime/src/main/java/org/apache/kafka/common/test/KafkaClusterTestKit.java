@@ -115,6 +115,17 @@ public class KafkaClusterTestKit implements AutoCloseable {
         private final String controllerListenerName;
         private final String brokerSecurityProtocol;
         private final String controllerSecurityProtocol;
+        private kafka.server.storage.BrokerStorageRuntimeFactory brokerStorageRuntimeFactory = kafka.server.storage.BrokerStorageRuntimeFactory.Disabled();
+        private kafka.server.storage.ControllerStorageRuntimeFactory controllerStorageRuntimeFactory = kafka.server.storage.ControllerStorageRuntimeFactory.Disabled();
+
+        public Builder setBrokerStorageRuntimeFactory(kafka.server.storage.BrokerStorageRuntimeFactory factory) {
+            this.brokerStorageRuntimeFactory = java.util.Objects.requireNonNull(factory);
+            return this;
+        }
+        public Builder setControllerStorageRuntimeFactory(kafka.server.storage.ControllerStorageRuntimeFactory factory) {
+            this.controllerStorageRuntimeFactory = java.util.Objects.requireNonNull(factory);
+            return this;
+        }
         private boolean standalone;
         private Optional<Map<Integer, Uuid>> initialVoterSet = Optional.empty();
         private boolean deleteOnClose;
@@ -298,7 +309,7 @@ public class KafkaClusterTestKit implements AutoCloseable {
                         controller = new ControllerServer(
                                 sharedServer,
                                 KafkaRaftServer.configSchema(),
-                                nodes.bootstrapMetadata());
+                                nodes.bootstrapMetadata(), controllerStorageRuntimeFactory);
                     } catch (Throwable e) {
                         log.error("Error creating controller {}", node.id(), e);
                         Utils.swallow(log, Level.WARN, "sharedServer.stopForController error", sharedServer::stopForController);
@@ -325,7 +336,7 @@ public class KafkaClusterTestKit implements AutoCloseable {
                     }
                     BrokerServer broker = null;
                     try {
-                        broker = new BrokerServer(sharedServer);
+                        broker = new BrokerServer(sharedServer, brokerStorageRuntimeFactory);
                     } catch (Throwable e) {
                         log.error("Error creating broker {}", node.id(), e);
                         Utils.swallow(log, Level.WARN, "sharedServer.stopForBroker error", sharedServer::stopForBroker);

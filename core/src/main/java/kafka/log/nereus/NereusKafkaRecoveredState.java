@@ -19,431 +19,52 @@ package kafka.log.nereus;
 
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
-import org.apache.kafka.common.record.MemoryRecords;
-import org.apache.kafka.common.record.Record;
-import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.storage.internals.log.LeaderEpochAwareRecoveryState;
 
-import com.nereusstream.api.ErrorCode;
-import com.nereusstream.api.NereusException;
-import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointState;
-import com.nereusstream.kafka.checkpoint.KafkaCanonicalCheckpointStateCodecV1;
-import com.nereusstream.kafka.checkpoint.KafkaCheckpointSourceState;
-import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
-import com.nereusstream.kafka.partition.KafkaPartitionIdentity;
-import com.nereusstream.kafka.recovery.KafkaReplayBatch;
-import com.nereusstream.objectstore.kafka.checkpoint.KafkaCheckpointHeader;
-import com.nereusstream.objectstore.kafka.checkpoint.KafkaCheckpointSection;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaCoherentProtocolSnapshotV1;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.OptionalLong;
 
-/**
- * Fresh Kafka state rebuilt from NKC1 and exact COMMITTED RecordBatch bytes.
- *
- * <p>The object is mutable only while owned by one recovery codec. Validation freezes it before the partition
- * publisher can expose it. Producer idempotence and transaction semantics are delegated to the exact stock
- * {@link NereusProducerStateManager} instance that the target {@link NereusUnifiedLog} will publish.
- */
-public final class NereusKafkaRecoveredState implements LeaderEpochAwareRecoveryState {
-    private final KafkaPartitionIdentity identity;
-    private final int leaderEpoch;
-    private final long logStartOffset;
-    private final long expectedStableEndOffset;
-    private final NereusProducerStateManager producerStateManager;
-    private final KafkaCanonicalCheckpointStateCodecV1 checkpointCodec =
-            new KafkaCanonicalCheckpointStateCodecV1();
-    private final List<LeaderEpochRange> leaderEpochRanges = new ArrayList<>();
-    private final List<NereusCanonicalLogState.BatchObservation> committedTail =
-            new ArrayList<>();
-
-    private long nextOffset;
-    private int batchCount;
-    private long recordCount;
-    private long logicalBytes;
-    private long largestTimestamp = RecordBatch.NO_TIMESTAMP;
-    private long maxTimestampOffset = -1;
-    private long lastStableOffset;
-    private KafkaProducerTransactionState producerTransactionState;
-    private KafkaCanonicalCheckpointState checkpointState;
-    private boolean checkpointHydrated;
-    private boolean frozen;
-
-    NereusKafkaRecoveredState(
-            KafkaPartitionIdentity identity,
-            int leaderEpoch,
-            long logStartOffset,
-            long expectedStableEndOffset,
-            NereusProducerStateManager producerStateManager
-    ) {
-        this.identity = Objects.requireNonNull(identity, "identity");
-        if (leaderEpoch < 0
-                || logStartOffset < 0
-                || expectedStableEndOffset < logStartOffset) {
-            throw new IllegalArgumentException("invalid Nereus Kafka recovery state bounds");
+/** Immutable shared-commit state installed after checkpoint and tail recovery. */
+public record NereusKafkaRecoveredState(
+        TopicPartition topicPartition, Uuid topicId, int leaderEpoch, KafkaCoherentProtocolSnapshotV1 sharedState)
+        implements LeaderEpochAwareRecoveryState {
+    public NereusKafkaRecoveredState {
+        Objects.requireNonNull(topicPartition, "topicPartition");
+        Objects.requireNonNull(topicId, "topicId");
+        Objects.requireNonNull(sharedState, "sharedState");
+        if (topicId.equals(Uuid.ZERO_UUID)
+                || leaderEpoch != sharedState.root().fence().kafkaLeaderEpoch()
+                || !topicPartition
+                        .topic()
+                        .equals(sharedState
+                                .root()
+                                .fence()
+                                .topicIncarnation()
+                                .topicName()
+                                .value())
+                || !topicId.equals(new Uuid(
+                        sharedState
+                                .root()
+                                .fence()
+                                .topicIncarnation()
+                                .topicId()
+                                .value()
+                                .highBits(),
+                        sharedState
+                                .root()
+                                .fence()
+                                .topicIncarnation()
+                                .topicId()
+                                .value()
+                                .lowBits()))
+                || topicPartition.partition() != sharedState.root().fence().partitionId()) {
+            throw new IllegalArgumentException("native recovered identity differs from the shared BK root");
         }
-        this.leaderEpoch = leaderEpoch;
-        this.logStartOffset = logStartOffset;
-        this.expectedStableEndOffset = expectedStableEndOffset;
-        this.producerStateManager = Objects.requireNonNull(
-                producerStateManager, "producerStateManager");
-        try {
-            this.producerStateManager.resetForRecovery(logStartOffset);
-        } catch (IOException failure) {
-            throw invariant(
-                    "Kafka producer state reset failed before recovery",
-                    failure);
-        }
-        this.nextOffset = logStartOffset;
-    }
-
-    void hydrateCheckpoint(
-            KafkaCheckpointHeader header,
-            List<KafkaCheckpointSection> sections
-    ) {
-        requireMutable();
-        Objects.requireNonNull(header, "header");
-        Objects.requireNonNull(sections, "sections");
-        long checkpointOffset = header.checkpointOffset();
-        if (checkpointHydrated
-                || batchCount != 0
-                || nextOffset != logStartOffset) {
-            throw invariant(
-                    "Kafka producer checkpoint is not the initial bounded recovery state");
-        }
-        if (header.logStartOffset() > logStartOffset
-                || header.stableEndOffset() != checkpointOffset
-                || checkpointOffset < logStartOffset
-                || checkpointOffset > expectedStableEndOffset) {
-            throw invariant(
-                    "Kafka producer checkpoint is not the initial bounded recovery state");
-        }
-        try {
-            KafkaCanonicalCheckpointState checkpoint =
-                    checkpointCodec.decodeSections(
-                            sections,
-                            checkpointOffset,
-                            header.logStartOffset(),
-                            header.stableEndOffset());
-            checkpointState = checkpoint;
-            producerStateManager.restoreCanonical(
-                    checkpoint.producerTransactionState());
-            checkpoint.leaderEpochState().ranges().forEach(range ->
-                    observeLeaderEpoch(
-                            range.leaderEpoch(),
-                            range.startOffset()));
-            checkpoint.virtualSegmentState().segments().forEach(segment -> {
-                logicalBytes = addExact(
-                        logicalBytes,
-                        segment.logicalBytes(),
-                        "Kafka checkpoint logical bytes overflow");
-                observeTimestamp(
-                        segment.largestTimestamp(),
-                        segment.maxTimestampOffset());
-            });
-            nextOffset = checkpointOffset;
-            checkpointHydrated = true;
-        } catch (IOException | RuntimeException failure) {
-            throw invariant(
-                    "Kafka producer checkpoint cannot hydrate stock state",
-                    failure);
-        }
-    }
-
-    void replay(KafkaReplayBatch replay) {
-        requireMutable();
-        Objects.requireNonNull(replay, "replay");
-        if (replay.baseOffset() != nextOffset) {
-            throw invariant("Kafka recovery state received a non-contiguous batch");
-        }
-        RecordBatch batch = exactBatch(replay);
-        BatchFacts batchFacts = validateRecords(batch);
-        long expectedNext = addExact(
-                batch.lastOffset(), 1, "Kafka recovery batch offset overflows");
-        try {
-            producerStateManager.replayBatch(batch);
-        } catch (IOException | RuntimeException failure) {
-            throw invariant("Kafka producer state replay failed", failure);
-        }
-        observeLeaderEpoch(batch.partitionLeaderEpoch(), batch.baseOffset());
-        nextOffset = expectedNext;
-        batchCount = addExact(batchCount, 1, "Kafka recovery batch count overflows");
-        recordCount = addExact(
-                recordCount, batchFacts.recordCount(), "Kafka recovery record count overflows");
-        logicalBytes = addExact(
-                logicalBytes,
-                replay.encodedBatch().length,
-                "Kafka recovery logical bytes overflow");
-        committedTail.add(new NereusCanonicalLogState.BatchObservation(
-                batch.baseOffset(),
-                expectedNext,
-                replay.encodedBatch().length,
-                batchFacts.largestTimestamp(),
-                batchFacts.maxTimestampOffset()));
-    }
-
-    private RecordBatch exactBatch(KafkaReplayBatch replay) {
-        byte[] encoded = replay.encodedBatch();
-        MemoryRecords records = MemoryRecords.readableRecords(ByteBuffer.wrap(encoded));
-        if (records.validBytes() != encoded.length) {
-            throw invariant("Kafka recovery batch contains trailing or incomplete bytes");
-        }
-        Iterator<? extends RecordBatch> batches = records.batches().iterator();
-        if (!batches.hasNext()) {
-            throw invariant("Kafka recovery entry contains no RecordBatch");
-        }
-        RecordBatch batch = batches.next();
-        if (batches.hasNext()
-                || batch.magic() != RecordBatch.MAGIC_VALUE_V2
-                || batch.baseOffset() != replay.baseOffset()
-                || batch.lastOffset() != replay.lastOffset()) {
-            throw invariant("Kafka recovery entry does not contain one exact magic-v2 RecordBatch");
-        }
-        batch.ensureValid();
-        return batch;
-    }
-
-    private BatchFacts validateRecords(RecordBatch batch) {
-        long recordOffset = batch.baseOffset();
-        long batchRecords = 0;
-        long batchLargestTimestamp = RecordBatch.NO_TIMESTAMP;
-        long batchMaxTimestampOffset = -1;
-        for (Record record : batch) {
-            record.ensureValid();
-            if (record.offset() != recordOffset) {
-                throw invariant("Kafka recovery RecordBatch contains a non-dense record offset");
-            }
-            observeTimestamp(record.timestamp(), record.offset());
-            if (record.timestamp() >= 0
-                    && (batchLargestTimestamp < 0
-                            || record.timestamp() > batchLargestTimestamp
-                            || (record.timestamp() == batchLargestTimestamp
-                                    && record.offset() < batchMaxTimestampOffset))) {
-                batchLargestTimestamp = record.timestamp();
-                batchMaxTimestampOffset = record.offset();
-            }
-            recordOffset = addExact(recordOffset, 1, "Kafka recovery record offset overflows");
-            batchRecords = addExact(batchRecords, 1, "Kafka recovery record count overflows");
-        }
-        long expectedNext = addExact(batch.lastOffset(), 1, "Kafka recovery batch offset overflows");
-        if (recordOffset != expectedNext || batchRecords != expectedNext - batch.baseOffset()) {
-            throw invariant("Kafka recovery RecordBatch logical span does not match its records");
-        }
-        return new BatchFacts(
-                batchRecords, batchLargestTimestamp, batchMaxTimestampOffset);
-    }
-
-    void freeze(KafkaCheckpointSourceState source) {
-        requireMutable();
-        Objects.requireNonNull(source, "source");
-        if (source.trimOffset() != logStartOffset
-                || source.endOffset() != expectedStableEndOffset
-                || nextOffset != expectedStableEndOffset
-                || source.authority().authorityEpoch() != leaderEpoch
-                || source.appendInFlight()
-                || source.stateMapEndOffset() != source.endOffset()) {
-            throw invariant("Kafka recovered state does not match the frozen stable source");
-        }
-        producerTransactionState =
-                producerStateManager.freezeCanonical(expectedStableEndOffset);
-        lastStableOffset = producerStateManager.firstUnstableOffset()
-                .map(offset -> Math.min(
-                        offset.messageOffset, expectedStableEndOffset))
-                .orElse(expectedStableEndOffset);
-        observeLeaderEpoch(leaderEpoch, expectedStableEndOffset);
-        frozen = true;
-    }
-
-    public KafkaPartitionIdentity identity() {
-        return identity;
-    }
-
-    @Override
-    public TopicPartition topicPartition() {
-        return new TopicPartition(
-                identity.observedTopicName(), identity.partition());
-    }
-
-    @Override
-    public Uuid topicId() {
-        return Uuid.fromString(identity.topicId());
-    }
-
-    @Override
-    public int leaderEpoch() {
-        return leaderEpoch;
-    }
-
-    public long logStartOffset() {
-        return logStartOffset;
-    }
-
-    public long stableEndOffset() {
-        requireFrozen();
-        return expectedStableEndOffset;
-    }
-
-    public long lastStableOffset() {
-        requireFrozen();
-        return lastStableOffset;
-    }
-
-    public KafkaProducerTransactionState producerTransactionState() {
-        requireFrozen();
-        return producerTransactionState;
-    }
-
-    public int batchCount() {
-        requireFrozen();
-        return batchCount;
-    }
-
-    public long recordCount() {
-        requireFrozen();
-        return recordCount;
-    }
-
-    public long logicalBytes() {
-        requireFrozen();
-        return logicalBytes;
-    }
-
-    public OptionalLong largestTimestamp() {
-        requireFrozen();
-        return largestTimestamp == RecordBatch.NO_TIMESTAMP
-                ? OptionalLong.empty()
-                : OptionalLong.of(largestTimestamp);
-    }
-
-    public OptionalLong maxTimestampOffset() {
-        requireFrozen();
-        return maxTimestampOffset < 0
-                ? OptionalLong.empty()
-                : OptionalLong.of(maxTimestampOffset);
-    }
-
-    public List<LeaderEpochRange> leaderEpochRanges() {
-        requireFrozen();
-        return List.copyOf(leaderEpochRanges);
-    }
-
-    Optional<KafkaCanonicalCheckpointState> checkpointState() {
-        requireFrozen();
-        return Optional.ofNullable(checkpointState);
-    }
-
-    List<NereusCanonicalLogState.BatchObservation> committedTail() {
-        requireFrozen();
-        return List.copyOf(committedTail);
     }
 
     @Override
     public boolean frozen() {
-        return frozen;
+        return true;
     }
-
-    NereusProducerStateManager producerStateManager() {
-        return producerStateManager;
-    }
-
-    private void observeLeaderEpoch(int observedEpoch, long startOffset) {
-        if (observedEpoch == RecordBatch.NO_PARTITION_LEADER_EPOCH) {
-            return;
-        }
-        if (observedEpoch < 0 || observedEpoch > leaderEpoch) {
-            throw invariant("Kafka recovery batch has an invalid partition leader epoch");
-        }
-        if (leaderEpochRanges.isEmpty()) {
-            leaderEpochRanges.add(new LeaderEpochRange(observedEpoch, startOffset));
-            return;
-        }
-        LeaderEpochRange last = leaderEpochRanges.get(leaderEpochRanges.size() - 1);
-        if (observedEpoch < last.leaderEpoch()) {
-            throw invariant("Kafka recovery leader epochs are not monotonic");
-        }
-        if (observedEpoch > last.leaderEpoch()) {
-            if (startOffset <= last.startOffset()) {
-                throw invariant("Kafka recovery leader epoch start offsets are not monotonic");
-            }
-            leaderEpochRanges.add(new LeaderEpochRange(observedEpoch, startOffset));
-        }
-    }
-
-    private void observeTimestamp(long timestamp, long offset) {
-        if (timestamp < 0) {
-            return;
-        }
-        if (largestTimestamp == RecordBatch.NO_TIMESTAMP
-                || timestamp > largestTimestamp
-                || (timestamp == largestTimestamp && offset < maxTimestampOffset)) {
-            largestTimestamp = timestamp;
-            maxTimestampOffset = offset;
-        }
-    }
-
-    private void requireMutable() {
-        if (frozen) {
-            throw new IllegalStateException("Nereus Kafka recovered state is already frozen");
-        }
-    }
-
-    private void requireFrozen() {
-        if (!frozen) {
-            throw new IllegalStateException("Nereus Kafka recovered state is not frozen");
-        }
-    }
-
-    private static int addExact(int left, int right, String message) {
-        try {
-            return Math.addExact(left, right);
-        } catch (ArithmeticException failure) {
-            throw invariant(message);
-        }
-    }
-
-    private static long addExact(long left, long right, String message) {
-        try {
-            return Math.addExact(left, right);
-        } catch (ArithmeticException failure) {
-            throw invariant(message);
-        }
-    }
-
-    private static NereusException invariant(String message) {
-        return new NereusException(
-                ErrorCode.METADATA_INVARIANT_VIOLATION,
-                false,
-                message);
-    }
-
-    private static NereusException invariant(
-            String message,
-            Throwable cause
-    ) {
-        return new NereusException(
-                ErrorCode.METADATA_INVARIANT_VIOLATION,
-                false,
-                message,
-                cause);
-    }
-
-    public record LeaderEpochRange(int leaderEpoch, long startOffset) {
-        public LeaderEpochRange {
-            if (leaderEpoch < 0 || startOffset < 0) {
-                throw new IllegalArgumentException("invalid Kafka leader epoch range");
-            }
-        }
-    }
-
-    private record BatchFacts(
-            long recordCount,
-            long largestTimestamp,
-            long maxTimestampOffset
-    ) { }
 }

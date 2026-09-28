@@ -38,7 +38,7 @@ class NereusKafkaStorageConfigTest {
         NereusKafkaStorageConfig config = parse(Map.of());
 
         assertFalse(config.enabled());
-        assertEquals(100, NereusKafkaConfigs.CONFIG_DEF.names().size());
+        assertTrue(NereusKafkaConfigs.CONFIG_DEF.names().contains(NereusKafkaConfigs.BOOKKEEPER_CAPABILITY_FILE_CONFIG));
         assertTrue(AbstractKafkaConfig.CONFIG_DEF.names().containsAll(NereusKafkaConfigs.CONFIG_DEF.names()));
         assertEquals(
                 NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT,
@@ -97,7 +97,7 @@ class NereusKafkaStorageConfigTest {
     }
 
     @Test
-    void bookKeeperOnlyProfileStillRequiresObjectCheckpointConfiguration() {
+    void bookKeeperOnlyProfileDoesNotRequireObjectCheckpointConfiguration() {
         Map<String, Object> properties = enabledProperties();
         properties.put(NereusKafkaConfigs.PROFILE_CONFIG, "BOOKKEEPER_WAL_ONLY");
 
@@ -107,7 +107,10 @@ class NereusKafkaStorageConfigTest {
         assertTrue(config.bookKeeper().isPresent());
 
         properties.remove(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
-        assertConfigFailure(properties, NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
+        properties.remove(NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG);
+        var bookKeeperOnly = parse(properties);
+        assertTrue(bookKeeperOnly.core().objectBucket().isEmpty());
+        assertTrue(bookKeeperOnly.core().objectProvider().isEmpty());
     }
 
     @Test
@@ -199,15 +202,10 @@ class NereusKafkaStorageConfigTest {
         properties.put(NereusKafkaConfigs.BOOKKEEPER_DEPLOYMENT_ID_CONFIG, "kafka-deployment-a");
         properties.put(NereusKafkaConfigs.BOOKKEEPER_CLUSTER_ALIAS_CONFIG, "nereus-prod");
         properties.put(NereusKafkaConfigs.BOOKKEEPER_PROVIDER_SCOPE_SHA256_CONFIG, "11".repeat(32));
-        properties.put(NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_PREFIX_VALUE_CONFIG, 0x801L);
-        properties.put(
-                NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_RESERVATION_ID_CONFIG,
-                "reservation-a");
         properties.put(
                 NereusKafkaConfigs.BOOKKEEPER_PASSWORD_FILE_CONFIG,
                 "/tmp/nereus-kafka-bookkeeper-password");
         properties.put(NereusKafkaConfigs.BOOKKEEPER_PASSWORD_VERSION_CONFIG, "v1");
-        properties.put(NereusKafkaConfigs.BOOKKEEPER_READINESS_SHA256_CONFIG, "55".repeat(32));
         properties.put(NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG, "s3");
         properties.put(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG, "nereus-kafka");
         return properties;

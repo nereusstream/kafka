@@ -23,8 +23,8 @@ import kafka.log.LogManager
 import kafka.server.share.SharePartitionManager
 import kafka.server.{KafkaConfig, ReplicaManager}
 import kafka.utils.Logging
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.errors.TimeoutException
+import org.apache.kafka.common.{TopicPartition, Uuid}
+import org.apache.kafka.common.errors.{FencedLeaderEpochException, NotLeaderOrFollowerException, TimeoutException}
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.coordinator.group.GroupCoordinator
 import org.apache.kafka.coordinator.share.ShareCoordinator
@@ -277,6 +277,9 @@ class BrokerMetadataPublisher(
     }
   }
 
+  private val asyncAuthorityLock = new Object
+  private val asyncAuthorities = scala.collection.mutable.HashMap.empty[TopicPartition, (Uuid, Int, Int)]
+
   // Nereus inject start: asynchronous storage lifecycle callback ordering
   private def handleTopicsDeltaAsync(
     deltaName: String,
@@ -284,6 +287,17 @@ class BrokerMetadataPublisher(
     newImage: MetadataImage,
     lifecycle: AsyncTopicDeltaLifecycle
   ): Unit = {
+    val changes = topicsDelta.localChanges(brokerId)
+    val changed = changes.deletes().asScala.toSet ++ changes.leaders().keySet().asScala ++ changes.followers().keySet().asScala
+    val expected = asyncAuthorityLock.synchronized {
+      changed.foreach { tp =>
+        val topic = newImage.topics().getTopic(tp.topic())
+        val partition = if (topic == null) null else topic.partitions().get(tp.partition())
+        if (partition == null) asyncAuthorities.remove(tp)
+        else asyncAuthorities.put(tp, (topic.id(), partition.leader, partition.leaderEpoch))
+      }
+      changed.map(tp => tp -> asyncAuthorities.get(tp)).toMap
+    }
     try {
       replicaManager.applyDelta(
         topicsDelta,
@@ -300,8 +314,20 @@ class BrokerMetadataPublisher(
       lifecycle.applyAfterReplicaManager(
         topicsDelta,
         newImage,
-        (topicPartition, leaderEpoch) => onAsyncLeaderReady(deltaName, topicPartition, leaderEpoch),
-        (topicPartition, leaderEpoch) => onAsyncResigned(deltaName, topicPartition, leaderEpoch))
+        (topicPartition, leaderEpoch) => asyncAuthorityLock.synchronized {
+          val authority = expected.getOrElse(topicPartition, None)
+          if (authority.nonEmpty && asyncAuthorities.get(topicPartition) == authority &&
+            authority.exists(value => value._2 == brokerId && value._3 == leaderEpoch) &&
+            replicaManager.onlinePartition(topicPartition).exists(partition =>
+              partition.currentNereusRecoveredState(leaderEpoch).isPresent && partition.topicId.contains(authority.get._1))) {
+            onAsyncLeaderReady(deltaName, topicPartition, leaderEpoch)
+          }
+        },
+        (topicPartition, leaderEpoch) => asyncAuthorityLock.synchronized {
+          if (asyncAuthorities.get(topicPartition) == expected.getOrElse(topicPartition, None)) {
+            onAsyncResigned(deltaName, topicPartition, leaderEpoch)
+          }
+        })
     } catch {
       case t: Throwable => CompletableFuture.failedFuture[Void](t)
     }
@@ -313,9 +339,13 @@ class BrokerMetadataPublisher(
     }
     operation.whenComplete((_, failure) => {
       if (failure != null) {
-        metadataPublishingFaultHandler.handleFault(
-          s"Error applying asynchronous topics lifecycle in $deltaName",
-          failure)
+        var cause = failure
+        while (cause.getCause != null && (cause.isInstanceOf[java.util.concurrent.CompletionException] ||
+            cause.isInstanceOf[java.util.concurrent.ExecutionException])) cause = cause.getCause
+        if (cause.isInstanceOf[FencedLeaderEpochException] || cause.isInstanceOf[NotLeaderOrFollowerException]) {
+          debug(s"Asynchronous topics lifecycle in $deltaName was superseded", cause)
+        } else metadataPublishingFaultHandler.handleFault(
+          s"Error applying asynchronous topics lifecycle in $deltaName", failure)
       }
       notifyShareCoordinatorOfDeletedTopics(deltaName, topicsDelta)
     })

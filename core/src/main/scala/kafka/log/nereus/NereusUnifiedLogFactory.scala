@@ -17,12 +17,11 @@
 
 package kafka.log.nereus
 
-import com.nereusstream.api.{ErrorCode, NereusException}
-import com.nereusstream.kafka.partition.KafkaPartitionIdentity
 import kafka.log.{UnifiedLogFactory, UnifiedLogOpenContext}
 import kafka.server.storage.BrokerStorageRuntimeContext
 
-import org.apache.kafka.common.{DirectoryId, Uuid}
+import org.apache.kafka.common.{DirectoryId, TopicIdPartition, Uuid}
+import org.apache.kafka.common.errors.KafkaStorageException
 import org.apache.kafka.metadata.properties.{MetaProperties, MetaPropertiesEnsemble, MetaPropertiesVersion, PropertiesUtils}
 import org.apache.kafka.storage.internals.log.UnifiedLog
 
@@ -68,11 +67,9 @@ final class NereusUnifiedLogFactory(context: BrokerStorageRuntimeContext) extend
         PropertiesUtils.writePropertiesFile(identity.toProperties, metaProperties.toString, true)
       }
     } catch {
-      case failure: NereusException => throw failure
+      case failure: KafkaStorageException => throw failure
       case failure: Exception =>
-        throw new NereusException(
-          ErrorCode.METADATA_UNAVAILABLE,
-          false,
+        throw new KafkaStorageException(
           s"failed to prepare Nereus Kafka cache directory identity at $metaProperties",
           failure)
     }
@@ -104,11 +101,7 @@ final class NereusUnifiedLogFactory(context: BrokerStorageRuntimeContext) extend
       throw invariant("Nereus log creation requires a non-zero KRaft topic ID")
     }
     val topicPartition = UnifiedLog.parseTopicPartitionName(openContext.dir)
-    val identity = new KafkaPartitionIdentity(
-      context.clusterId,
-      topicId.toString,
-      topicPartition.partition,
-      topicPartition.topic)
+    val identity = new TopicIdPartition(topicId, topicPartition)
     NereusUnifiedLog.create(
       openContext.dir,
       openContext.config,
@@ -124,11 +117,15 @@ final class NereusUnifiedLogFactory(context: BrokerStorageRuntimeContext) extend
       context.config.nereusKafkaStorageConfig.append().timeout(),
       context.config.nereusKafkaStorageConfig.fetch().timeout(),
       Math.toIntExact(context.config.nereusKafkaStorageConfig.fetch().maxResponseBytes()),
+      new NereusListOffsetsScanConfig(
+        context.config.nereusKafkaStorageConfig.lifecycle().recoveryChunkRecords(),
+        context.config.nereusKafkaStorageConfig.lifecycle().recoveryChunkBytes(),
+        context.config.nereusKafkaStorageConfig.fetch().timeout()),
       openContext.logOffsetsListener)
   }
 
-  private def invariant(message: String): NereusException =
-    new NereusException(ErrorCode.METADATA_INVARIANT_VIOLATION, false, message)
+  private def invariant(message: String): KafkaStorageException =
+    new KafkaStorageException(message)
 
   private def validateCacheIdentity(identity: MetaProperties): Unit = {
     if (identity.version() != MetaPropertiesVersion.V1) {

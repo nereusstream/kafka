@@ -17,219 +17,108 @@
 
 package kafka.server.nereus
 
-import com.nereusstream.api.{ErrorCode, NereusException}
-import com.nereusstream.kafka.fetch.{KafkaFetchWaveOperation, KafkaFetchWaveSource}
-import com.nereusstream.kafka.partition.{KafkaPartitionEventSubscription, KafkaPartitionIdentity, KafkaPartitionStorageManager}
-import kafka.log.nereus.NereusKafkaExceptionMapper
+import kafka.log.nereus.NereusListOffsetsLifecycle
 import kafka.server.storage.BrokerStorageFetchExecutor
 import org.apache.kafka.common.TopicIdPartition
+import org.apache.kafka.common.errors.ThrottlingQuotaExceededException
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.requests.FetchRequest.PartitionData
 import org.apache.kafka.server.config.NereusKafkaStorageConfig
 import org.apache.kafka.server.storage.log.FetchParams
 import org.apache.kafka.storage.internals.log.LogReadResult
 
-import java.time.Duration
-import java.util.Objects
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.{ArrayBlockingQueue, CompletableFuture, CompletionStage, ScheduledExecutorService, ThreadFactory, ThreadPoolExecutor, TimeUnit}
-import java.util.function.{Predicate, ToIntFunction}
+import java.util.concurrent.{ArrayBlockingQueue, CompletableFuture, CompletionStage, ScheduledExecutorService, ScheduledFuture, ThreadPoolExecutor, TimeUnit}
 import scala.collection.Seq
 import scala.collection.mutable
 
-/**
- * Product-backed whole-request Fetch handoff.
- *
- * The stock read wave remains the single owner of leader-epoch, divergence, follower-state, quota and request-order byte
- * semantics. This class owns only bounded admission, partition event subscriptions and operation lifecycle.
- */
-final class NereusBrokerStorageFetchExecutor(
-  config: NereusKafkaStorageConfig.Fetch,
-  kafkaClusterId: String,
-  brokerId: Int,
-  storageManager: KafkaPartitionStorageManager,
-  deadlineScheduler: ScheduledExecutorService
-) extends BrokerStorageFetchExecutor {
-  Objects.requireNonNull(config, "config")
-  Objects.requireNonNull(kafkaClusterId, "kafkaClusterId")
-  Objects.requireNonNull(storageManager, "storageManager")
-  Objects.requireNonNull(deadlineScheduler, "deadlineScheduler")
-
+/** One event-driven stock Fetch wave at a time, with bounded request admission and a final deadline read. */
+final class NereusBrokerStorageFetchExecutor(config: NereusKafkaStorageConfig.Fetch, brokerId: Int,
+    lifecycle: NereusListOffsetsLifecycle, scheduler: ScheduledExecutorService) extends BrokerStorageFetchExecutor {
   private val guard = new Object
-  private val maxOutstanding = Math.addExact(config.executorThreads(), config.executorQueueCapacity())
-  private val operations = mutable.Set.empty[KafkaFetchWaveOperation[Seq[(TopicIdPartition, LogReadResult)]]]
-  // Logical admission already bounds runners to maxOutstanding. Keeping that many physical queue slots prevents a burst of
-  // signals for already-admitted waiting operations from being rejected before idle workers can dequeue their control tasks.
-  private val readExecutor = new TrackingExecutor(
-    config.executorThreads(),
-    maxOutstanding,
-    threadFactory(s"nereus-kafka-fetch-read-$brokerId"))
-  private val callbackExecutor = new TrackingExecutor(
-    1,
-    maxOutstanding,
-    threadFactory(s"nereus-kafka-fetch-callback-$brokerId"))
-  private val drainedRoot = CompletableFuture.allOf(readExecutor.terminatedFuture, callbackExecutor.terminatedFuture)
+  private val maximum = Math.addExact(config.executorThreads(), config.executorQueueCapacity())
+  private val operations = mutable.Set.empty[Operation]
+  private val drainedRoot = new CompletableFuture[Void]
+  private val workers = new ThreadPoolExecutor(config.executorThreads(), config.executorThreads(), 0L, TimeUnit.MILLISECONDS,
+    new ArrayBlockingQueue[Runnable](maximum), task => {
+      val thread = new Thread(task, s"nereus-kafka-fetch-$brokerId"); thread.setDaemon(true); thread
+    }, new ThreadPoolExecutor.AbortPolicy)
   private var closed = false
+  @volatile private var ownedBytes = 0L
 
-  override def submit(
-    params: FetchParams,
-    suppliedFetchInfos: Seq[(TopicIdPartition, PartitionData)],
-    readWave: Boolean => Seq[(TopicIdPartition, LogReadResult)]
-  ): CompletionStage[Seq[(TopicIdPartition, LogReadResult)]] = {
-    Objects.requireNonNull(params, "params")
-    Objects.requireNonNull(suppliedFetchInfos, "fetchInfos")
-    Objects.requireNonNull(readWave, "read")
-    val fetchInfos = suppliedFetchInfos.toVector
-    if (fetchInfos.isEmpty) {
-      return CompletableFuture.completedFuture(Seq.empty)
-    }
-
-    val operation = new KafkaFetchWaveOperation[Seq[(TopicIdPartition, LogReadResult)]](
-      source(fetchInfos, readWave),
-      params.minBytes,
-      Duration.ofMillis(Math.max(0L, params.maxWaitMs)),
-      config.operationMaxRereads(),
-      responseBytes,
-      forceComplete,
-      readExecutor,
-      callbackExecutor,
-      deadlineScheduler)
+  override def submit(params: FetchParams, infos: Seq[(TopicIdPartition, PartitionData)],
+      read: Boolean => Seq[(TopicIdPartition, LogReadResult)]): CompletionStage[Seq[(TopicIdPartition, LogReadResult)]] = {
+    if (infos.isEmpty) return CompletableFuture.completedFuture(Seq.empty)
+    val byteBudget = Math.max(Math.min(config.maxResponseBytes(), Math.max(0, params.maxBytes).toLong), config.maxEntryBytes())
+    val operation = new Operation(params, infos.toVector, read, byteBudget)
     guard.synchronized {
-      if (closed) return failed(ErrorCode.STORAGE_CLOSED, "Kafka Fetch executor is closed")
-      if (operations.size >= maxOutstanding) {
-        return failed(ErrorCode.BACKPRESSURE_REJECTED, "Kafka Fetch executor logical capacity is exhausted")
-      }
+      if (closed || operations.size >= maximum || byteBudget > config.inflightBytes() - ownedBytes) return CompletableFuture.failedFuture(new ThrottlingQuotaExceededException("native Fetch capacity exhausted"))
       operations += operation
+      ownedBytes = Math.addExact(ownedBytes, byteBudget)
     }
-
+    operation.start()
+    operation.result.copy()
+  }
+  override def drained: CompletionStage[Void] = drainedRoot.copy()
+  override def close(): Unit = {
+    val pending = guard.synchronized { closed = true; operations.toVector }
+    pending.foreach(_.deadline())
+    guard.synchronized { shutdownIfDrained() }
+  }
+  private def shutdownIfDrained(): Unit = if (closed && operations.isEmpty) { workers.shutdown(); drainedRoot.complete(null) }
+  private final class Operation(params: FetchParams, infos: Seq[(TopicIdPartition, PartitionData)],
+      read: Boolean => Seq[(TopicIdPartition, LogReadResult)], byteBudget: Long) {
     val result = new CompletableFuture[Seq[(TopicIdPartition, LogReadResult)]]
-    operation.start().whenComplete { (terminal, failure) =>
+    private val lock = new Object
+    private val subscriptions = mutable.ArrayBuffer.empty[AutoCloseable]
+    private var timer: ScheduledFuture[_] = _
+    private var running = false
+    private var signaled = false
+    private var expired = params.maxWaitMs <= 0
+    private var waves = 0
+    private var done = false
+    private var started = false
+    def start(): Unit = {
       try {
-        if (failure == null) {
-          result.complete(terminal.response())
-        } else {
-          result.completeExceptionally(NereusKafkaExceptionMapper.map(failure))
+        infos.foreach { case (identity, _) => subscriptions += lifecycle.subscribe(identity, () => wakeup()) }
+        lock.synchronized {
+          started = true
+          timer = scheduler.schedule((() => deadline()): Runnable, Math.max(0L, params.maxWaitMs), TimeUnit.MILLISECONDS)
+          queue()
         }
-      } finally {
-        guard.synchronized {
-          operations -= operation
-          shutdownIfDrained()
-        }
-      }
+      } catch { case failure: Throwable => finish(null, failure) }
     }
-    result.copy()
-  }
-
-  override def drained: CompletionStage[Void] = drainedRoot.thenApply(_ => null)
-
-  override def close(): Unit = guard.synchronized {
-    closed = true
-    shutdownIfDrained()
-  }
-
-  private def source(
-    fetchInfos: Seq[(TopicIdPartition, PartitionData)],
-    readWave: Boolean => Seq[(TopicIdPartition, LogReadResult)]
-  ): KafkaFetchWaveSource[Seq[(TopicIdPartition, LogReadResult)]] =
-    new KafkaFetchWaveSource[Seq[(TopicIdPartition, LogReadResult)]] {
-      override def read(initialWave: Boolean): CompletionStage[Seq[(TopicIdPartition, LogReadResult)]] = {
-        val results = Objects.requireNonNull(
-          readWave(initialWave),
-          "stock Kafka Fetch read wave").toVector
-        if (results.size != fetchInfos.size ||
-          !results.iterator.zip(fetchInfos.iterator).forall { case ((actual, _), (expected, _)) => actual == expected }) {
-          throw new IllegalStateException("stock Kafka Fetch wave changed request partition order or cardinality")
-        }
-        CompletableFuture.completedFuture(results)
-      }
-
-      override def subscribe(wakeup: Runnable): AutoCloseable = {
-        Objects.requireNonNull(wakeup, "wakeup")
-        val subscriptions = mutable.ArrayBuffer.empty[KafkaPartitionEventSubscription]
+    def wakeup(): Unit = lock.synchronized { signaled = true; if (started && !running && !done) queue() }
+    def deadline(): Unit = lock.synchronized { expired = true; if (started && !running && !done) queue() }
+    private def queue(): Unit = {
+      if (done || running || (!expired && waves > config.operationMaxRereads())) return
+      running = true; signaled = false
+      val initial = waves == 0
+      val finalWave = expired
+      waves += 1
+      try workers.execute(() => {
         try {
-          fetchInfos.foreach { case (partition, _) =>
-            val identity = new KafkaPartitionIdentity(
-              kafkaClusterId,
-              partition.topicId.toString,
-              partition.partition,
-              partition.topic)
-            storageManager.current(identity).ifPresent { storage =>
-              subscriptions += storage.subscribe(_ => wakeup.run())
-            }
+          val response = read(initial).toVector
+          if (response.size != infos.size || !response.iterator.zip(infos.iterator).forall { case ((actual, _), (expected, _)) => actual == expected }) {
+            throw new IllegalStateException("native Fetch wave changed partition order")
           }
-        } catch {
-          case failure: Throwable =>
-            subscriptions.reverseIterator.foreach(subscription => closeQuietly(subscription))
-            throw failure
-        }
-        new AutoCloseable {
-          override def close(): Unit =
-            subscriptions.reverseIterator.foreach(subscription => closeQuietly(subscription))
-        }
-      }
+          val size = response.foldLeft(0L) { case (total, (_, value)) => Math.addExact(total, value.info.records.sizeInBytes.toLong) }
+          if (size > byteBudget) throw new IllegalStateException("native Fetch wave exceeded its admitted byte budget")
+          val terminal = response.exists { case (_, value) => value.error != Errors.NONE || value.divergingEpoch.isPresent ||
+            value.preferredReadReplica.isPresent || value.info.delayedRemoteStorageFetch.isPresent }
+          lock.synchronized {
+            running = false
+            if (finalWave || terminal || size >= params.minBytes) finish(response, null)
+            else if (expired || signaled) queue()
+          }
+        } catch { case failure: Throwable => finish(null, failure) }
+      }) catch { case failure: Throwable => finish(null, failure) }
     }
-
-  private def shutdownIfDrained(): Unit = {
-    if (closed && operations.isEmpty) {
-      readExecutor.shutdown()
-      callbackExecutor.shutdown()
+    private def finish(value: Seq[(TopicIdPartition, LogReadResult)], failure: Throwable): Unit = {
+      val terminal = lock.synchronized { if (done) false else { done = true; if (timer != null) timer.cancel(false); true } }
+      if (!terminal) return
+      subscriptions.foreach(_.close())
+      guard.synchronized { operations -= this; ownedBytes = Math.subtractExact(ownedBytes, byteBudget); shutdownIfDrained() }
+      if (failure == null) result.complete(value) else result.completeExceptionally(failure)
     }
-  }
-
-  private def failed(
-    code: ErrorCode,
-    message: String
-  ): CompletionStage[Seq[(TopicIdPartition, LogReadResult)]] =
-    CompletableFuture.failedFuture(NereusKafkaExceptionMapper.map(
-      new NereusException(code, code == ErrorCode.BACKPRESSURE_REJECTED, message)))
-
-  private def threadFactory(prefix: String): ThreadFactory = {
-    val threadId = new AtomicInteger
-    task => {
-      val thread = new Thread(task, s"$prefix-${threadId.incrementAndGet()}")
-      thread.setDaemon(true)
-      thread
-    }
-  }
-
-  private def closeQuietly(subscription: KafkaPartitionEventSubscription): Unit = {
-    try subscription.close()
-    catch {
-      case _: Throwable =>
-    }
-  }
-
-  private val responseBytes = new ToIntFunction[Seq[(TopicIdPartition, LogReadResult)]] {
-    override def applyAsInt(results: Seq[(TopicIdPartition, LogReadResult)]): Int =
-      results.foldLeft(0) { case (total, (_, result)) =>
-        Math.addExact(total, result.info.records.sizeInBytes)
-      }
-  }
-
-  private val forceComplete = new Predicate[Seq[(TopicIdPartition, LogReadResult)]] {
-    override def test(results: Seq[(TopicIdPartition, LogReadResult)]): Boolean =
-      results.exists { case (_, result) =>
-        result.error != Errors.NONE ||
-          result.divergingEpoch.isPresent ||
-          result.preferredReadReplica.isPresent ||
-          result.info.delayedRemoteStorageFetch.isPresent
-      }
-  }
-
-  private final class TrackingExecutor(
-    threads: Int,
-    queueCapacity: Int,
-    factory: ThreadFactory
-  ) extends ThreadPoolExecutor(
-    threads,
-    threads,
-    0L,
-    TimeUnit.MILLISECONDS,
-    new ArrayBlockingQueue[Runnable](queueCapacity),
-    factory,
-    new ThreadPoolExecutor.AbortPolicy) {
-    val terminatedFuture = new CompletableFuture[Void]
-
-    override protected def terminated(): Unit = terminatedFuture.complete(null)
   }
 }

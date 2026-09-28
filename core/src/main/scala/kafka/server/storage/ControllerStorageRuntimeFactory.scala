@@ -26,6 +26,8 @@ import java.util.concurrent.{CompletableFuture, CompletionStage}
 
 /** Explicit controller-runtime injection point; no reflection or process-global registry is used. */
 trait ControllerStorageRuntimeFactory {
+  def metadataPolicy(config: kafka.server.KafkaConfig): Option[org.apache.kafka.metadata.nereus.NereusKafkaMetadataPolicyV1] = None
+
   def create(context: ControllerStorageRuntimeContext): ControllerStorageRuntime
 }
 

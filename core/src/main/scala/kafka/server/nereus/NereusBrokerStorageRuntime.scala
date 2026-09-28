@@ -17,175 +17,50 @@
 
 package kafka.server.nereus
 
-import com.nereusstream.api.StorageProfile
-import com.nereusstream.kafka.partition.KafkaPartitionStorageManager
-import com.nereusstream.kafka.recovery.KafkaRecoveryStateFactory
-import com.nereusstream.kafka.runtime.{DrainReason, NereusKafkaRuntime}
 import kafka.log.UnifiedLogFactory
-import kafka.log.nereus.{NereusListOffsetsLifecycle, NereusListOffsetsScanConfig, NereusTopicDeltaLifecycle, NereusUnifiedLogFactory}
+import kafka.log.nereus.{NereusListOffsetsLifecycle, NereusTopicDeltaLifecycle, NereusUnifiedLogFactory}
 import kafka.server.ReplicaManager
 import kafka.server.metadata.AsyncTopicDeltaLifecycle
 import kafka.server.storage.{BrokerStorageAppendExecutor, BrokerStorageDrainReason, BrokerStorageFetchExecutor, BrokerStorageRuntime, BrokerStorageRuntimeContext}
-import org.apache.kafka.server.config.NereusKafkaStorageConfig
 
 import java.time.Duration
-import java.util.Objects
 import java.util.concurrent.{CompletableFuture, CompletionStage, TimeUnit}
-import java.util.function.Function
 
-/** Binds one product-owned runtime to the exact BrokerServer and ReplicaManager that consume it. */
-final class NereusBrokerStorageRuntime(
-  context: BrokerStorageRuntimeContext,
-  delegate: NereusKafkaRuntime,
-  scanConfig: NereusListOffsetsScanConfig,
-  recoveryStateFactoryCreator: Function[ReplicaManager, KafkaRecoveryStateFactory] = null
-) extends BrokerStorageRuntime {
-  Objects.requireNonNull(context, "context")
-  Objects.requireNonNull(delegate, "delegate")
-  Objects.requireNonNull(scanConfig, "scanConfig")
-
+/** Owns the existing native request handoffs and one shared BK provider lifecycle. */
+final class NereusBrokerStorageRuntime(context: BrokerStorageRuntimeContext, provider: NereusKafkaOwnedProviderRuntime)
+  extends BrokerStorageRuntime {
   private val guard = new Object
-  private val storageManager: KafkaPartitionStorageManager = Objects.requireNonNull(
-    delegate.partitionStorageManager(),
-    "Nereus runtime partition manager")
-  private val logFactory = new NereusUnifiedLogFactory(context)
-  private val storageAppendExecutor = new NereusBrokerStorageAppendExecutor(
-    context.config.nereusKafkaStorageConfig.append(),
-    context.config.brokerId)
-  private val storageFetchExecutor = new NereusBrokerStorageFetchExecutor(
-    context.config.nereusKafkaStorageConfig.fetch(),
-    context.clusterId,
-    context.config.brokerId,
-    storageManager,
-    context.scheduler.scheduledExecutorService())
-  private var metadataLifecycle: MetadataLifecycle = _
-  private var draining = false
+  private val partitions = new NereusListOffsetsLifecycle(context, provider)
+  private val append = new NereusBrokerStorageAppendExecutor(context.config.nereusKafkaStorageConfig.append(), context.config.brokerId)
+  private val fetch = new NereusBrokerStorageFetchExecutor(context.config.nereusKafkaStorageConfig.fetch(), context.config.brokerId,
+    partitions, context.scheduler.scheduledExecutorService())
+  private val logs = new NereusUnifiedLogFactory(context)
+  private var replicaManager: ReplicaManager = _
+  private var lifecycle: NereusTopicDeltaLifecycle = _
   private var closed = false
-
-  override def start(): CompletionStage[Void] = {
-    guard.synchronized {
-      if (draining || closed) {
-        throw new IllegalStateException("Nereus broker storage runtime cannot start after drain or close")
-      }
-    }
-    Objects.requireNonNull(delegate.start(), "Nereus runtime start future")
+  override def start(): CompletionStage[Void] = provider.start()
+  override def unifiedLogFactory: UnifiedLogFactory = logs
+  override def appendExecutor: Option[BrokerStorageAppendExecutor] = Some(append)
+  override def fetchExecutor: Option[BrokerStorageFetchExecutor] = Some(fetch)
+  override def asyncTopicDeltaLifecycle(manager: ReplicaManager): Option[AsyncTopicDeltaLifecycle] = guard.synchronized {
+    if (closed) throw new IllegalStateException("native BK runtime is draining")
+    if (lifecycle == null) {
+      replicaManager = manager
+      lifecycle = new NereusTopicDeltaLifecycle(context.clusterId, context.config.brokerId, context.brokerEpochSupplier,
+        context.scheduler.scheduledExecutorService(), () => context.time.milliseconds(),
+        context.config.nereusKafkaStorageConfig.lifecycle().recoveryTimeout(), manager, partitions)
+    } else if (!(replicaManager eq manager)) throw new IllegalArgumentException("native BK runtime has another ReplicaManager")
+    Some(lifecycle)
   }
-
-  override def unifiedLogFactory: UnifiedLogFactory = logFactory
-
-  override def appendExecutor: Option[BrokerStorageAppendExecutor] = Some(storageAppendExecutor)
-
-  override def fetchExecutor: Option[BrokerStorageFetchExecutor] = Some(storageFetchExecutor)
-
-  override def asyncTopicDeltaLifecycle(replicaManager: ReplicaManager): Option[AsyncTopicDeltaLifecycle] = {
-    Objects.requireNonNull(replicaManager, "replicaManager")
-    guard.synchronized {
-      if (draining || closed) {
-        throw new IllegalStateException("Nereus metadata lifecycle cannot be created after drain or close")
-      }
-      if (metadataLifecycle == null) {
-        bindRecoveryStateFactory(replicaManager)
-        val partitionLifecycle = new NereusListOffsetsLifecycle(storageManager, scanConfig)
-        val topicLifecycle = new NereusTopicDeltaLifecycle(
-          context.clusterId,
-          context.config.brokerId,
-          context.brokerEpochSupplier,
-          context.scheduler.scheduledExecutorService(),
-          () => context.time.milliseconds(),
-          storageProfile(context.config.nereusKafkaStorageConfig.core().profile()),
-          context.config.nereusKafkaStorageConfig.lifecycle().recoveryTimeout(),
-          replicaManager,
-          partitionLifecycle)
-        metadataLifecycle = new MetadataLifecycle(replicaManager, partitionLifecycle, topicLifecycle)
-      } else if (!(metadataLifecycle.replicaManager eq replicaManager)) {
-        throw new IllegalArgumentException("Nereus broker runtime is already bound to a different ReplicaManager")
-      }
-      Some(metadataLifecycle.topicLifecycle)
-    }
-  }
-
   override def beginDrain(reason: BrokerStorageDrainReason): CompletionStage[Void] = {
-    Objects.requireNonNull(reason, "reason")
-    val partitionLifecycle = guard.synchronized {
-      draining = true
-      Option(metadataLifecycle).map(_.partitionLifecycle)
-    }
-    storageAppendExecutor.close()
-    storageFetchExecutor.close()
-    try {
-      Objects.requireNonNull(delegate.beginDrain(drainReason(reason)), "Nereus runtime drain future")
-    } finally {
-      partitionLifecycle.foreach(_.beginDrain())
-    }
+    guard.synchronized { closed = true }
+    partitions.beginDrain(); provider.fence(); append.close(); fetch.close()
+    CompletableFuture.completedFuture(null)
   }
-
-  override def awaitDrained(timeout: Duration): CompletionStage[Void] = {
-    Objects.requireNonNull(timeout, "timeout")
-    if (timeout.isNegative || timeout.isZero) {
-      throw new IllegalArgumentException("timeout must be positive")
-    }
-    val productDrained = Objects.requireNonNull(
-      delegate.awaitDrained(timeout),
-      "Nereus runtime drained future").toCompletableFuture
-    CompletableFuture.allOf(
-      storageAppendExecutor.drained.toCompletableFuture,
-      storageFetchExecutor.drained.toCompletableFuture,
-      productDrained
-    ).orTimeout(timeout.toMillis, TimeUnit.MILLISECONDS)
-  }
-
+  override def awaitDrained(timeout: Duration): CompletionStage[Void] =
+    CompletableFuture.allOf(append.drained.toCompletableFuture, fetch.drained.toCompletableFuture).orTimeout(timeout.toMillis, TimeUnit.MILLISECONDS)
   override def close(): Unit = {
-    val partitionLifecycle = guard.synchronized {
-      if (closed) {
-        return
-      }
-      draining = true
-      closed = true
-      Option(metadataLifecycle).map(_.partitionLifecycle)
-    }
-    partitionLifecycle.foreach(_.beginDrain())
-    try {
-      storageAppendExecutor.close()
-    } finally {
-      try {
-        storageFetchExecutor.close()
-      } finally {
-        delegate.close()
-      }
-    }
+    beginDrain(BrokerStorageDrainReason.BrokerShutdown)
+    provider.close()
   }
-
-  private def drainReason(reason: BrokerStorageDrainReason): DrainReason = reason match {
-    case BrokerStorageDrainReason.BrokerShutdown => DrainReason.BROKER_SHUTDOWN
-    case BrokerStorageDrainReason.StartupFailure => DrainReason.STARTUP_FAILURE
-    case BrokerStorageDrainReason.BrokerFenced => DrainReason.BROKER_FENCED
-    case BrokerStorageDrainReason.OperatorRequest => DrainReason.OPERATOR_REQUEST
-  }
-
-  private def storageProfile(profile: NereusKafkaStorageConfig.Profile): StorageProfile = profile match {
-    case NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT => StorageProfile.OBJECT_WAL_SYNC_OBJECT
-    case NereusKafkaStorageConfig.Profile.OBJECT_WAL_ASYNC_OBJECT => StorageProfile.OBJECT_WAL_ASYNC_OBJECT
-    case NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY => StorageProfile.BOOKKEEPER_WAL_ONLY
-    case NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT => StorageProfile.BOOKKEEPER_WAL_ASYNC_OBJECT
-    case NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_SYNC_OBJECT => StorageProfile.BOOKKEEPER_WAL_SYNC_OBJECT
-  }
-
-  private def bindRecoveryStateFactory(replicaManager: ReplicaManager): Unit = delegate match {
-    case deferred: NereusKafkaDeferredRuntime =>
-      if (recoveryStateFactoryCreator == null) {
-        throw new IllegalStateException(
-          "deferred Nereus runtime requires a ReplicaManager recovery-state factory creator")
-      }
-      deferred.bindRecoveryStateFactory(Objects.requireNonNull(
-        recoveryStateFactoryCreator.apply(replicaManager),
-        "Kafka recovery state factory creator returned null"))
-      deferred.bindReplicaManager(replicaManager)
-    case _ =>
-  }
-
-  private final class MetadataLifecycle(
-    val replicaManager: ReplicaManager,
-    val partitionLifecycle: NereusListOffsetsLifecycle,
-    val topicLifecycle: NereusTopicDeltaLifecycle
-  )
 }

@@ -17,7 +17,6 @@
 package kafka.log.nereus;
 
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.util.Scheduler;
@@ -32,144 +31,57 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
 
-/**
- * Ephemeral local shell used only to satisfy stock UnifiedLog state machinery. Its segment files are cache artifacts,
- * never partition truth. Durable append/read overrides are owned by {@link NereusUnifiedLog}.
- */
+/** Disposable native log machinery; authoritative bytes and successful appends belong to shared BK. */
 public final class NereusLocalLog extends LocalLog {
     private final NereusTransactionIndex transactionIndex;
-    private final NereusCanonicalLogState canonicalState;
     private StableAppend stableAppend;
 
     NereusLocalLog(
             File dir,
             LogConfig config,
             LogSegments segments,
-            long recoveryPoint,
-            LogOffsetMetadata nextOffsetMetadata,
             Scheduler scheduler,
             Time time,
             TopicPartition topicPartition,
-            LogDirFailureChannel logDirFailureChannel,
-            NereusTransactionIndex transactionIndex,
-            NereusCanonicalLogState canonicalState
-    ) {
-        super(
-                dir,
-                config,
-                segments,
-                recoveryPoint,
-                nextOffsetMetadata,
-                scheduler,
-                time,
-                topicPartition,
-                logDirFailureChannel);
-        this.transactionIndex = Objects.requireNonNull(
-                transactionIndex, "transactionIndex");
-        this.canonicalState = Objects.requireNonNull(
-                canonicalState, "canonicalState");
+            LogDirFailureChannel failures,
+            NereusTransactionIndex transactions) {
+        super(dir, config, segments, 0, new LogOffsetMetadata(0), scheduler, time, topicPartition, failures);
+        transactionIndex = transactions;
     }
 
-    void bindStableAppend(StableAppend exact) {
-        Objects.requireNonNull(exact, "exact");
-        if (stableAppend != null) {
-            throw new IllegalStateException("Nereus LocalLog stable append is already bound");
-        }
-        stableAppend = exact;
+    void bindStableAppend(StableAppend callback) {
+        if (stableAppend != null) throw new IllegalStateException("shared BK append is already bound");
+        stableAppend = Objects.requireNonNull(callback, "callback");
     }
 
     @Override
     public void append(long lastOffset, MemoryRecords records) throws IOException {
-        StableAppend exact = stableAppend;
-        if (exact == null) {
-            throw new IOException("Nereus LocalLog stable append is not bound");
-        }
-        exact.append(lastOffset, records);
-        updateLogEndOffset(lastOffset + 1);
+        if (stableAppend == null) throw new IOException("shared BK append is not bound");
+        stableAppend.append(lastOffset, records);
+        ((NereusLogSegment) segments().activeSegment()).observe(records);
+        updateLogEndOffset(Math.addExact(lastOffset, 1));
     }
 
     @Override
-    public org.apache.kafka.storage.internals.log.LogSegment roll(
-            Long expectedNextOffset
-    ) {
-        long newOffset = Math.max(
-                Objects.requireNonNull(expectedNextOffset, "expectedNextOffset"),
-                logEndOffset());
-        org.apache.kafka.storage.internals.log.LogSegment active =
-                segments().activeSegment();
-        if (active.baseOffset() == newOffset) {
-            return active;
-        }
-        if (newOffset < active.baseOffset() || segments().contains(newOffset)) {
-            throw new KafkaStorageException(
-                    "Invalid Nereus synthetic segment roll from "
-                            + active.baseOffset()
-                            + " to "
-                            + newOffset);
-        }
-        canonicalState.stageRoll(newOffset, time().milliseconds());
+    public org.apache.kafka.storage.internals.log.LogSegment roll(Long expectedNextOffset) {
+        long next = Math.max(Objects.requireNonNull(expectedNextOffset), logEndOffset());
+        if (segments().activeSegment().baseOffset() == next) return segments().activeSegment();
         try {
-            active.onBecomeInactiveSegment();
-            NereusLogSegment next = NereusLogSegment.open(
-                    dir(),
-                    newOffset,
-                    config(),
-                    time(),
-                    transactionIndex,
-                    canonicalState);
-            segments().add(next);
-            updateLogEndOffset(nextOffsetMetadata().messageOffset);
-            return next;
-        } catch (IOException | RuntimeException failure) {
-            canonicalState.cancelPendingRoll(newOffset);
-            throw new KafkaStorageException(
-                    "Failed to roll the Nereus synthetic segment at " + newOffset,
-                    failure);
+            segments().activeSegment().onBecomeInactiveSegment();
+            var segment = NereusLogSegment.open(dir(), next, config(), time(), transactionIndex);
+            segments().add(segment);
+            updateLogEndOffset(logEndOffset());
+            return segment;
+        } catch (IOException failure) {
+            throw new org.apache.kafka.common.errors.KafkaStorageException(
+                    "shared BK local shell roll failed", failure);
         }
-    }
-
-    void installCanonicalSegments(List<Long> baseOffsets) throws IOException {
-        Objects.requireNonNull(baseOffsets, "baseOffsets");
-        if (baseOffsets.isEmpty()
-                || baseOffsets.get(0) < 0
-                || baseOffsets.get(baseOffsets.size() - 1) > logEndOffset()) {
-            throw new IllegalArgumentException("invalid canonical segment bases");
-        }
-        IOException closeFailure = null;
-        for (org.apache.kafka.storage.internals.log.LogSegment segment :
-                segments().values()) {
-            try {
-                segment.close();
-            } catch (IOException failure) {
-                if (closeFailure == null) {
-                    closeFailure = failure;
-                } else {
-                    closeFailure.addSuppressed(failure);
-                }
-            }
-        }
-        if (closeFailure != null) {
-            throw closeFailure;
-        }
-        segments().clear();
-        for (long baseOffset : baseOffsets) {
-            segments().add(NereusLogSegment.open(
-                    dir(),
-                    baseOffset,
-                    config(),
-                    time(),
-                    transactionIndex,
-                    canonicalState));
-        }
-        updateLogEndOffset(nextOffsetMetadata().messageOffset);
     }
 
     @Override
-    public List<org.apache.kafka.storage.internals.log.LogSegment> truncateFullyAndStartAt(
-            long newOffset
-    ) {
+    public List<org.apache.kafka.storage.internals.log.LogSegment> truncateFullyAndStartAt(long offset) {
         transactionIndex.reset();
-        updateLogEndOffset(newOffset);
+        updateLogEndOffset(offset);
         return List.of();
     }
 

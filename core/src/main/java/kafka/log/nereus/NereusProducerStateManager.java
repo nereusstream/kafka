@@ -22,27 +22,18 @@ import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.storage.internals.log.AbortedTxn;
 import org.apache.kafka.storage.internals.log.AppendOrigin;
-import org.apache.kafka.storage.internals.log.BatchMetadata;
 import org.apache.kafka.storage.internals.log.CompletedTxn;
 import org.apache.kafka.storage.internals.log.ProducerAppendInfo;
-import org.apache.kafka.storage.internals.log.ProducerStateEntry;
 import org.apache.kafka.storage.internals.log.ProducerStateManager;
 import org.apache.kafka.storage.internals.log.ProducerStateManagerConfig;
 
-import com.nereusstream.kafka.checkpoint.KafkaProducerTransactionState;
-
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
-import java.util.OptionalLong;
 
-/** Stock producer state with NKC1 import/export and exact committed-batch replay instead of local snapshots. */
+/** Stock producer state loaded from the shared checkpoint and validated tail. */
 public final class NereusProducerStateManager extends ProducerStateManager {
-    private final TopicPartition topicPartition;
     private final NereusTransactionIndex transactionIndex;
 
     public NereusProducerStateManager(
@@ -51,10 +42,9 @@ public final class NereusProducerStateManager extends ProducerStateManager {
             int maxTransactionTimeoutMs,
             ProducerStateManagerConfig config,
             Time time,
-            NereusTransactionIndex transactionIndex
-    ) throws IOException {
+            NereusTransactionIndex transactionIndex)
+            throws IOException {
         super(topicPartition, logDir, maxTransactionTimeoutMs, config, time);
-        this.topicPartition = topicPartition;
         this.transactionIndex = transactionIndex;
     }
 
@@ -63,59 +53,62 @@ public final class NereusProducerStateManager extends ProducerStateManager {
         transactionIndex.reset();
     }
 
-    public void restoreCanonical(KafkaProducerTransactionState state) throws IOException {
-        state.requireCheckpointOffset(state.mapEndOffset());
-        if (!activeProducers().isEmpty()
-                || firstUndecidedOffset().isPresent()
-                || !transactionIndex.isEmpty()) {
-            throw new IllegalStateException(
-                    "NKC1 producer state can only be imported into a fresh manager");
-        }
-        for (KafkaProducerTransactionState.ProducerState producer : state.producers()) {
-            ProducerStateEntry imported = ProducerStateEntry.fromBatchMetadata(
+    public void loadSharedState(com.nereusstream.kafka.bookkeeper.commit.KafkaCoherentProtocolSnapshotV1 state)
+            throws IOException {
+        resetForRecovery(state.root().frontiers().trimStartOffset());
+        for (var producer : state.committedProducerState().producers().values()) {
+            var ongoing = state.transactionState().ongoingTransactions().get(producer.producerId());
+            var batches = producer.recentBatches().stream()
+                    .map(batch -> new org.apache.kafka.storage.internals.log.BatchMetadata(
+                            batch.identity().lastSequence(),
+                            batch.endOffsetExclusive() - 1,
+                            Math.toIntExact(batch.endOffsetExclusive() - batch.startOffset() - 1),
+                            batch.maxTimestamp()))
+                    .toList();
+            loadProducerEntry(org.apache.kafka.storage.internals.log.ProducerStateEntry.fromBatchMetadata(
                     producer.producerId(),
                     producer.producerEpoch(),
                     producer.coordinatorEpoch(),
                     producer.lastTimestamp(),
-                    producer.currentTransactionFirstOffset(),
-                    producer.batches().stream()
-                            .map(NereusProducerStateManager::importBatch)
-                            .toList());
-            loadProducerEntry(imported);
+                    ongoing == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(ongoing.firstOffset()),
+                    batches));
         }
-        for (KafkaProducerTransactionState.AbortedTransaction transaction
-                : state.abortedTransactions()) {
+        long end = state.root().frontiers().durableEndOffset();
+        for (var transaction : state.transactionState().abortedTransactions()) {
+            long stable = transaction.markerEndOffsetExclusive();
+            for (var other : state.transactionState().ongoingTransactions().values()) {
+                if (other.firstOffset() < transaction.markerEndOffsetExclusive())
+                    stable = Math.min(stable, other.firstOffset());
+            }
+            for (var other : state.transactionState().completedTransactions()) {
+                if (other.producerId() != transaction.producerId()
+                        && other.firstOffset() < transaction.markerEndOffsetExclusive()
+                        && other.markerEndOffsetExclusive() > transaction.markerEndOffsetExclusive())
+                    stable = Math.min(stable, other.firstOffset());
+            }
             transactionIndex.append(new AbortedTxn(
                     transaction.producerId(),
                     transaction.firstOffset(),
-                    transaction.lastOffset(),
-                    transaction.lastStableOffset()));
+                    transaction.markerEndOffsetExclusive() - 1,
+                    stable));
         }
-        updateMapEndOffset(state.mapEndOffset());
-        KafkaProducerTransactionState imported = exportCanonical(state.mapEndOffset());
-        if (!imported.equals(state)) {
-            throw new IllegalArgumentException(
-                    "NKC1 producer state cannot be represented exactly by the stock manager");
-        }
+        updateMapEndOffset(end);
+        onHighWatermarkUpdated(end);
     }
 
     public void replayBatch(RecordBatch batch) throws IOException {
         if (batch.baseOffset() != mapEndOffset()) {
-            throw new IllegalArgumentException(
-                    "Kafka producer replay batch does not start at map end");
+            throw new IllegalArgumentException("Kafka producer replay batch does not start at map end");
         }
         if (batch.hasProducerId()) {
-            ProducerAppendInfo appendInfo = prepareUpdate(
-                    batch.producerId(), AppendOrigin.REPLICATION);
-            Optional<CompletedTxn> completed = appendInfo.append(
-                    batch, Optional.empty(), (short) 0);
+            ProducerAppendInfo appendInfo = prepareUpdate(batch.producerId(), AppendOrigin.REPLICATION);
+            Optional<CompletedTxn> completed = appendInfo.append(batch, Optional.empty(), (short) 0);
             update(appendInfo);
             if (completed.isPresent()) {
                 CompletedTxn transaction = completed.orElseThrow();
                 long lastStableOffset = lastStableOffset(transaction);
                 if (transaction.isAborted()) {
-                    transactionIndex.append(new AbortedTxn(
-                            transaction, lastStableOffset));
+                    transactionIndex.append(new AbortedTxn(transaction, lastStableOffset));
                 }
                 completeTxn(transaction);
             }
@@ -123,101 +116,19 @@ public final class NereusProducerStateManager extends ProducerStateManager {
         updateMapEndOffset(Math.addExact(batch.lastOffset(), 1));
     }
 
-    public KafkaProducerTransactionState freezeCanonical(long stableEndOffset) {
-        if (mapEndOffset() != stableEndOffset) {
-            throw new IllegalStateException(
-                    "Kafka producer map end does not match stable end");
-        }
-        onHighWatermarkUpdated(stableEndOffset);
-        return exportCanonical(stableEndOffset);
-    }
-
-    public KafkaProducerTransactionState exportCanonical(long expectedMapEndOffset) {
-        if (mapEndOffset() != expectedMapEndOffset) {
-            throw new IllegalArgumentException(
-                    "Kafka producer map end does not match checkpoint offset");
-        }
-        ArrayList<KafkaProducerTransactionState.ProducerState> producers =
-                new ArrayList<>();
-        activeProducers().entrySet().stream()
-                .sorted(Map.Entry.comparingByKey())
-                .forEach(entry -> producers.add(exportProducer(entry.getValue())));
-        ArrayList<KafkaProducerTransactionState.OpenTransaction> open =
-                new ArrayList<>();
-        for (KafkaProducerTransactionState.ProducerState producer : producers) {
-            producer.currentTransactionFirstOffset().ifPresent(firstOffset ->
-                    open.add(new KafkaProducerTransactionState.OpenTransaction(
-                            producer.producerId(), firstOffset, OptionalLong.empty())));
-        }
-        open.sort(Comparator
-                .comparingLong(KafkaProducerTransactionState.OpenTransaction::firstOffset)
-                .thenComparingLong(
-                        KafkaProducerTransactionState.OpenTransaction::producerId));
-        List<KafkaProducerTransactionState.AbortedTransaction> aborted =
-                transactionIndex.allAbortedTxns().stream()
-                        .map(transaction ->
-                                new KafkaProducerTransactionState.AbortedTransaction(
-                                        transaction.version(),
-                                        transaction.producerId(),
-                                        transaction.firstOffset(),
-                                        transaction.lastOffset(),
-                                        transaction.lastStableOffset()))
-                        .toList();
-        return new KafkaProducerTransactionState(
-                expectedMapEndOffset, producers, open, aborted);
-    }
-
-    public List<AbortedTxn> collectAbortedTransactions(
-            long fetchOffset,
-            long upperBoundOffset
-    ) {
-        return transactionIndex.collectAbortedTxns(
-                fetchOffset, upperBoundOffset).abortedTransactions();
+    public List<AbortedTxn> collectAbortedTransactions(long fetchOffset, long upperBoundOffset) {
+        return transactionIndex
+                .collectAbortedTxns(fetchOffset, upperBoundOffset)
+                .abortedTransactions();
     }
 
     @Override
     public void takeSnapshot() {
-        // The partition checkpoint coordinator owns durable NKC1 publication.
+        // Cold recovery installs the durable shared checkpoint and its validated tail.
     }
 
     @Override
     public Optional<File> takeSnapshot(boolean sync) {
         return Optional.empty();
-    }
-
-    private static KafkaProducerTransactionState.ProducerState exportProducer(
-            ProducerStateEntry producer
-    ) {
-        List<KafkaProducerTransactionState.BatchMetadata> batches =
-                producer.batchMetadata().stream()
-                        .map(NereusProducerStateManager::exportBatch)
-                        .toList();
-        return new KafkaProducerTransactionState.ProducerState(
-                producer.producerId(),
-                producer.producerEpoch(),
-                producer.coordinatorEpoch(),
-                producer.lastTimestamp(),
-                producer.currentTxnFirstOffset(),
-                batches);
-    }
-
-    private static KafkaProducerTransactionState.BatchMetadata exportBatch(
-            BatchMetadata batch
-    ) {
-        return new KafkaProducerTransactionState.BatchMetadata(
-                batch.lastSeq(),
-                batch.lastOffset(),
-                batch.offsetDelta(),
-                batch.timestamp());
-    }
-
-    private static BatchMetadata importBatch(
-            KafkaProducerTransactionState.BatchMetadata batch
-    ) {
-        return new BatchMetadata(
-                batch.lastSequence(),
-                batch.lastOffset(),
-                batch.offsetDelta(),
-                batch.timestamp());
     }
 }

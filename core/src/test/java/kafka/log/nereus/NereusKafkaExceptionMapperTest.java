@@ -17,17 +17,10 @@
 
 package kafka.log.nereus;
 
-import org.apache.kafka.common.errors.ApiException;
-import org.apache.kafka.common.errors.CorruptRecordException;
 import org.apache.kafka.common.errors.FencedLeaderEpochException;
 import org.apache.kafka.common.errors.InvalidRequestException;
 import org.apache.kafka.common.errors.KafkaStorageException;
-import org.apache.kafka.common.errors.OffsetOutOfRangeException;
-import org.apache.kafka.common.errors.ThrottlingQuotaExceededException;
 import org.apache.kafka.common.errors.TimeoutException;
-
-import com.nereusstream.api.ErrorCode;
-import com.nereusstream.api.NereusException;
 
 import org.junit.jupiter.api.Test;
 
@@ -38,39 +31,15 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 
 class NereusKafkaExceptionMapperTest {
     @Test
-    void preservesKafkaExceptions() {
-        ApiException failure = new InvalidRequestException("already mapped");
-
-        assertSame(failure, NereusKafkaExceptionMapper.map(failure));
-    }
-
-    @Test
-    void mapsFencingAndOffsetFailuresWithoutWeakeningThem() {
-        assertInstanceOf(FencedLeaderEpochException.class, map(ErrorCode.FENCED_APPEND));
-        assertInstanceOf(OffsetOutOfRangeException.class, map(ErrorCode.OFFSET_TRIMMED));
-    }
-
-    @Test
-    void mapsWrappedTimeoutAndCapacityFailures() {
-        ApiException timeout = NereusKafkaExceptionMapper.map(
-                new CompletionException(nereus(ErrorCode.TIMEOUT)));
-
-        assertInstanceOf(TimeoutException.class, timeout);
-        assertInstanceOf(ThrottlingQuotaExceededException.class, map(ErrorCode.BACKPRESSURE_REJECTED));
-    }
-
-    @Test
-    void mapsIntegrityAndInternalStorageFailures() {
-        assertInstanceOf(CorruptRecordException.class, map(ErrorCode.OBJECT_CHECKSUM_MISMATCH));
-        assertInstanceOf(KafkaStorageException.class, map(ErrorCode.METADATA_LIMIT_EXCEEDED));
-        assertInstanceOf(KafkaStorageException.class, NereusKafkaExceptionMapper.map(new IllegalStateException("boom")));
-    }
-
-    private static ApiException map(ErrorCode code) {
-        return NereusKafkaExceptionMapper.map(nereus(code));
-    }
-
-    private static NereusException nereus(ErrorCode code) {
-        return new NereusException(code, true, code.name());
+    void preservesNativeErrorsAndUnwrapsActualStorageFailures() {
+        var fenced = new FencedLeaderEpochException("stale");
+        assertSame(fenced, NereusKafkaExceptionMapper.map(new CompletionException(fenced)));
+        assertInstanceOf(
+                TimeoutException.class, NereusKafkaExceptionMapper.map(new java.util.concurrent.TimeoutException()));
+        assertInstanceOf(
+                InvalidRequestException.class, NereusKafkaExceptionMapper.map(new IllegalArgumentException("invalid")));
+        assertInstanceOf(
+                KafkaStorageException.class,
+                NereusKafkaExceptionMapper.map(new IllegalStateException("physical failure")));
     }
 }

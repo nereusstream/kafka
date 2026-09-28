@@ -1102,8 +1102,29 @@ project(':core') {
     sourceSets.main.scala.exclude 'kafka/server/nereus/**'
     sourceSets.test.java.exclude 'kafka/server/nereus/**'
     sourceSets.test.scala.exclude '**/kafka/server/nereus/**'
+    sourceSets.test.java.exclude 'kafka/server/nsip/**'
+    sourceSets.test.scala.exclude '**/kafka/server/nsip/**'
   }
   // Nereus inject end: keep stock builds independent from unpublished development artifacts
+
+  if (nereusDevelopmentEnabled) {
+    test { filter { excludeTestsMatching 'kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest' } }
+    tasks.register('nereusBookKeeperOwnerRelocationRealTest', Test) {
+      group = 'verification'
+      description = 'Exercises actual native Kafka Controller/Brokers over explicitly supplied real BK/Oxia backends.'
+      testClassesDirs = sourceSets.test.output.classesDirs
+      classpath = sourceSets.test.runtimeClasspath
+      useJUnitPlatform()
+      maxParallelForks = 1
+      filter { includeTestsMatching 'kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest' }
+      dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain'
+      outputs.upToDateWhen { false }
+      doFirst {
+        systemProperty 'nereus.nsip.bkUri', providers.gradleProperty('v2M2BookKeeperMetadataServiceUri').get()
+        systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+      }
+    }
+  }
 
   // scaladoc generation is configured at the sub-module level with an artifacts
   // block (cf. see streams-scala). If scaladoc generation is invoked explicitly
@@ -1191,35 +1212,24 @@ project(':core') {
 
     // Nereus inject start: exact product-owned adapter boundary
     if (nereusDevelopmentEnabled) {
-      implementation("com.nereusstream:nereus-kafka-adapter:${nereusDevelopmentVersion.get()}") {
-        changing = true
-        // The host selects the exact SLF4J -> Log4j provider above. A provider
-        // from a storage dependency must not cross the adapter boundary.
-        exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
+      ['nereus-kafka-bookkeeper', 'nereus-storage-bookkeeper', 'nereus-metadata-oxia'].each { moduleName ->
+        implementation("com.nereusstream:${moduleName}:${nereusDevelopmentVersion.get()}") {
+          changing = true
+          exclude group: 'org.apache.bookkeeper', module: 'circe-checksum'
+          exclude group: 'org.apache.bookkeeper', module: 'cpu-affinity'
+          exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
+          exclude group: 'org.apache.kafka', module: 'kafka-clients'
+        }
       }
-      implementation("com.nereusstream:nereus-bookkeeper:${nereusDevelopmentVersion.get()}") {
-        changing = true
-        // BookKeeper publishes these Java archives with NAR packaging. Resolve the same
-        // archives explicitly as JARs so Kafka's -Werror compiler does not reject the
-        // otherwise valid classes solely because their classpath entries end in .nar.
+      implementation("org.apache.bookkeeper:bookkeeper-server:4.18.0") {
         exclude group: 'org.apache.bookkeeper', module: 'circe-checksum'
         exclude group: 'org.apache.bookkeeper', module: 'cpu-affinity'
         exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
       }
       implementation "org.apache.bookkeeper:circe-checksum:4.18.0@jar"
       implementation "org.apache.bookkeeper:cpu-affinity:4.18.0@jar"
-      implementation "org.slf4j:slf4j-api:2.0.17"
-      implementation("com.nereusstream:nereus-core:${nereusDevelopmentVersion.get()}") {
-        changing = true
-      }
-      implementation("com.nereusstream:nereus-materialization:${nereusDevelopmentVersion.get()}") {
-        changing = true
-      }
-      implementation("com.nereusstream:nereus-metadata-oxia:${nereusDevelopmentVersion.get()}") {
-        changing = true
-      }
-      implementation("com.nereusstream:nereus-object-store:${nereusDevelopmentVersion.get()}") {
-        changing = true
+      configurations.configureEach {
+        resolutionStrategy.force "com.nereusstream:nereus-domain:${nereusN1DomainVersion}"
       }
     }
     // Nereus inject end: exact product-owned adapter boundary

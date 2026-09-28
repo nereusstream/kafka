@@ -184,8 +184,10 @@ public record NereusKafkaStorageConfig(
         requirePresent(core.cluster(), NereusKafkaConfigs.CLUSTER_CONFIG);
         requirePresent(core.oxiaServiceAddress(), NereusKafkaConfigs.OXIA_SERVICE_ADDRESS_CONFIG);
         requirePresent(core.cacheDir(), NereusKafkaConfigs.CACHE_DIR_CONFIG);
-        requirePresent(core.objectProvider(), NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG);
-        requirePresent(core.objectBucket(), NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
+        if (core.profile() != Profile.BOOKKEEPER_WAL_ONLY) {
+            requirePresent(core.objectProvider(), NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG);
+            requirePresent(core.objectBucket(), NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
+        }
         if (core.profile().usesBookKeeper()) {
             requirePresent(
                     core.bookKeeperMetadataServiceUri(),
@@ -333,13 +335,6 @@ public record NereusKafkaStorageConfig(
                 requiredConfiguredText(
                         config,
                         NereusKafkaConfigs.BOOKKEEPER_PROVIDER_SCOPE_SHA256_CONFIG),
-                config.getInt(NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_PREFIX_BITS_CONFIG),
-                requiredLong(
-                        config,
-                        NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_PREFIX_VALUE_CONFIG),
-                requiredConfiguredText(
-                        config,
-                        NereusKafkaConfigs.BOOKKEEPER_LEDGER_ID_RESERVATION_ID_CONFIG),
                 config.getInt(NereusKafkaConfigs.BOOKKEEPER_ENSEMBLE_SIZE_CONFIG),
                 config.getInt(NereusKafkaConfigs.BOOKKEEPER_WRITE_QUORUM_SIZE_CONFIG),
                 config.getInt(NereusKafkaConfigs.BOOKKEEPER_ACK_QUORUM_SIZE_CONFIG),
@@ -374,12 +369,6 @@ public record NereusKafkaStorageConfig(
                         config,
                         NereusKafkaConfigs.BOOKKEEPER_RETENTION_SCAN_INTERVAL_MS_CONFIG),
                 config.getInt(NereusKafkaConfigs.BOOKKEEPER_RETENTION_PAGE_SIZE_CONFIG),
-                config.getLong(NereusKafkaConfigs.BOOKKEEPER_READINESS_EPOCH_CONFIG),
-                requiredConfiguredText(
-                        config,
-                        NereusKafkaConfigs.BOOKKEEPER_READINESS_SHA256_CONFIG),
-                config.getInt(
-                        NereusKafkaConfigs.BOOKKEEPER_PERSISTENT_BROKER_COUNT_CONFIG),
                 new NereusKafkaBookKeeperConfig.LedgerGc(
                         config.getInt(
                                 NereusKafkaConfigs
@@ -400,14 +389,6 @@ public record NereusKafkaStorageConfig(
                                 NereusKafkaConfigs.BOOKKEEPER_GC_ENABLED_CONFIG),
                         config.getBoolean(
                                 NereusKafkaConfigs.BOOKKEEPER_GC_DRY_RUN_CONFIG)));
-    }
-
-    private static long requiredLong(AbstractConfig config, String name) {
-        Long value = config.getLong(name);
-        if (value == null) {
-            throw invalid(name, "must be configured by a BookKeeper profile");
-        }
-        return value;
     }
 
     private static Duration multiply(Duration value, int multiplier) {

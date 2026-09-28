@@ -955,6 +955,11 @@ public class ReplicationControlManager {
         NereusTopicProfileResolverV1.Resolution resolution
     ) {
         Map<String, String> creationConfigs = translateCreationConfigs(topic.configs(), true);
+        ConfigEntry minIsr = configurationControl.computeEffectiveTopicConfigs(creationConfigs).get(MIN_IN_SYNC_REPLICAS_CONFIG);
+        if (minIsr == null || !"1".equals(minIsr.value())) {
+            return NereusTopicCandidateResult.failure(new ApiError(Errors.INVALID_CONFIG,
+                MIN_IN_SYNC_REPLICAS_CONFIG + " must resolve to 1 for Nereus single-owner storage."));
+        }
         Map<Integer, PartitionRegistration> newParts = new HashMap<>();
         if (!topic.assignments().isEmpty()) {
             if (topic.replicationFactor() != -1) {
@@ -1015,6 +1020,10 @@ public class ReplicationControlManager {
             int numPartitions = topic.numPartitions() == -1 ? defaultNumPartitions : topic.numPartitions();
             short replicationFactor = topic.replicationFactor() == -1 ?
                 defaultReplicationFactor : topic.replicationFactor();
+            if (replicationFactor != 1) {
+                return NereusTopicCandidateResult.failure(new ApiError(Errors.INVALID_REPLICATION_FACTOR,
+                    "Replication factor must resolve to 1 for Nereus single-owner storage."));
+            }
             try {
                 TopicAssignment topicAssignment = clusterControl.replicaPlacer().place(new PlacementSpec(
                     0, numPartitions, replicationFactor), clusterDescriber);
@@ -2402,6 +2411,9 @@ public class ReplicationControlManager {
         PartitionAssignment assignment,
         OptionalInt replicationFactor
     ) {
+        if (featureControl.isNereusStorageFeatureEnabled() && assignment.replicas().size() != 1) {
+            throw new InvalidReplicaAssignmentException("Nereus single-owner assignments must contain exactly one broker.");
+        }
         if (assignment.replicas().isEmpty()) {
             throw new InvalidReplicaAssignmentException("The manual partition " +
                 "assignment includes an empty replica list.");
@@ -2487,6 +2499,17 @@ public class ReplicationControlManager {
                 throw new RuntimeException("Partition " + topicIdPart +
                     " existed in isrMembers, but not in the partitions map.");
             }
+            if (isNereusBookKeeperTopic(topic) && (partition.leader == NO_LEADER
+                    || !isAcceptableLeader.test(partition.leader))) {
+                OptionalInt replacement = clusterControl.brokerRegistrations().keySet().stream()
+                    .filter(isAcceptableLeader::test)
+                    .mapToInt(Integer::intValue).min();
+                if (replacement.isPresent()) {
+                    nereusOwnerAssignment(topicIdPart, partition, replacement.getAsInt(), isAcceptableLeader)
+                        .ifPresent(records::add);
+                    continue;
+                }
+            }
             PartitionChangeBuilder builder = new PartitionChangeBuilder(
                 partition,
                 topicIdPart.topicId(),
@@ -2528,6 +2551,33 @@ public class ReplicationControlManager {
                 log.info("{}: changing {} partition(s)", context, records.size() - oldSize);
             }
         }
+    }
+
+    private boolean isNereusBookKeeperTopic(TopicControlInfo topic) {
+        return featureControl.isNereusStorageFeatureEnabled() && topic.nereusAggregate().filter(aggregate ->
+            aggregate.storageProfile() != com.nereusstream.domain.aggregate.StorageProfileV1.OBJECT_WAL).isPresent();
+    }
+
+    /** Changes the actual sole replica in one native record; the new broker gates requests on fenced storage recovery. */
+    private Optional<ApiMessageAndVersion> nereusOwnerAssignment(
+        TopicIdPartition topicPartition, PartitionRegistration partition, int brokerId, IntPredicate acceptable
+    ) {
+        if (partition.replicas.length != 1) {
+            throw new IllegalStateException("Nereus shared BK partition does not have RF=1");
+        }
+        Uuid targetDirectory = clusterDescriber.defaultDir(brokerId);
+        IntPredicate targetIsOnline = candidate -> acceptable.test(candidate)
+            && clusterControl.hasOnlineDir(candidate, targetDirectory);
+        return new PartitionChangeBuilder(partition, topicPartition.topicId(), topicPartition.partitionId(),
+            targetIsOnline, featureControl.metadataVersionOrThrow(), 1)
+            .setTargetReplicas(List.of(brokerId))
+            .setTargetIsr(List.of(brokerId))
+            .setTargetAdding(List.of())
+            .setTargetRemoving(List.of())
+            .setTargetLeaderRecoveryState(LeaderRecoveryState.RECOVERING)
+            .setEligibleLeaderReplicasEnabled(false)
+            .setDefaultDirProvider(clusterDescriber)
+            .build();
     }
 
     ControllerResult<AlterPartitionReassignmentsResponseData>
@@ -2668,6 +2718,17 @@ public class ReplicationControlManager {
         validateManualPartitionAssignment(targetAssignment, OptionalInt.empty());
         if (!allowRFChange) {
             validatePartitionReplicationFactorUnchanged(part, target);
+        }
+
+        if (isNereusBookKeeperTopic(topics.get(tp.topicId()))) {
+            int newOwner = target.replicas().get(0);
+            if (!clusterControl.isActive(newOwner)) {
+                throw new InvalidReplicaAssignmentException("Nereus replacement owner must be active and outside controlled shutdown.");
+            }
+            if (part.replicas.length == 1 && part.replicas[0] == newOwner) {
+                return Optional.empty();
+            }
+            return nereusOwnerAssignment(tp, part, newOwner, clusterControl::isActive);
         }
 
         List<Integer> currentReplicas = Replicas.toList(part.replicas);

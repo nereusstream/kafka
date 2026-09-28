@@ -725,7 +725,7 @@ public class ReplicationControlManagerTest {
     }
 
     @Test
-    public void testNereusStorageFeatureCreatesAggregateWithNativeReplicaSemantics() {
+    public void testNereusStorageFeatureRequiresOneReplicaAndMinIsrOne() {
         ReplicationControlTestContext ctx =
             new ReplicationControlTestContext.Builder().
                 setIsNereusStorageEnabled(true).
@@ -733,16 +733,22 @@ public class ReplicationControlManagerTest {
         ctx.registerBrokers(0, 1);
         ctx.unfenceBrokers(0, 1);
 
-        CreatableTopicResult result = ctx.createTestTopic("rf-two", 1, (short) 2, NONE.code());
-        assertEquals(2, ctx.replicationControl.getPartition(result.topicId(), 0).replicas.length);
+        ctx.createTestTopic("rf-two", 1, (short) 2, INVALID_REPLICATION_FACTOR.code());
+        CreatableTopicResult result = ctx.createTestTopic("rf-one", 1, (short) 1, NONE.code());
+        assertEquals(1, ctx.replicationControl.getPartition(result.topicId(), 0).replicas.length);
         assertTrue(ctx.replicationControl.getTopic(result.topicId()).nereusAggregate().isPresent());
 
-        CreatableTopicResult manual = ctx.createTestTopic(
+        ctx.createTestTopic(
             "manual-rf-two",
             new int[][] {new int[] {0, 1}},
-            Map.of(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, "2"),
+            Map.of(),
+            Errors.INVALID_REPLICA_ASSIGNMENT.code());
+        ctx.createTestTopic("min-isr-two", new int[][] {new int[] {0}},
+            Map.of(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, "2"), Errors.INVALID_CONFIG.code());
+        CreatableTopicResult manual = ctx.createTestTopic("manual-rf-one",
+            new int[][] {new int[] {0}}, Map.of(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, "1"),
             NONE.code());
-        assertEquals(2, manual.replicationFactor());
+        assertEquals(1, manual.replicationFactor());
         assertTrue(ctx.replicationControl.getTopic(manual.topicId()).nereusAggregate().isPresent());
     }
 
@@ -756,7 +762,7 @@ public class ReplicationControlManagerTest {
         CreatableTopic topic = new CreatableTopic()
             .setName("explicit-profile")
             .setNumPartitions(2)
-            .setReplicationFactor((short) 2);
+            .setReplicationFactor((short) 1);
         topic.configs().add(new CreateTopicsRequestData.CreatableTopicConfig()
             .setName(NereusTopicProfileResolverV1.PROFILE_CONFIG)
             .setValue("OBJECT_WAL"));
@@ -850,10 +856,10 @@ public class ReplicationControlManagerTest {
         CreatableTopic topic = new CreatableTopic()
             .setName("config-derived")
             .setNumPartitions(1)
-            .setReplicationFactor((short) 2);
+            .setReplicationFactor((short) 1);
         topic.configs().add(new CreateTopicsRequestData.CreatableTopicConfig()
             .setName(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG)
-            .setValue("2"));
+            .setValue("1"));
         request.topics().add(topic);
 
         ControllerResult<CreateTopicsResponseData> result = ctx.replicationControl.createTopics(

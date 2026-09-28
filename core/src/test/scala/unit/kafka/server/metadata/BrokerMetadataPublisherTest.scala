@@ -50,7 +50,7 @@ import org.junit.jupiter.api.Assertions.{assertEquals, assertNotNull, assertTrue
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 import org.mockito.ArgumentMatchers.{any, same}
 import org.mockito.Mockito
-import org.mockito.Mockito.{doThrow, mock, never, verify}
+import org.mockito.Mockito.{doThrow, mock, never, times, verify, when}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
 
@@ -160,6 +160,15 @@ class BrokerMetadataPublisherTest {
       .setLeaderEpoch(6)
       .setReplicas(util.List.of(0))
       .setIsr(util.List.of(0)))
+    def recovered(topic: String, id: Uuid, epoch: Int): Unit = {
+      val partition = mock(classOf[Partition])
+      when(partition.topicId).thenReturn(Some(id))
+      when(partition.currentNereusRecoveredState(epoch)).thenReturn(java.util.Optional.of(
+        mock(classOf[org.apache.kafka.storage.internals.log.LeaderEpochAwareRecoveryState])))
+      when(replicaManager.onlinePartition(new TopicPartition(topic, 0))).thenReturn(Some(partition))
+    }
+    recovered(Topic.GROUP_METADATA_TOPIC_NAME, groupTopicId, 5)
+    recovered(Topic.TRANSACTION_STATE_TOPIC_NAME, transactionTopicId, 6)
     val image = delta.apply(new MetadataProvenance(10, 1, 1000, true))
 
     publisher.onMetadataUpdate(
@@ -185,6 +194,23 @@ class BrokerMetadataPublisherTest {
     verify(groupCoordinator).onElection(0, 5)
     leaderReady.get().apply(new TopicPartition(Topic.TRANSACTION_STATE_TOPIC_NAME, 0), 6)
     verify(txnCoordinator).onElection(0, 6)
+    val staleReady = leaderReady.get()
+    val replacementId = Uuid.randomUuid()
+    val replacement = new MetadataDelta(image)
+    replacement.replay(new RemoveTopicRecord().setTopicId(groupTopicId))
+    replacement.replay(new TopicRecord().setName(Topic.GROUP_METADATA_TOPIC_NAME).setTopicId(replacementId))
+    replacement.replay(new PartitionRecord()
+      .setTopicId(replacementId).setPartitionId(0).setLeader(0).setLeaderEpoch(5)
+      .setReplicas(util.List.of(0)).setIsr(util.List.of(0)))
+    recovered(Topic.GROUP_METADATA_TOPIC_NAME, replacementId, 5)
+    val replacementImage = replacement.apply(new MetadataProvenance(11, 1, 1001, true))
+    publisher.onMetadataUpdate(replacement, replacementImage, LogDeltaManifest.newBuilder()
+      .provenance(replacementImage.provenance()).leaderAndEpoch(LeaderAndEpoch.UNKNOWN)
+      .numBatches(1).elapsedNs(100).numBytes(42).build())
+    staleReady.apply(new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, 0), 5)
+    verify(groupCoordinator, times(1)).onElection(0, 5)
+    leaderReady.get().apply(new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, 0), 5)
+    verify(groupCoordinator, times(2)).onElection(0, 5)
     lifecycleCompletion.complete(null)
   }
 

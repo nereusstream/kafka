@@ -60,6 +60,7 @@ public final class NereusKafkaConfigs {
     public static final String OBJECT_REGION_CONFIG = "nereus.kafka.storage.object.region";
     public static final String OBJECT_PATH_STYLE_ACCESS_CONFIG =
             "nereus.kafka.storage.object.path.style.access";
+    public static final String BOOKKEEPER_CAPABILITY_FILE_CONFIG = "nereus.kafka.bookkeeper.capability.file";
     public static final String BOOKKEEPER_METADATA_SERVICE_URI_CONFIG =
             "nereus.kafka.storage.bookkeeper.metadata.service.uri";
     public static final String BOOKKEEPER_DEPLOYMENT_ID_CONFIG =
@@ -68,13 +69,6 @@ public final class NereusKafkaConfigs {
             "nereus.kafka.storage.bookkeeper.cluster.alias";
     public static final String BOOKKEEPER_PROVIDER_SCOPE_SHA256_CONFIG =
             "nereus.kafka.storage.bookkeeper.provider.scope.sha256";
-    public static final String BOOKKEEPER_LEDGER_ID_PREFIX_BITS_CONFIG =
-            "nereus.kafka.storage.bookkeeper.ledger.id.prefix.bits";
-    public static final int BOOKKEEPER_LEDGER_ID_PREFIX_BITS_DEFAULT = 12;
-    public static final String BOOKKEEPER_LEDGER_ID_PREFIX_VALUE_CONFIG =
-            "nereus.kafka.storage.bookkeeper.ledger.id.prefix.value";
-    public static final String BOOKKEEPER_LEDGER_ID_RESERVATION_ID_CONFIG =
-            "nereus.kafka.storage.bookkeeper.ledger.id.reservation.id";
     public static final String BOOKKEEPER_ENSEMBLE_SIZE_CONFIG =
             "nereus.kafka.storage.bookkeeper.ensemble.size";
     public static final int BOOKKEEPER_ENSEMBLE_SIZE_DEFAULT = 2;
@@ -164,14 +158,6 @@ public final class NereusKafkaConfigs {
             "nereus.kafka.storage.bookkeeper.gc.late.create.audit.grace.ms";
     public static final long BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_DEFAULT =
             7L * 24L * 60L * 60L * 1_000L;
-    public static final String BOOKKEEPER_READINESS_EPOCH_CONFIG =
-            "nereus.kafka.storage.bookkeeper.readiness.epoch";
-    public static final long BOOKKEEPER_READINESS_EPOCH_DEFAULT = 1L;
-    public static final String BOOKKEEPER_READINESS_SHA256_CONFIG =
-            "nereus.kafka.storage.bookkeeper.readiness.sha256";
-    public static final String BOOKKEEPER_PERSISTENT_BROKER_COUNT_CONFIG =
-            "nereus.kafka.storage.bookkeeper.persistent.broker.count";
-    public static final int BOOKKEEPER_PERSISTENT_BROKER_COUNT_DEFAULT = 1;
     public static final String CACHE_DIR_CONFIG = "nereus.kafka.storage.cache.dir";
 
     public static final String APPEND_TIMEOUT_MS_CONFIG = "nereus.kafka.storage.append.timeout.ms";
@@ -351,21 +337,16 @@ public final class NereusKafkaConfigs {
                     "Optional object-store region.")
             .define(OBJECT_PATH_STYLE_ACCESS_CONFIG, BOOLEAN, false, LOW,
                     "Use provider-specific path-style object-store access.")
+            .define(BOOKKEEPER_CAPABILITY_FILE_CONFIG, STRING, null, HIGH,
+                    "Path to the admitted V2 BookKeeper capability descriptor, required by the native BK runtime.")
             .define(BOOKKEEPER_METADATA_SERVICE_URI_CONFIG, STRING, null, HIGH,
                     "BookKeeper metadata service URI required by BookKeeper profiles.")
             .define(BOOKKEEPER_DEPLOYMENT_ID_CONFIG, STRING, null, HIGH,
-                    "Deployment identity owning the pre-provisioned BookKeeper ledger-id namespace.")
+                    "Deployment identity bound to the native Kafka Cell policy.")
             .define(BOOKKEEPER_CLUSTER_ALIAS_CONFIG, STRING, null, HIGH,
                     "Durable BookKeeper cluster alias stored in physical read targets.")
             .define(BOOKKEEPER_PROVIDER_SCOPE_SHA256_CONFIG, STRING, null, HIGH,
                     "Lowercase SHA-256 of the canonical BookKeeper provider scope.")
-            .define(BOOKKEEPER_LEDGER_ID_PREFIX_BITS_CONFIG, INT,
-                    BOOKKEEPER_LEDGER_ID_PREFIX_BITS_DEFAULT, between(8, 24), HIGH,
-                    "Positive-63-bit BookKeeper ledger-id namespace prefix width.")
-            .define(BOOKKEEPER_LEDGER_ID_PREFIX_VALUE_CONFIG, LONG, null, HIGH,
-                    "Exact pre-provisioned BookKeeper ledger-id namespace prefix value.")
-            .define(BOOKKEEPER_LEDGER_ID_RESERVATION_ID_CONFIG, STRING, null, HIGH,
-                    "Immutable operator reservation identity for the BookKeeper ledger-id namespace.")
             .define(BOOKKEEPER_ENSEMBLE_SIZE_CONFIG, INT, BOOKKEEPER_ENSEMBLE_SIZE_DEFAULT,
                     atLeast(1), HIGH, "BookKeeper ledger ensemble size.")
             .define(BOOKKEEPER_WRITE_QUORUM_SIZE_CONFIG, INT, BOOKKEEPER_WRITE_QUORUM_SIZE_DEFAULT,
@@ -451,14 +432,6 @@ public final class NereusKafkaConfigs {
             .define(BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_CONFIG, LONG,
                     BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_DEFAULT, atLeast(1_000L), MEDIUM,
                     "Audit separation between two provider-absence observations.")
-            .define(BOOKKEEPER_READINESS_EPOCH_CONFIG, LONG,
-                    BOOKKEEPER_READINESS_EPOCH_DEFAULT, atLeast(1L), HIGH,
-                    "Exact pre-provisioned BookKeeper broker-readiness epoch.")
-            .define(BOOKKEEPER_READINESS_SHA256_CONFIG, STRING, null, HIGH,
-                    "Exact lowercase SHA-256 of the pre-provisioned BookKeeper broker set.")
-            .define(BOOKKEEPER_PERSISTENT_BROKER_COUNT_CONFIG, INT,
-                    BOOKKEEPER_PERSISTENT_BROKER_COUNT_DEFAULT, atLeast(1), HIGH,
-                    "Persistent broker count bound to the BookKeeper readiness identity.")
             .define(CACHE_DIR_CONFIG, STRING, null, HIGH,
                     "Dedicated ephemeral Nereus cache directory.")
             .define(APPEND_TIMEOUT_MS_CONFIG, LONG, APPEND_TIMEOUT_MS_DEFAULT,

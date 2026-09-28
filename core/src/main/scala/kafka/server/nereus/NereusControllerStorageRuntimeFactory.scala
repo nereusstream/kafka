@@ -18,41 +18,32 @@
 package kafka.server.nereus
 
 import kafka.server.storage.{ControllerStorageRuntime, ControllerStorageRuntimeContext, ControllerStorageRuntimeFactory}
+import org.apache.kafka.image.{MetadataDelta, MetadataImage}
+import org.apache.kafka.image.loader.LoaderManifest
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingImageValidatorV1
+import org.apache.kafka.server.config.NereusKafkaStorageConfig
 
-import java.util.Objects
+import java.util.concurrent.{CompletableFuture, CompletionStage}
 
-/** Explicit adapter-backed controller factory with provider I/O deferred to ControllerStorageRuntime.start(). */
-final class NereusControllerStorageRuntimeFactory(
-  mapper: NereusKafkaRuntimeConfigurationMapper,
-  activationCreator: NereusKafkaControllerActivationCreator
-) extends ControllerStorageRuntimeFactory {
-  Objects.requireNonNull(mapper, "mapper")
-  Objects.requireNonNull(activationCreator, "activationCreator")
+/** Native assignment remains Controller-owned. Physical write admission is closed and recovered by the elected Broker. */
+final class NereusControllerStorageRuntimeFactory extends ControllerStorageRuntimeFactory {
+  override def metadataPolicy(config: kafka.server.KafkaConfig): Option[org.apache.kafka.metadata.nereus.NereusKafkaMetadataPolicyV1] =
+    if (config.nereusKafkaStorageConfig.enabled()) Some(NereusKafkaOwnedProviderRuntime.metadataPolicy(config)) else None
 
   override def create(context: ControllerStorageRuntimeContext): ControllerStorageRuntime = {
-    val exact = Objects.requireNonNull(context, "context")
-    if (!exact.config.nereusKafkaStorageConfig.enabled()) {
-      return ControllerStorageRuntimeFactory.Disabled.create(exact)
+    if (!context.config.nereusKafkaStorageConfig.enabled()) return ControllerStorageRuntimeFactory.Disabled.create(context)
+    if (context.config.nereusKafkaStorageConfig.core().profile() != NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ONLY) {
+      throw new IllegalArgumentException("NSIP-1 native Controller admits BOOKKEEPER_WAL_ONLY; Object authority is pending")
     }
-    val mapped = mapper.mapController(
-      exact.config.nereusKafkaStorageConfig,
-      exact.clusterId)
-    val clusterSnapshots = new NereusKafkaStorageClusterSnapshotProvider(
-      exact.clusterId,
-      exact.metadataCache,
-      exact.logDirectories)
-    val clock = new NereusKafkaClock(exact.time)
-    new NereusControllerStorageRuntime(
-      exact.nodeId,
-      () => activationCreator.create(mapped, clusterSnapshots, clock),
-      mapped.retryInterval,
-      exact.faultHandler)
+    new ControllerStorageRuntime {
+      override def name(): String = "NereusControllerStorageRuntime"
+      override def start(): CompletionStage[Void] = CompletableFuture.completedFuture(null)
+      override def onMetadataUpdate(delta: MetadataDelta, image: MetadataImage, manifest: LoaderManifest): Unit =
+        KafkaTopicBindingImageValidatorV1.validatePublication(image.features(), image.topics(), delta.topicsDelta(), true)
+      override def close(): Unit = ()
+    }
   }
 }
-
 object NereusControllerStorageRuntimeFactory {
-  def production(): NereusControllerStorageRuntimeFactory =
-    new NereusControllerStorageRuntimeFactory(
-      new NereusKafkaRuntimeConfigurationMapper,
-      new NereusKafkaControllerActivationCreator)
+  def production(): NereusControllerStorageRuntimeFactory = new NereusControllerStorageRuntimeFactory
 }

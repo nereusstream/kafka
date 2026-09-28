@@ -17,12 +17,12 @@
 
 package kafka.log.nereus
 
-import com.nereusstream.api.{ErrorCode, NereusException, StorageProfile}
-import com.nereusstream.kafka.partition.{KafkaPartitionIdentity, KafkaPartitionLeaderOpenRequest}
 import kafka.cluster.Partition
 import kafka.server.ReplicaManager
 import kafka.server.metadata.AsyncTopicDeltaLifecycle
-import org.apache.kafka.common.{TopicPartition, Uuid}
+import org.apache.kafka.common.{TopicIdPartition, TopicPartition, Uuid}
+import org.apache.kafka.common.errors.KafkaStorageException
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1
 import org.apache.kafka.image.{MetadataImage, TopicsDelta}
 
 import java.time.Duration
@@ -42,7 +42,6 @@ final class NereusTopicDeltaLifecycle(
   brokerEpochSupplier: () => Long,
   brokerEpochScheduler: ScheduledExecutorService,
   currentTimeMillis: LongSupplier,
-  storageProfile: StorageProfile,
   operationTimeout: Duration,
   replicaManager: ReplicaManager,
   partitionLifecycle: NereusListOffsetsLifecycle
@@ -53,7 +52,6 @@ final class NereusTopicDeltaLifecycle(
   Objects.requireNonNull(brokerEpochSupplier, "brokerEpochSupplier")
   Objects.requireNonNull(brokerEpochScheduler, "brokerEpochScheduler")
   Objects.requireNonNull(currentTimeMillis, "currentTimeMillis")
-  Objects.requireNonNull(storageProfile, "storageProfile")
   Objects.requireNonNull(replicaManager, "replicaManager")
   Objects.requireNonNull(partitionLifecycle, "partitionLifecycle")
   if (kafkaClusterId.isBlank || brokerId < 0) {
@@ -147,15 +145,11 @@ final class NereusTopicDeltaLifecycle(
             throw invariant("Stock ReplicaManager did not publish the Nereus leader partition before recovery")
           }
           try {
-            val request = new KafkaPartitionLeaderOpenRequest(
-              identity(topicPartition, info.topicId().toString),
-              brokerId,
-              info.partition().leaderEpoch,
-              exactBrokerEpoch,
-              storageProfile,
-              metadataOffset,
-              operationTimeout)
-            val opened = partitionLifecycle.openLeader(partition, request)
+            val topic = newImage.topics().getTopic(info.topicId())
+            val aggregate = KafkaTopicBindingAggregateMapperV1.toRecord(topic.nereusAggregate().orElseThrow())
+            val opened = partitionLifecycle.openLeader(partition,
+              identity(topicPartition, info.topicId().toString), aggregate,
+              info.partition().leaderEpoch, exactBrokerEpoch, metadataOffset)
             if (changes.electedLeaders().containsKey(topicPartition)) {
               opened
                 .thenRun(() => onLeaderReady(topicPartition, info.partition().leaderEpoch))
@@ -181,7 +175,7 @@ final class NereusTopicDeltaLifecycle(
     CompletableFuture.allOf(tails.values.toArray: _*)
   }
 
-  private def deletedIdentity(delta: TopicsDelta, topicPartition: TopicPartition): KafkaPartitionIdentity = {
+  private def deletedIdentity(delta: TopicsDelta, topicPartition: TopicPartition): TopicIdPartition = {
     val topic = delta.image().getTopic(topicPartition.topic())
     if (topic == null || !topic.partitions().containsKey(topicPartition.partition())) {
       throw invariant("Deleted Nereus partition is absent from the previous KRaft metadata image")
@@ -192,10 +186,10 @@ final class NereusTopicDeltaLifecycle(
   private def retainedLeaderEpoch(
     newImage: MetadataImage,
     topicPartition: TopicPartition,
-    previousIdentity: KafkaPartitionIdentity
+    previousIdentity: TopicIdPartition
   ): Option[Int] = {
     val currentTopic = newImage.topics().getTopic(topicPartition.topic())
-    if (currentTopic == null || currentTopic.id().toString != previousIdentity.topicId()) {
+    if (currentTopic == null || currentTopic.id().toString != previousIdentity.topicId().toString) {
       None
     } else {
       Option(currentTopic.partitions().get(topicPartition.partition()))
@@ -203,12 +197,8 @@ final class NereusTopicDeltaLifecycle(
     }
   }
 
-  private def identity(topicPartition: TopicPartition, topicId: String): KafkaPartitionIdentity =
-    new KafkaPartitionIdentity(
-      kafkaClusterId,
-      topicId,
-      topicPartition.partition(),
-      topicPartition.topic())
+  private def identity(topicPartition: TopicPartition, topicId: String): TopicIdPartition =
+    new TopicIdPartition(Uuid.fromString(topicId), topicPartition)
 
   private def failPreparedLeaders(
     leaders: collection.Map[TopicPartition, org.apache.kafka.image.LocalReplicaChanges.PartitionInfo],
@@ -266,9 +256,7 @@ final class NereusTopicDeltaLifecycle(
         return
     }
     if (remaining <= 0) {
-      result.completeExceptionally(new NereusException(
-        ErrorCode.TIMEOUT,
-        true,
+      result.completeExceptionally(new KafkaStorageException(
         "timed out waiting for the KRaft broker registration epoch before Nereus leader recovery"))
       return
     }
@@ -290,6 +278,6 @@ final class NereusTopicDeltaLifecycle(
     }
   }
 
-  private def invariant(message: String): NereusException =
-    new NereusException(ErrorCode.METADATA_INVARIANT_VIOLATION, false, message)
+  private def invariant(message: String): KafkaStorageException =
+    new KafkaStorageException(message)
 }

@@ -522,7 +522,7 @@ public class ConfigurationControlManagerTest {
     }
 
     @Test
-    public void testNereusStoragePreservesNativeMinIsrSemantics() {
+    public void testNereusStorageRequiresMinIsrOneAndKeepsProfileImmutable() {
         FeatureControlManager featureManager =
             new FeatureControlManager.Builder().
                 setQuorumFeatures(new QuorumFeatures(
@@ -549,8 +549,11 @@ public class ConfigurationControlManagerTest {
                     TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG,
                     entry(SET, "2"))),
                 true);
-        assertEquals(Errors.NONE, result.response().error());
-        assertEquals(1, result.records().size());
+        assertEquals(Errors.INVALID_CONFIG, result.response().error());
+        assertTrue(result.records().isEmpty());
+        ControllerResult<ApiError> allowed = manager.incrementalAlterConfig(MYTOPIC,
+            toMap(entry(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, entry(SET, "1"))), true);
+        assertEquals(Errors.NONE, allowed.response().error());
 
         ControllerResult<ApiError> rejectedIncremental = manager.incrementalAlterConfig(
             MYTOPIC,

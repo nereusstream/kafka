@@ -57,15 +57,17 @@
   <!-- Nereus inject start: exact adapter and stock record bridge -->
   <subpackage name="log">
     <subpackage name="nereus">
-      <allow pkg="com.nereusstream.api" />
-      <allow pkg="com.nereusstream.kafka.checkpoint" />
-      <allow pkg="com.nereusstream.kafka.compaction" />
-      <allow pkg="com.nereusstream.kafka.partition" />
-      <allow pkg="com.nereusstream.kafka.recovery" />
-      <allow pkg="com.nereusstream.kafka.retention" />
-      <allow pkg="com.nereusstream.materialization" />
+      <!-- V2 closed-owner/shared BK composition is confined to this native adapter boundary. -->
+      <allow pkg="com.nereusstream.domain" />
+      <allow pkg="com.nereusstream.kafka.bookkeeper" />
+      <allow pkg="com.nereusstream.storage.api.bookkeeper" />
+      <allow pkg="com.nereusstream.storage.api.kafka" />
+      <allow pkg="com.nereusstream.storage.api.lifecycle" />
+      <allow pkg="com.nereusstream.storage.bookkeeper" />
+      <allow pkg="com.nereusstream.storage.object.gc" />
+      <allow pkg="com.nereusstream.metadata.oxia.v2" />
+      <allow pkg="io.oxia.client.api" />
       <allow class="com.nereusstream.metadata.oxia.VersionedKafkaPartitionBinding" />
-      <allow pkg="com.nereusstream.objectstore.kafka.checkpoint" />
       <allow pkg="org.apache.kafka.common.compress" />
       <allow pkg="org.apache.kafka.common.errors" />
       <allow pkg="org.apache.kafka.common.protocol" />
@@ -91,21 +93,17 @@
     <allow pkg="org.apache.kafka" />
     <!-- Nereus inject start: exact adapter-backed broker runtime -->
     <subpackage name="nereus">
+      <!-- V2 closed-owner/shared BK composition is confined to this native adapter boundary. -->
+      <allow pkg="com.nereusstream.domain" />
+      <allow pkg="com.nereusstream.kafka.bookkeeper" />
+      <allow pkg="com.nereusstream.storage.api.bookkeeper" />
+      <allow pkg="com.nereusstream.storage.api.kafka" />
+      <allow pkg="com.nereusstream.storage.api.lifecycle" />
+      <allow pkg="com.nereusstream.storage.bookkeeper" />
+      <allow pkg="com.nereusstream.storage.object.gc" />
+      <allow pkg="com.nereusstream.metadata.oxia.v2" />
+      <allow pkg="io.oxia.client.api" />
       <allow pkg="org.apache.bookkeeper" />
-      <allow pkg="com.nereusstream.api" />
-      <allow pkg="com.nereusstream.bookkeeper" />
-      <allow pkg="com.nereusstream.core" />
-      <allow pkg="com.nereusstream.kafka.activation" />
-      <allow pkg="com.nereusstream.kafka.checkpoint" />
-      <allow pkg="com.nereusstream.kafka.compaction" />
-      <allow pkg="com.nereusstream.kafka.partition" />
-      <allow pkg="com.nereusstream.kafka.recovery" />
-      <allow pkg="com.nereusstream.kafka.retention" />
-      <allow pkg="com.nereusstream.kafka.runtime" />
-      <allow pkg="com.nereusstream.materialization" />
-      <allow pkg="com.nereusstream.metadata.oxia" />
-      <allow pkg="com.nereusstream.metadata.oxia.records" />
-      <allow pkg="com.nereusstream.objectstore" />
     </subpackage>
     <!-- Nereus inject end: exact adapter-backed broker runtime -->
   </subpackage>
