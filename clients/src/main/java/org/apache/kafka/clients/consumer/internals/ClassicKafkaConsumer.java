@@ -661,7 +661,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
                 updateAssignmentMetadataIfNeeded(timer, false);
 
                 final Fetch<K, V> fetch = pollForFetches(timer);
-                if (!fetch.isEmpty()) {
+                if (!fetch.isEmpty() || hasGuardedResponse(fetch)) {
                     // before returning the fetched records, we can send off the next round of fetches
                     // and avoid block waiting for their responses to enable pipelining while the user
                     // is handling the fetched records.
@@ -695,6 +695,11 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
         return fetcher.sendFetches();
     }
 
+    // Evidence belongs only to the validated response collected for this poll; a timeout has no response.
+    private boolean hasGuardedResponse(final Fetch<K, V> fetch) {
+        return metadata.guardedResourceGuard().isPresent() && !fetch.guardedFetchEvidence().isEmpty();
+    }
+
     private ConsumerRecords<K, V> guardedRecords(final Fetch<K, V> fetch,
                                                   final ConsumerRecords<K, V> records) {
         Optional<org.apache.kafka.clients.consumer.ConsumerResourceGuard> guardedResource =
@@ -721,6 +726,15 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
         }
         org.apache.kafka.clients.consumer.GuardedFetchEvidence evidence =
                 fetch.guardedFetchEvidence().get(guard.topicPartition());
+        if (evidence != null && (!guard.authenticatedClusterId().equals(evidence.authenticatedClusterId())
+                || !guard.canonicalTopic().equals(evidence.canonicalTopic())
+                || !guard.expectedTopicId().equals(evidence.expectedTopicId())
+                || guard.partition() != evidence.partition())) {
+            throw new org.apache.kafka.clients.consumer.ConsumerResourceGuardException(
+                    "guarded Fetch evidence no longer matches the current resource guard",
+                    org.apache.kafka.clients.consumer.ConsumerResourceGuardFailureReason.RESPONSE_EVIDENCE_INTEGRITY,
+                    guard);
+        }
         if (!records.isEmpty() && evidence == null) {
             throw new org.apache.kafka.clients.consumer.ConsumerResourceGuardException(
                     "guarded Fetch records have no response evidence",
@@ -747,7 +761,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
 
         // if data is available already, return it immediately
         final Fetch<K, V> fetch = fetcher.collectFetch();
-        if (!fetch.isEmpty()) {
+        if (!fetch.isEmpty() || hasGuardedResponse(fetch)) {
             return fetch;
         }
 

@@ -37,6 +37,7 @@ public final class GuardedFetchEvidence {
     private final long lastRecordOffset;
     private final long highWatermark;
     private final long lastStableOffset;
+    private final long logStartOffset;
     private final byte[] fetchResponseBodySha256;
 
     @SuppressWarnings("ParameterNumber")
@@ -46,12 +47,25 @@ public final class GuardedFetchEvidence {
                                 final long fetchOffset, final long firstRecordOffset, final long lastRecordOffset,
                                 final long highWatermark, final long lastStableOffset,
                                 final byte[] fetchResponseBodySha256) {
+        this(authenticatedClusterId, canonicalTopic, expectedTopicId, partition, requestVersion,
+                correlationId, brokerNodeId, sessionId, fetchOffset, firstRecordOffset, lastRecordOffset,
+                highWatermark, lastStableOffset, -1L, fetchResponseBodySha256);
+    }
+
+    /** The observed log start is from this same guarded response; -1 explicitly means unavailable. */
+    @SuppressWarnings("ParameterNumber")
+    public GuardedFetchEvidence(final String authenticatedClusterId, final String canonicalTopic,
+                                final Uuid expectedTopicId, final int partition, final short requestVersion,
+                                final int correlationId, final int brokerNodeId, final int sessionId,
+                                final long fetchOffset, final long firstRecordOffset, final long lastRecordOffset,
+                                final long highWatermark, final long lastStableOffset, final long logStartOffset,
+                                final byte[] fetchResponseBodySha256) {
         this.authenticatedClusterId = requireText(authenticatedClusterId, "authenticatedClusterId");
         this.canonicalTopic = requireText(canonicalTopic, "canonicalTopic");
         this.expectedTopicId = Objects.requireNonNull(expectedTopicId, "expectedTopicId");
         if (invalidIdentity(expectedTopicId, partition, requestVersion, correlationId, brokerNodeId, sessionId)
                 || fetchOffset < 0 || invalidRecordRange(firstRecordOffset, lastRecordOffset)
-                || highWatermark < -1 || lastStableOffset < -1) {
+                || highWatermark < -1 || lastStableOffset < -1 || logStartOffset < -1) {
             throw new IllegalArgumentException("invalid guarded Fetch evidence");
         }
         this.partition = partition;
@@ -64,6 +78,7 @@ public final class GuardedFetchEvidence {
         this.lastRecordOffset = lastRecordOffset;
         this.highWatermark = highWatermark;
         this.lastStableOffset = lastStableOffset;
+        this.logStartOffset = logStartOffset;
         this.fetchResponseBodySha256 = requireSha256(fetchResponseBodySha256, "fetchResponseBodySha256");
     }
 
@@ -123,6 +138,11 @@ public final class GuardedFetchEvidence {
         return lastStableOffset;
     }
 
+    /** Returns the same-response log start, or -1 when the constructing API did not observe it. */
+    public long logStartOffset() {
+        return logStartOffset;
+    }
+
     public byte[] fetchResponseBodySha256() {
         return fetchResponseBodySha256.clone();
     }
@@ -138,6 +158,7 @@ public final class GuardedFetchEvidence {
                 && sessionId == that.sessionId && fetchOffset == that.fetchOffset
                 && firstRecordOffset == that.firstRecordOffset && lastRecordOffset == that.lastRecordOffset
                 && highWatermark == that.highWatermark && lastStableOffset == that.lastStableOffset
+                && logStartOffset == that.logStartOffset
                 && authenticatedClusterId.equals(that.authenticatedClusterId)
                 && canonicalTopic.equals(that.canonicalTopic) && expectedTopicId.equals(that.expectedTopicId)
                 && Arrays.equals(fetchResponseBodySha256, that.fetchResponseBodySha256);
@@ -147,7 +168,7 @@ public final class GuardedFetchEvidence {
     public int hashCode() {
         int result = Objects.hash(authenticatedClusterId, canonicalTopic, expectedTopicId, partition,
                 requestVersion, correlationId, brokerNodeId, sessionId, fetchOffset, firstRecordOffset,
-                lastRecordOffset, highWatermark, lastStableOffset);
+                lastRecordOffset, highWatermark, lastStableOffset, logStartOffset);
         return 31 * result + Arrays.hashCode(fetchResponseBodySha256);
     }
 
@@ -158,7 +179,8 @@ public final class GuardedFetchEvidence {
                 + ", partition=" + partition + ", requestVersion=" + requestVersion
                 + ", correlationId=" + correlationId + ", brokerNodeId=" + brokerNodeId
                 + ", sessionId=" + sessionId + ", fetchOffset=" + fetchOffset
-                + ", firstRecordOffset=" + firstRecordOffset + ", lastRecordOffset=" + lastRecordOffset + "}";
+                + ", firstRecordOffset=" + firstRecordOffset + ", lastRecordOffset=" + lastRecordOffset
+                + ", logStartOffset=" + logStartOffset + "}";
     }
 
     private static byte[] requireSha256(final byte[] value, final String name) {

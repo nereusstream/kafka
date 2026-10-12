@@ -323,7 +323,7 @@ public abstract class AbstractFetch implements Closeable {
                 guard.expectedTopicId(), guard.partition(), requestVersion,
                 clientResponse.requestHeader().correlationId(), fetchTarget.id(), response.sessionId(),
                 requestPartition.fetchOffset, firstRecordOffset, lastRecordOffset,
-                partitionData.highWatermark(), partitionData.lastStableOffset(), responseDigest));
+                partitionData.highWatermark(), partitionData.lastStableOffset(), partitionData.logStartOffset(), responseDigest));
     }
 
     private ConsumerResourceGuardException guardedFailure(final ConsumerResourceGuardFailureReason reason,
