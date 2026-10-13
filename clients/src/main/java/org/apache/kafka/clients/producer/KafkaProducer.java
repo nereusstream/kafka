@@ -1099,6 +1099,31 @@ public class KafkaProducer<K, V> implements GuardedTransactionalProducer<K, V> {
     }
 
     @Override
+    public void requireResourceGuard(final ProducerResourceGuard guard) {
+        Objects.requireNonNull(guard, "resource guard");
+        throwIfProducerClosed();
+        if (maxBlockTimeMs <= 0 || maxBlockTimeMs == Long.MAX_VALUE)
+            throw new TimeoutException("Fresh guarded metadata requires finite positive max.block.ms");
+        long startedMs = time.milliseconds();
+        long observation = metadata.requestGuardedUpdate(guard);
+        try {
+            sender.wakeup();
+            long remainingMs = maxBlockTimeMs - Math.max(0, time.milliseconds() - startedMs);
+            if (remainingMs <= 0)
+                throw new TimeoutException("Fresh guarded metadata deadline elapsed");
+            Cluster observed = metadata.awaitGuardedUpdate(observation, remainingMs);
+            throwIfProducerClosed();
+            if (time.milliseconds() - startedMs >= maxBlockTimeMs)
+                throw new TimeoutException("Fresh guarded metadata deadline elapsed");
+            validateGuardedCluster(observed, guard);
+        } catch (InterruptedException interrupted) {
+            throw new InterruptException(interrupted);
+        } finally {
+            metadata.cancelGuardedUpdate(observation);
+        }
+    }
+
+    @Override
     public Future<GuardedRecordMetadata> sendGuarded(final ProducerRecord<K, V> record,
                                                       final ProducerResourceGuard guard) {
         return sendGuarded(record, guard, null);

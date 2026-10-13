@@ -732,6 +732,12 @@ public class Metadata implements Closeable {
         return new MetadataRequestAndVersion(request, requestVersion, isPartialUpdate);
     }
 
+    /** Builds a subclass-specific request while preserving its explicit response version association. */
+    protected final MetadataRequestAndVersion metadataRequestAndVersion(
+            MetadataRequest.Builder request, int version, boolean isPartialUpdate) {
+        return new MetadataRequestAndVersion(request, version, isPartialUpdate);
+    }
+
     /**
      * Constructs and returns a metadata request builder for fetching cluster data and all active topics.
      *

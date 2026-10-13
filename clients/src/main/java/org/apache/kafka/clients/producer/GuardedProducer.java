@@ -20,6 +20,15 @@ import java.util.concurrent.Future;
 
 /** Producer API whose success result carries authenticated resource evidence. */
 public interface GuardedProducer<K, V> extends Producer<K, V> {
+    /**
+     * Requires a fresh response from this producer's Metadata path for the exact resource.
+     * The query prohibits automatic topic creation and never submits a record or changes a transaction.
+     * Implementations without this extension fail explicitly instead of accepting cached identity.
+     */
+    default void requireResourceGuard(ProducerResourceGuard guard) {
+        throw new UnsupportedOperationException("fresh guarded metadata observation is unavailable");
+    }
+
     Future<GuardedRecordMetadata> sendGuarded(ProducerRecord<K, V> record, ProducerResourceGuard guard);
 
     Future<GuardedRecordMetadata> sendGuarded(ProducerRecord<K, V> record, ProducerResourceGuard guard,
