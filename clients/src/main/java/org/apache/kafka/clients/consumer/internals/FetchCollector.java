@@ -132,6 +132,11 @@ public class FetchCollector<K, V> {
                     final Fetch<K, V> nextFetch = fetchRecords(nextInLineFetch, recordsRemaining);
                     recordsRemaining -= nextFetch.numRecords();
                     fetch.add(nextFetch);
+                    // Keep a guarded poll's processed nextOffsets paired with one
+                    // CompletedFetch response, including partial and filtered batches.
+                    // Aggregating another response would overwrite its evidence in Fetch.add.
+                    if (!nextFetch.guardedFetchEvidence().isEmpty())
+                        break;
                 }
             }
         } catch (KafkaException e) {
