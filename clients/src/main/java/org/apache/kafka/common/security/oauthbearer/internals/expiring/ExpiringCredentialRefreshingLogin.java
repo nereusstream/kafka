@@ -258,6 +258,8 @@ public abstract class ExpiringCredentialRefreshingLogin implements AutoCloseable
         }
     }
 
+    public boolean guardedResourcesTerminated() { return refresherThread == null || !refresherThread.isAlive(); }
+
     public abstract ExpiringCredential expiringCredential();
 
     /**

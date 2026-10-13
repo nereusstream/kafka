@@ -87,6 +87,9 @@ public class NetworkClient implements KafkaClient {
 
     /* the selector used to perform network i/o */
     private final Selectable selector;
+    private boolean guardedSelectorClosed;
+    private boolean guardedMetadataClosed;
+    private boolean guardedTelemetryClosed;
 
     private final MetadataUpdater metadataUpdater;
 
@@ -757,6 +760,37 @@ public class NetworkClient implements KafkaClient {
         } else {
             log.warn("Attempting to close NetworkClient that has already been closed.");
         }
+    }
+
+    /** Guarded consumer local teardown keeps each unfinished original component despite CLOSED business state. */
+    public synchronized void closeGuardedResources() {
+        state.set(State.CLOSED);
+        Throwable failure = null;
+        if (!guardedSelectorClosed) {
+            try {
+                if (!(selector instanceof org.apache.kafka.common.network.Selector))
+                    throw new IllegalStateException("Guarded cleanup requires the original native Selector");
+                ((org.apache.kafka.common.network.Selector) selector).closeGuardedResources();
+                guardedSelectorClosed = true;
+            } catch (Throwable failed) { failure = failed; }
+        }
+        if (!guardedMetadataClosed) {
+            try { metadataUpdater.close(); guardedMetadataClosed = true; }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (!guardedTelemetryClosed) {
+            try {
+                if (telemetrySender != null) telemetrySender.close();
+                guardedTelemetryClosed = true;
+            } catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (failure != null) throw new KafkaException("Guarded network cleanup failed", failure);
     }
 
     /**

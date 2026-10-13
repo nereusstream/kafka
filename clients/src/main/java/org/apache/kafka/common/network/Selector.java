@@ -105,6 +105,11 @@ public class Selector implements Selectable, AutoCloseable {
     private final Logger log;
     private final java.nio.channels.Selector nioSelector;
     private final Map<String, KafkaChannel> channels;
+    private final Set<KafkaChannel> failedChannelCloses =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    private boolean guardedNioClosed;
+    private boolean guardedSensorsClosed;
+    private boolean guardedBuilderClosed;
     private final Set<KafkaChannel> explicitlyMutedChannels;
     private boolean outOfMemory;
     private final List<NetworkSend> completedSends;
@@ -161,28 +166,49 @@ public class Selector implements Selectable, AutoCloseable {
         } catch (IOException e) {
             throw new KafkaException(e);
         }
-        this.maxReceiveSize = maxReceiveSize;
-        this.time = time;
-        this.channels = new HashMap<>();
-        this.explicitlyMutedChannels = new HashSet<>();
-        this.outOfMemory = false;
-        this.completedSends = new ArrayList<>();
-        this.completedReceives = new LinkedHashMap<>();
-        this.immediatelyConnectedKeys = new HashSet<>();
-        this.closingChannels = new HashMap<>();
-        this.keysWithBufferedRead = new HashSet<>();
-        this.connected = new ArrayList<>();
-        this.disconnected = new HashMap<>();
-        this.failedSends = new ArrayList<>();
-        this.log = logContext.logger(Selector.class);
-        this.sensors = new SelectorMetrics(metrics, metricGrpPrefix, metricTags, metricsPerConnection);
-        this.channelBuilder = channelBuilder;
-        this.recordTimePerConnection = recordTimePerConnection;
-        this.idleExpiryManager = connectionMaxIdleMs < 0 ? null : new IdleExpiryManager(time, connectionMaxIdleMs);
-        this.memoryPool = memoryPool;
-        this.lowMemThreshold = (long) (0.1 * this.memoryPool.size());
-        this.failedAuthenticationDelayMs = failedAuthenticationDelayMs;
-        this.delayedClosingChannels = (failedAuthenticationDelayMs > NO_FAILED_AUTHENTICATION_DELAY) ? new LinkedHashMap<>() : null;
+        try {
+            this.maxReceiveSize = maxReceiveSize;
+            this.time = time;
+            this.channelBuilder = channelBuilder;
+            this.channels = new HashMap<>();
+            this.explicitlyMutedChannels = new HashSet<>();
+            this.outOfMemory = false;
+            this.completedSends = new ArrayList<>();
+            this.completedReceives = new LinkedHashMap<>();
+            this.immediatelyConnectedKeys = new HashSet<>();
+            this.closingChannels = new HashMap<>();
+            this.keysWithBufferedRead = new HashSet<>();
+            this.connected = new ArrayList<>();
+            this.disconnected = new HashMap<>();
+            this.failedSends = new ArrayList<>();
+            this.log = logContext.logger(Selector.class);
+            this.sensors = new SelectorMetrics(metrics, metricGrpPrefix, metricTags, metricsPerConnection);
+            this.recordTimePerConnection = recordTimePerConnection;
+            this.idleExpiryManager = connectionMaxIdleMs < 0 ? null : new IdleExpiryManager(time, connectionMaxIdleMs);
+            this.memoryPool = memoryPool;
+            this.lowMemThreshold = (long) (0.1 * this.memoryPool.size());
+            this.failedAuthenticationDelayMs = failedAuthenticationDelayMs;
+            this.delayedClosingChannels = (failedAuthenticationDelayMs > NO_FAILED_AUTHENTICATION_DELAY) ? new LinkedHashMap<>() : null;
+        } catch (Throwable original) {
+            ConstructionCleanupFailure retained = new ConstructionCleanupFailure(this, original);
+            try { retained.reconcile(); }
+            catch (Throwable failed) { if (failed != original) retained.addSuppressed(failed); }
+            throw retained;
+        }
+    }
+
+    /** Original native selector and builder are retained when construction fails after NIO allocation. */
+    public static final class ConstructionCleanupFailure extends KafkaException {
+        private static final long serialVersionUID = 1L;
+        private final transient Selector partial;
+        private boolean complete;
+        private ConstructionCleanupFailure(Selector partial, Throwable original) {
+            super("Selector construction failed", original); this.partial = partial;
+        }
+        public synchronized void reconcile() {
+            if (!complete) { partial.closeGuardedResources(); complete = true; }
+        }
+        public synchronized boolean resourcesTerminated() { return complete; }
     }
 
     public Selector(int maxReceiveSize,
@@ -382,6 +408,52 @@ public class Selector implements Selectable, AutoCloseable {
         if (exception instanceof RuntimeException && !(exception instanceof SecurityException)) {
             throw (RuntimeException) exception;
         }
+    }
+
+    /** Strict local teardown for the already frozen guarded consumer, including previously failed channel closes. */
+    public synchronized void closeGuardedResources() {
+        if (channels != null) failedChannelCloses.addAll(channels.values());
+        if (closingChannels != null) failedChannelCloses.addAll(closingChannels.values());
+        Throwable failure = null;
+        for (KafkaChannel channel : new ArrayList<>(failedChannelCloses)) {
+            try {
+                channel.closeGuardedResources();
+                channel.selectionKey().cancel();
+                channel.selectionKey().attach(null);
+                failedChannelCloses.remove(channel);
+                if (channels != null) channels.remove(channel.id(), channel);
+                if (closingChannels != null) closingChannels.remove(channel.id(), channel);
+            } catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (!guardedNioClosed) {
+            try { nioSelector.close(); guardedNioClosed = true; }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (!guardedSensorsClosed) {
+            try { if (sensors != null) sensors.close(); guardedSensorsClosed = true; }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (!guardedBuilderClosed) {
+            try {
+                if (channelBuilder instanceof SaslChannelBuilder)
+                    ((SaslChannelBuilder) channelBuilder).closeGuardedResources();
+                else if (channelBuilder != null) channelBuilder.close();
+                guardedBuilderClosed = true;
+            } catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (failure != null) throw new KafkaException("Guarded Selector cleanup failed", failure);
     }
 
     /**
@@ -961,6 +1033,7 @@ public class Selector implements Selectable, AutoCloseable {
             keysWithBufferedRead.remove(key);
             channel.close();
         } catch (IOException e) {
+            failedChannelCloses.add(channel);
             log.error("Exception closing connection to node {}:", channel.id(), e);
         } finally {
             key.cancel();

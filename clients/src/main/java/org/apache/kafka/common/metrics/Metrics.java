@@ -79,6 +79,8 @@ public final class Metrics implements Closeable {
     private final List<MetricsReporter> reporters;
     private final Time time;
     private final ScheduledThreadPoolExecutor metricsScheduler;
+    private final java.util.Set<MetricsReporter> guardedClosedReporters =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
     private static final Logger log = LoggerFactory.getLogger(Metrics.class);
 
     /**
@@ -706,5 +708,27 @@ public final class Metrics implements Closeable {
             }
         }
         log.info("Metrics reporters closed");
+    }
+
+    /** The owner observes actual scheduler exit and each reporter close, instead of swallowed cleanup errors. */
+    public synchronized void closeGuardedResources(long timeoutMs) {
+        Throwable failure = null;
+        if (metricsScheduler != null) {
+            metricsScheduler.shutdown();
+            try {
+                if (!metricsScheduler.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS))
+                    throw new org.apache.kafka.common.errors.TimeoutException("metrics scheduler remains active");
+            } catch (InterruptedException failed) { Thread.currentThread().interrupt(); failure = failed; }
+            catch (Throwable failed) { failure = failed; }
+        }
+        for (MetricsReporter reporter : reporters) {
+            if (guardedClosedReporters.contains(reporter)) continue;
+            try { reporter.close(); guardedClosedReporters.add(reporter); }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (failure != null) throw new org.apache.kafka.common.KafkaException("Guarded metrics cleanup failed", failure);
     }
 }

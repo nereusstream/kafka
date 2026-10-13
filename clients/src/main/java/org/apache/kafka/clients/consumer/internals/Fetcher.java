@@ -169,6 +169,25 @@ public class Fetcher<K, V> extends AbstractFetch {
         super.closeInternal(timer);
     }
 
+    private boolean guardedSessionCloseAttempted;
+
+    /** Preserve the first session-close attempt; subsequent cleanup touches only retained local resources. */
+    public synchronized void closeGuardedResources(Timer timer) {
+        client.disableWakeups();
+        Throwable failure = null;
+        if (!guardedSessionCloseAttempted) {
+            guardedSessionCloseAttempted = true;
+            try { maybeCloseFetchSessions(timer); }
+            catch (Throwable failed) { failure = failed; }
+        }
+        try { closeGuardedLocalResources(); }
+        catch (Throwable failed) {
+            if (failure == null) failure = failed;
+            else if (failure != failed) failure.addSuppressed(failed);
+        }
+        if (failure != null) throw new org.apache.kafka.common.KafkaException("Guarded Fetch cleanup failed", failure);
+    }
+
     /**
      * Creates the {@link FetchRequest.Builder fetch request},
      * {@link NetworkClient#send(ClientRequest, long)} enqueues/sends it, and adds the {@link RequestFuture callback}

@@ -26,4 +26,7 @@ public class DefaultLogin extends AbstractLogin {
     @Override
     public void close() {
     }
+
+    @Override
+    public boolean guardedResourcesTerminated() { return true; }
 }

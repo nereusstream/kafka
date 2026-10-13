@@ -1931,6 +1931,12 @@ public class KafkaConsumer<K, V> implements GuardedConsumer<K, V> {
         delegate.close(option);
     }
 
+    @Override
+    public void closeGuardedResources(Duration timeout) { delegate.closeGuardedResources(timeout); }
+
+    @Override
+    public boolean guardedResourcesTerminated() { return delegate.guardedResourcesTerminated(); }
+
     /**
      * Wakeup the consumer. This method is thread-safe and is useful in particular to abort a long poll.
      * The thread which is blocking in an operation will throw {@link org.apache.kafka.common.errors.WakeupException}.

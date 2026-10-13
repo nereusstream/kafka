@@ -155,6 +155,28 @@ public class KafkaChannel implements AutoCloseable {
         Utils.closeAll(transportLayer, authenticator, receive, metadataRegistry);
     }
 
+    private final java.util.Set<AutoCloseable> guardedClosedResources =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+
+    /** Each original resource is retained until its own close returns; completed parts are not invoked again. */
+    public synchronized void closeGuardedResources() {
+        disconnected = true;
+        Throwable failure = null;
+        for (AutoCloseable resource : new AutoCloseable[] {transportLayer, authenticator, receive, metadataRegistry}) {
+            if (resource == null || guardedClosedResources.contains(resource)) continue;
+            try {
+                if (resource instanceof TransportLayer) ((TransportLayer) resource).closeGuardedResources();
+                else resource.close();
+                guardedClosedResources.add(resource);
+            }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (failure != null) throw new org.apache.kafka.common.KafkaException("Guarded channel cleanup failed", failure);
+    }
+
     /**
      * Returns the principal returned by `authenticator.principal()`.
      */

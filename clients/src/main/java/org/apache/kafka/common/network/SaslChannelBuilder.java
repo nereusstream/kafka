@@ -179,7 +179,8 @@ public class SaslChannelBuilder implements ChannelBuilder, ListenerReconfigurabl
                 this.sslFactory.configure(configs);
             }
         } catch (Throwable e) {
-            close();
+            try { closeGuardedResources(); }
+            catch (Throwable cleanup) { if (cleanup != e) e.addSuppressed(cleanup); }
             throw new KafkaException(e);
         }
     }
@@ -256,6 +257,41 @@ public class SaslChannelBuilder implements ChannelBuilder, ListenerReconfigurabl
         for (AuthenticateCallbackHandler handler : saslCallbackHandlers.values())
             handler.close();
         if (sslFactory != null) sslFactory.close();
+    }
+
+    private final Map<String, LoginManager.GuardedCleanup> guardedLoginCleanup = new java.util.HashMap<>();
+    private final java.util.Set<AuthenticateCallbackHandler> guardedClosedCallbacks =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    private boolean guardedSslClosed;
+
+    /** Retains last-reference cleanup and skips already released references/callbacks on reconciliation. */
+    public synchronized void closeGuardedResources() {
+        Throwable failure = null;
+        for (Map.Entry<String, LoginManager> entry : loginManagers.entrySet()) {
+            try {
+                guardedLoginCleanup.computeIfAbsent(entry.getKey(), ignored -> entry.getValue().releaseGuardedReference())
+                        .reconcile();
+            } catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        for (AuthenticateCallbackHandler handler : saslCallbackHandlers.values()) {
+            if (guardedClosedCallbacks.contains(handler)) continue;
+            try { handler.close(); guardedClosedCallbacks.add(handler); }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (!guardedSslClosed) {
+            try { if (sslFactory != null) sslFactory.close(); guardedSslClosed = true; }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (failure != null) throw new KafkaException("Guarded SASL builder cleanup failed", failure);
     }
 
     // Visible to override for testing

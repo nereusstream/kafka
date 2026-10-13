@@ -184,8 +184,32 @@ public class ChannelBuilders {
                 throw new IllegalArgumentException("Unexpected securityProtocol " + securityProtocol);
         }
 
-        channelBuilder.configure(configs);
-        return channelBuilder;
+        try {
+            channelBuilder.configure(configs);
+            return channelBuilder;
+        } catch (Throwable original) {
+            ConstructionCleanupFailure retained = new ConstructionCleanupFailure(channelBuilder, original);
+            try { retained.reconcile(); }
+            catch (Throwable failed) { if (failed != original) retained.addSuppressed(failed); }
+            throw retained;
+        }
+    }
+
+    /** Failed configuration exposes only same-builder cleanup, never a usable channel builder. */
+    public static final class ConstructionCleanupFailure extends org.apache.kafka.common.KafkaException {
+        private static final long serialVersionUID = 1L;
+        private final transient ChannelBuilder partial;
+        private boolean complete;
+        private ConstructionCleanupFailure(ChannelBuilder partial, Throwable original) {
+            super("Channel builder configuration failed", original); this.partial = partial;
+        }
+        public synchronized void reconcile() {
+            if (complete) return;
+            if (partial instanceof SaslChannelBuilder) ((SaslChannelBuilder) partial).closeGuardedResources();
+            else partial.close();
+            complete = true;
+        }
+        public synchronized boolean resourcesTerminated() { return complete; }
     }
 
     /**

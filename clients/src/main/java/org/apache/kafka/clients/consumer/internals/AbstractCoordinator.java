@@ -437,13 +437,35 @@ public abstract class AbstractCoordinator implements Closeable {
                 return;
             heartbeatThread.close();
             thread = heartbeatThread;
-            heartbeatThread = null;
         }
         try {
             thread.join();
+            synchronized (this) {
+                if (heartbeatThread == thread) heartbeatThread = null;
+            }
         } catch (InterruptedException e) {
             log.warn("Interrupted while waiting for consumer heartbeat thread to close");
             throw new InterruptException(e);
+        }
+    }
+
+    /** No onLeavePrepare/leave-group or pending-commit replay during local cleanup reconciliation. */
+    public void closeGuardedLocalResources(Timer timer) {
+        BaseHeartbeatThread thread;
+        synchronized (this) {
+            thread = heartbeatThread;
+            if (thread == null) return;
+            thread.close();
+        }
+        try {
+            timer.update();
+            if (thread == Thread.currentThread()) throw new IllegalStateException("cannot join own heartbeat thread");
+            if (timer.remainingMs() > 0) thread.join(timer.remainingMs());
+            if (thread.isAlive()) throw new org.apache.kafka.common.errors.TimeoutException("heartbeat cleanup remains active");
+            synchronized (this) { if (heartbeatThread == thread) heartbeatThread = null; }
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new InterruptException(failure);
         }
     }
 

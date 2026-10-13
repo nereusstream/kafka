@@ -136,6 +136,11 @@ public class OAuthBearerRefreshingLogin implements Login {
     }
 
     @Override
+    public boolean guardedResourcesTerminated() {
+        return expiringCredentialRefreshingLogin == null || expiringCredentialRefreshingLogin.guardedResourcesTerminated();
+    }
+
+    @Override
     public Subject subject() {
         return expiringCredentialRefreshingLogin != null ? expiringCredentialRefreshingLogin.subject() : null;
     }

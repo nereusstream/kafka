@@ -75,6 +75,8 @@ public abstract class AbstractFetch implements Closeable {
     // We cache the logger used by CompletedFetch because it is created on every fetch responses.
     private final Logger completedFetchLog;
     private final IdempotentCloser idempotentCloser = new IdempotentCloser();
+    private boolean guardedBufferClosed;
+    private boolean guardedDecompressionClosed;
     protected final LogContext logContext;
     protected final ConsumerMetadata metadata;
     protected final SubscriptionState subscriptions;
@@ -734,6 +736,24 @@ public abstract class AbstractFetch implements Closeable {
     @Override
     public void close() {
         close(time.timer(Duration.ZERO));
+    }
+
+    /** Local cleanup only: no new Fetch or session-close request on a retry. */
+    public synchronized void closeGuardedLocalResources() {
+        idempotentCloser.close(() -> {});
+        Throwable failure = null;
+        if (!guardedBufferClosed) {
+            try { fetchBuffer.closeGuardedResources(); guardedBufferClosed = true; }
+            catch (Throwable failed) { failure = failed; }
+        }
+        if (!guardedDecompressionClosed) {
+            try { decompressionBufferSupplier.close(); guardedDecompressionClosed = true; }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (failure != null) throw new org.apache.kafka.common.KafkaException("Guarded Fetch local cleanup failed", failure);
     }
 
     /**

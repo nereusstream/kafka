@@ -142,6 +142,16 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
     private final int requestTimeoutMs;
     private final int defaultApiTimeoutMs;
     private volatile boolean closed = false;
+    private boolean guardedCloseStarted;
+    private boolean guardedCoordinatorAttempted;
+    private org.apache.kafka.clients.ClientUtils.NetworkConstructionCleanupFailure failedNetworkConstruction;
+    private final java.util.EnumSet<GuardedCleanupPart> guardedCompleted = java.util.EnumSet.noneOf(GuardedCleanupPart.class);
+    private List<MetricsReporter> constructionReporters = java.util.Collections.emptyList();
+    private final java.util.Set<MetricsReporter> guardedClosedConstructionReporters =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    private enum GuardedCleanupPart { COORDINATOR, FETCHER, INTERCEPTORS, KAFKA_METRICS, FETCH_METRICS,
+        METRICS, NETWORK, DESERIALIZERS, TELEMETRY, APP_INFO }
+
     private final List<ConsumerPartitionAssignor> assignors;
     // Init value is needed to avoid NPE in case of exception raised in the constructor
     private Optional<ClientTelemetryReporter> clientTelemetryReporter = Optional.empty();
@@ -175,6 +185,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
             this.defaultApiTimeoutMs = config.getInt(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG);
             this.time = Time.SYSTEM;
             List<MetricsReporter> reporters = CommonClientConfigs.metricsReporters(clientId, config);
+            constructionReporters = reporters;
             this.clientTelemetryReporter = CommonClientConfigs.telemetryReporter(clientId, config);
             this.clientTelemetryReporter.ifPresent(reporters::add);
             this.metrics = createMetrics(config, time, reporters);
@@ -280,13 +291,23 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
             AppInfoParser.registerAppInfo(CONSUMER_JMX_PREFIX, clientId, metrics, time.milliseconds());
             log.debug("Kafka consumer initialized");
         } catch (Throwable t) {
+            if (t instanceof org.apache.kafka.clients.ClientUtils.NetworkConstructionCleanupFailure)
+                failedNetworkConstruction = (org.apache.kafka.clients.ClientUtils.NetworkConstructionCleanupFailure) t;
             // call close methods if internal objects are already constructed; this is to prevent resource leak. see KAFKA-2121
             // we do not need to call `close` at all when `log` is null, which means no internal objects were initialized.
             if (this.log != null) {
                 // If a consumer fails during initialization, it means it hasn't joined the group yet.
                 // Since it's not a group member, we use REMAIN_IN_GROUP option when closing
                 // to prevent sending an unnecessary leave request to the coordinator.
-                close(Duration.ZERO, CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP, true);
+                guardedCloseStarted = true;
+                closed = true;
+                Throwable cleanupFailure = closeGuardedParts(Duration.ZERO,
+                        CloseOptions.GroupMembershipOperation.REMAIN_IN_GROUP);
+                if (cleanupFailure != null) {
+                    ConstructionCleanupFailure retained = new ConstructionCleanupFailure(this, t);
+                    retained.addSuppressed(cleanupFailure);
+                    throw retained;
+                }
             }
             // now propagate the exception
             throw new KafkaException("Failed to construct kafka consumer", t);
@@ -1185,6 +1206,102 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
             closed = true;
             release();
         }
+    }
+
+    @Override
+    public void closeGuardedResources(Duration timeout) {
+        if (timeout == null || timeout.isNegative() || timeout.toMillis() > 60_000)
+            throw new IllegalArgumentException("guarded cleanup requires a finite timeout up to 60s");
+        acquire();
+        try {
+            if (closed && !guardedCloseStarted)
+                throw new IllegalStateException("ordinary closed state has no guarded native cleanup proof");
+            guardedCloseStarted = true;
+            closed = true;
+            Throwable failure = closeGuardedParts(timeout, CloseOptions.GroupMembershipOperation.LEAVE_GROUP);
+            if (failure != null) throw new KafkaException("Guarded consumer cleanup failed", failure);
+        } finally { release(); }
+    }
+
+    @Override
+    public boolean guardedResourcesTerminated() {
+        acquire();
+        try { return guardedCloseStarted && guardedCompleted.size() == GuardedCleanupPart.values().length; }
+        finally { release(); }
+    }
+
+    private Throwable closeGuardedParts(Duration timeout, CloseOptions.GroupMembershipOperation membership) {
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Timer timer = createTimerForRequest(timeout);
+        if (client != null) client.disableWakeups();
+        if (coordinator != null && !guardedCoordinatorAttempted) {
+            try {
+                // Establish actual, bounded heartbeat exit before the ordinary protocol close's unbounded join.
+                coordinator.closeGuardedLocalResources(timer);
+                guardedCoordinatorAttempted = true;
+                coordinator.close(timer, membership);
+            } catch (Throwable failed) { appendGuardedFailure(failure, failed); }
+        }
+        closeGuardedPart(GuardedCleanupPart.COORDINATOR, () -> {
+            if (coordinator != null) coordinator.closeGuardedLocalResources(timer);
+        }, failure);
+        closeGuardedPart(GuardedCleanupPart.FETCHER, () -> {
+            if (fetcher != null) fetcher.closeGuardedResources(timer);
+        }, failure);
+        closeGuardedPart(GuardedCleanupPart.INTERCEPTORS, () -> { if (interceptors != null) interceptors.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.KAFKA_METRICS, () -> { if (kafkaConsumerMetrics != null) kafkaConsumerMetrics.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.FETCH_METRICS, () -> { if (fetchMetricsManager != null) fetchMetricsManager.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.METRICS, () -> {
+            if (metrics != null) {
+                timer.update();
+                metrics.closeGuardedResources(timer.remainingMs());
+            } else {
+                Throwable failedReporters = null;
+                for (MetricsReporter reporter : constructionReporters) {
+                    if (guardedClosedConstructionReporters.contains(reporter)) continue;
+                    try { reporter.close(); guardedClosedConstructionReporters.add(reporter); }
+                    catch (Throwable failed) {
+                        if (failedReporters == null) failedReporters = failed;
+                        else if (failedReporters != failed) failedReporters.addSuppressed(failed);
+                    }
+                }
+                if (failedReporters != null) throw new KafkaException("construction reporter cleanup failed", failedReporters);
+            }
+        }, failure);
+        closeGuardedPart(GuardedCleanupPart.NETWORK, () -> {
+            if (client != null) client.closeGuardedResources();
+            else if (failedNetworkConstruction != null) failedNetworkConstruction.reconcile();
+        }, failure);
+        closeGuardedPart(GuardedCleanupPart.DESERIALIZERS, () -> { if (deserializers != null) deserializers.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.TELEMETRY, () -> clientTelemetryReporter.ifPresent(ClientTelemetryReporter::close), failure);
+        closeGuardedPart(GuardedCleanupPart.APP_INFO, () -> {
+            if (clientId != null && metrics != null) AppInfoParser.unregisterAppInfo(CONSUMER_JMX_PREFIX, clientId, metrics);
+        }, failure);
+        return failure.get();
+    }
+
+    private void closeGuardedPart(GuardedCleanupPart part, Runnable cleanup, AtomicReference<Throwable> failure) {
+        if (guardedCompleted.contains(part)) return;
+        try { cleanup.run(); guardedCompleted.add(part); }
+        catch (Throwable failed) { appendGuardedFailure(failure, failed); }
+    }
+
+    private static void appendGuardedFailure(AtomicReference<Throwable> failure, Throwable failed) {
+        Throwable first = failure.get();
+        if (first == null) failure.set(failed);
+        else if (first != failed) first.addSuppressed(failed);
+    }
+
+    /** Partial construction is exposed only through cleanup; no poll/commit-capable instance escapes. */
+    public static final class ConstructionCleanupFailure extends KafkaException {
+        private static final long serialVersionUID = 1L;
+        private final transient ClassicKafkaConsumer<?, ?> partial;
+        private ConstructionCleanupFailure(ClassicKafkaConsumer<?, ?> partial, Throwable original) {
+            super("Failed to construct kafka consumer; native cleanup is not confirmed", original);
+            this.partial = partial;
+        }
+        public void reconcile(Duration timeout) { partial.closeGuardedResources(timeout); }
+        public boolean resourcesTerminated() { return partial.guardedResourcesTerminated(); }
     }
 
     private Timer createTimerForRequest(final Duration timeout) {

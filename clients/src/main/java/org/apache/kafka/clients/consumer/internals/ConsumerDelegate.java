@@ -38,6 +38,12 @@ public interface ConsumerDelegate<K, V> extends Consumer<K, V> {
 
     ConsumerResourceGuard resourceGuard();
 
+    default void closeGuardedResources(java.time.Duration timeout) {
+        throw new UnsupportedOperationException("guarded cleanup requires the classic consumer");
+    }
+
+    default boolean guardedResourcesTerminated() { return false; }
+
     String clientId();
 
     Metrics metricsRegistry();

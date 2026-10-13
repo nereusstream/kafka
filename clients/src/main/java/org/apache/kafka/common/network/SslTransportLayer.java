@@ -84,6 +84,8 @@ public class SslTransportLayer implements TransportLayer {
     private HandshakeStatus handshakeStatus;
     private SSLEngineResult handshakeResult;
     private State state;
+    private boolean guardedSocketClosed;
+    private boolean guardedChannelClosed;
     private SslAuthenticationException handshakeException;
     private ByteBuffer netReadBuffer;
     private ByteBuffer netWriteBuffer;
@@ -218,6 +220,44 @@ public class SslTransportLayer implements TransportLayer {
                 fileChannelBuffer = null;
             }
         }
+    }
+
+    @Override
+    public synchronized void closeGuardedResources() throws IOException {
+        Throwable failure = null;
+        if (state != State.CLOSING) {
+            try {
+                close();
+                guardedSocketClosed = true;
+                guardedChannelClosed = true;
+            } catch (Throwable failed) { failure = failed; }
+        }
+        state = State.CLOSING;
+        if (!guardedSocketClosed) {
+            try { socketChannel.socket().close(); guardedSocketClosed = true; }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (!guardedChannelClosed) {
+            try { socketChannel.close(); guardedChannelClosed = true; }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        netReadBuffer = null;
+        netWriteBuffer = null;
+        appReadBuffer = null;
+        if (fileChannelBuffer != null) {
+            try { ByteBufferUnmapper.unmap("fileChannelBuffer", fileChannelBuffer); fileChannelBuffer = null; }
+            catch (Throwable failed) {
+                if (failure == null) failure = failed;
+                else if (failure != failed) failure.addSuppressed(failed);
+            }
+        }
+        if (failure != null) throw new IOException("Guarded SSL cleanup failed", failure);
     }
 
     /**

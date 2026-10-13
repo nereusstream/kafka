@@ -277,6 +277,9 @@ public class KerberosLogin extends AbstractLogin {
     }
 
     @Override
+    public boolean guardedResourcesTerminated() { return t == null || !t.isAlive(); }
+
+    @Override
     public Subject subject() {
         return subject;
     }

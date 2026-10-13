@@ -169,6 +169,50 @@ public class LoginManager {
         }
     }
 
+    /** A single owned reference is released once; only the last reference owns native login cleanup. */
+    public GuardedCleanup releaseGuardedReference() {
+        synchronized (LoginManager.class) {
+            if (refCount == 0) throw new IllegalStateException("guarded release called on disposed login");
+            boolean last = --refCount == 0;
+            if (last) {
+                if (loginMetadata.configInfo instanceof Password) DYNAMIC_INSTANCES.remove(loginMetadata);
+                else STATIC_INSTANCES.remove(loginMetadata);
+            }
+            return new GuardedCleanup(this, last);
+        }
+    }
+
+    /** Cleanup-only receipt retains the original login and never decrements another owner's reference. */
+    public static final class GuardedCleanup {
+        private final LoginManager manager;
+        private boolean loginClosed;
+        private boolean callbackClosed;
+        private GuardedCleanup(LoginManager manager, boolean last) {
+            this.manager = manager;
+            loginClosed = !last;
+            callbackClosed = !last;
+        }
+        public synchronized void reconcile() {
+            Throwable failure = null;
+            if (!loginClosed) {
+                try {
+                    manager.login.close();
+                    if (!manager.login.guardedResourcesTerminated())
+                        throw new IllegalStateException("native login resources remain active or unconfirmed");
+                    loginClosed = true;
+                } catch (Throwable failed) { failure = failed; }
+            }
+            if (!callbackClosed) {
+                try { manager.loginCallbackHandler.close(); callbackClosed = true; }
+                catch (Throwable failed) {
+                    if (failure == null) failure = failed;
+                    else if (failure != failed) failure.addSuppressed(failed);
+                }
+            }
+            if (failure != null) throw new org.apache.kafka.common.KafkaException("Guarded login cleanup failed", failure);
+        }
+    }
+
     @Override
     public String toString() {
         return "LoginManager(serviceName=" + serviceName() +

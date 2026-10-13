@@ -69,4 +69,7 @@ public interface Login {
      * Closes this instance.
      */
     void close();
+
+    /** Optional proof for the built-in guarded consumer cleanup path; an unsupported plugin remains unconfirmed. */
+    default boolean guardedResourcesTerminated() { return false; }
 }

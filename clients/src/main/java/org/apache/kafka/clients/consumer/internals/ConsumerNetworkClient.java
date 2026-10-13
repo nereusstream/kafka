@@ -552,6 +552,17 @@ public class ConsumerNetworkClient implements Closeable {
         }
     }
 
+    public void closeGuardedResources() {
+        lock.lock();
+        try {
+            if (!(client instanceof org.apache.kafka.clients.NetworkClient))
+                throw new IllegalStateException("Guarded cleanup requires the original native NetworkClient");
+            ((org.apache.kafka.clients.NetworkClient) client).closeGuardedResources();
+        } finally {
+            lock.unlock();
+        }
+    }
+
 
     /**
      * Check if the code is disconnected and unavailable for immediate reconnection (i.e. if it is in

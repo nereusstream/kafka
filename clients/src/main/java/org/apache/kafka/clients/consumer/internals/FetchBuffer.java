@@ -271,4 +271,15 @@ public class FetchBuffer implements AutoCloseable {
             lock.unlock();
         }
     }
+
+    /** Retry the retained buffers after sealing admission; the idempotent business gate is not cleanup proof. */
+    public void closeGuardedResources() {
+        lock.lock();
+        try {
+            idempotentCloser.close(() -> {});
+            retainAll(Collections.emptySet());
+        } finally {
+            lock.unlock();
+        }
+    }
 }

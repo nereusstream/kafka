@@ -33,6 +33,8 @@ import java.nio.channels.SocketChannel;
 import java.security.Principal;
 
 public interface TransportLayer extends ScatteringByteChannel, TransferableChannel {
+    /** SSL reconciles its unfinished local resources even after the business state has entered CLOSING. */
+    default void closeGuardedResources() throws java.io.IOException { close(); }
 
     /**
      * Returns true if the channel has handshake and authentication done.

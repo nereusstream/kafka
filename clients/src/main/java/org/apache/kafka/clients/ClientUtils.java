@@ -43,7 +43,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
-import static org.apache.kafka.common.utils.Utils.closeQuietly;
 import static org.apache.kafka.common.utils.Utils.getHost;
 import static org.apache.kafka.common.utils.Utils.getPort;
 
@@ -225,10 +224,36 @@ public final class ClientUtils {
                     config.getBoolean(CommonClientConfigs.METADATA_CLUSTER_CHECK_ENABLE_CONFIG)
             );
         } catch (Throwable t) {
-            closeQuietly(selector, "Selector");
-            closeQuietly(channelBuilder, "ChannelBuilder");
-            throw new KafkaException("Failed to create new NetworkClient", t);
+            NetworkConstructionCleanupFailure retained = new NetworkConstructionCleanupFailure(selector, channelBuilder, t);
+            try { retained.reconcile(); }
+            catch (Throwable failed) { if (failed != t) retained.addSuppressed(failed); }
+            throw retained;
         }
+    }
+
+    /** A failed network factory returns no usable client, but preserves its original lower resource owners. */
+    public static final class NetworkConstructionCleanupFailure extends KafkaException {
+        private static final long serialVersionUID = 1L;
+        private final transient Selector selector;
+        private final transient ChannelBuilder builder;
+        private boolean complete;
+        private NetworkConstructionCleanupFailure(Selector selector, ChannelBuilder builder, Throwable original) {
+            super("Failed to create new NetworkClient", original); this.selector = selector; this.builder = builder;
+        }
+        public synchronized void reconcile() {
+            if (complete) return;
+            Throwable original = getCause();
+            if (selector != null) selector.closeGuardedResources();
+            else if (original instanceof Selector.ConstructionCleanupFailure)
+                ((Selector.ConstructionCleanupFailure) original).reconcile();
+            else if (original instanceof ChannelBuilders.ConstructionCleanupFailure)
+                ((ChannelBuilders.ConstructionCleanupFailure) original).reconcile();
+            else if (builder instanceof org.apache.kafka.common.network.SaslChannelBuilder)
+                ((org.apache.kafka.common.network.SaslChannelBuilder) builder).closeGuardedResources();
+            else if (builder != null) builder.close();
+            complete = true;
+        }
+        public synchronized boolean resourcesTerminated() { return complete; }
     }
 
     public static <T> List<?> configuredInterceptors(AbstractConfig config,

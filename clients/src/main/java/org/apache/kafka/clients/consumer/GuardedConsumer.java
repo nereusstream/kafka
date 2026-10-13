@@ -28,4 +28,12 @@ public interface GuardedConsumer<K, V> extends Consumer<K, V> {
 
     /** Polls and requires every non-empty returned batch to carry guarded Fetch evidence. */
     GuardedConsumerRecords<K, V> pollGuarded(Duration timeout);
+
+    /** Closes the original classic consumer and reconciles only its unfinished local resources on later calls. */
+    default void closeGuardedResources(Duration timeout) {
+        throw new UnsupportedOperationException("guarded cleanup requires the classic consumer");
+    }
+
+    /** Actual component cleanup, independent of the business closed flag and the first close outcome. */
+    default boolean guardedResourcesTerminated() { return false; }
 }
