@@ -20,6 +20,15 @@ import java.util.concurrent.Future;
 
 /** Producer API whose success result carries authenticated resource evidence. */
 public interface GuardedProducer<K, V> extends Producer<K, V> {
+    /** Local same-object cleanup; business closure alone does not prove native termination. */
+    default void closeGuardedResources(java.time.Duration timeout) {
+        throw new UnsupportedOperationException("guarded producer native cleanup is unavailable");
+    }
+
+    default boolean guardedResourcesTerminated() { return false; }
+
+    /** Original guarded-close failure is retained after later successful cleanup. */
+    default Throwable guardedFirstCloseFailure() { return null; }
     /**
      * Requires a fresh response from this producer's Metadata path for the exact resource.
      * The query prohibits automatic topic creation and never submits a record or changes a transaction.

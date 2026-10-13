@@ -290,6 +290,18 @@ public class KafkaProducer<K, V> implements GuardedTransactionalProducer<K, V> {
     private final TransactionManager transactionManager;
     // Init value is needed to avoid NPE in case of exception raised in the constructor
     private Optional<ClientTelemetryReporter> clientTelemetryReporter = Optional.empty();
+    private volatile boolean guardedBusinessClosing;
+    private volatile boolean guardedNativeTerminated;
+    private volatile Throwable guardedFirstFailure;
+    private boolean guardedCloseObserved;
+    private KafkaClient guardedNetworkClient;
+    private ClientUtils.NetworkConstructionCleanupFailure guardedNetworkConstruction;
+    private List<MetricsReporter> guardedConstructionReporters = Collections.emptyList();
+    private final java.util.Set<MetricsReporter> guardedClosedConstructionReporters =
+            Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    private enum GuardedCleanupPart { SENDER, ACCUMULATOR, NETWORK, METADATA, INTERCEPTORS, PRODUCER_METRICS,
+        METRICS, KEY_SERIALIZER, VALUE_SERIALIZER, PARTITIONER, TELEMETRY, APP_INFO }
+    private final java.util.EnumSet<GuardedCleanupPart> guardedCompleted = java.util.EnumSet.noneOf(GuardedCleanupPart.class);
 
     /**
      * A producer is instantiated by providing a set of key-value pairs as configuration. Valid configuration strings
@@ -381,6 +393,7 @@ public class KafkaProducer<K, V> implements GuardedTransactionalProducer<K, V> {
                     .recordLevel(Sensor.RecordingLevel.forName(config.getString(ProducerConfig.METRICS_RECORDING_LEVEL_CONFIG)))
                     .tags(metricTags);
             List<MetricsReporter> reporters = CommonClientConfigs.metricsReporters(clientId, config);
+            guardedConstructionReporters = reporters;
             this.clientTelemetryReporter = CommonClientConfigs.telemetryReporter(clientId, config);
             this.clientTelemetryReporter.ifPresent(reporters::add);
             MetricsContext metricsContext = new KafkaMetricsContext(JMX_PREFIX,
@@ -482,10 +495,10 @@ public class KafkaProducer<K, V> implements GuardedTransactionalProducer<K, V> {
             AppInfoParser.registerAppInfo(JMX_PREFIX, clientId, metrics, time.milliseconds());
             log.debug("Kafka producer started");
         } catch (Throwable t) {
-            // call close methods if internal objects are already constructed this is to prevent resource leak. see KAFKA-2121
-            close(Duration.ofMillis(0), true);
-            // now propagate the exception
-            throw new KafkaException("Failed to construct kafka producer", t);
+            // Do not wait for arbitrary native cleanup here. The already registered opening owner retains this handle.
+            guardedBusinessClosing = true;
+            signalGuardedConstructionFailure(t);
+            throw new ConstructionCleanupFailure(this, t);
         }
     }
 
@@ -535,7 +548,8 @@ public class KafkaProducer<K, V> implements GuardedTransactionalProducer<K, V> {
         int requestTimeoutMs = producerConfig.getInt(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG);
         ProducerMetrics metricsRegistry = new ProducerMetrics(this.metrics);
         Sensor throttleTimeSensor = Sender.throttleTimeSensor(metricsRegistry.senderMetrics);
-        KafkaClient client = kafkaClient != null ? kafkaClient : ClientUtils.createNetworkClient(producerConfig,
+        KafkaClient client;
+        try { client = kafkaClient != null ? kafkaClient : ClientUtils.createNetworkClient(producerConfig,
                 this.metrics,
                 "producer",
                 logContext,
@@ -544,7 +558,11 @@ public class KafkaProducer<K, V> implements GuardedTransactionalProducer<K, V> {
                 maxInflightRequests,
                 metadata,
                 throttleTimeSensor,
-                clientTelemetryReporter.map(ClientTelemetryReporter::telemetrySender).orElse(null));
+                clientTelemetryReporter.map(ClientTelemetryReporter::telemetrySender).orElse(null)); }
+        catch (ClientUtils.NetworkConstructionCleanupFailure partial) {
+            guardedNetworkConstruction = partial; throw partial;
+        }
+        guardedNetworkClient = client; // Ownership precedes Sender construction and all later failure points.
 
         short acks = Short.parseShort(producerConfig.getString(ProducerConfig.ACKS_CONFIG));
         return new Sender(logContext,
@@ -1282,6 +1300,7 @@ public class KafkaProducer<K, V> implements GuardedTransactionalProducer<K, V> {
     // Verify that this producer instance has not been closed. This method throws IllegalStateException if the producer
     // has already been closed.
     private void throwIfProducerClosed() {
+        if (guardedBusinessClosing) throw new IllegalStateException("Producer business admission is closed");
         if (sender == null || !sender.isRunning())
             throw new IllegalStateException("Cannot perform operation after producer has been closed");
     }
@@ -1725,6 +1744,145 @@ public class KafkaProducer<K, V> implements GuardedTransactionalProducer<K, V> {
     @Override
     public void close(Duration timeout) {
         close(timeout, false);
+    }
+
+    @Override
+    public synchronized void closeGuardedResources(Duration timeout) {
+        if (timeout == null || timeout.isNegative() || timeout.compareTo(Duration.ofSeconds(60)) > 0)
+            throw new IllegalArgumentException("guarded producer cleanup requires a finite timeout up to 60s");
+        guardedBusinessClosing = true;
+        final boolean firstObservation = !guardedCloseObserved;
+        guardedCloseObserved = true;
+        final long started = System.nanoTime();
+        final long budget = timeout.toNanos();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        if (sender != null && ioThread != null && ioThread.isAlive()) {
+            try { sender.initiateClose(); }
+            catch (Throwable failed) { appendGuardedFailure(failure, failed); }
+            try { joinGuardedSender(started, budget); }
+            catch (Throwable failed) { appendGuardedFailure(failure, failed); }
+            if (ioThread.isAlive()) {
+                try { sender.forceClose(); }
+                catch (Throwable failed) { appendGuardedFailure(failure, failed); }
+                try { joinGuardedSender(started, budget); }
+                catch (Throwable failed) { appendGuardedFailure(failure, failed); }
+            }
+        }
+        if (ioThread != null && ioThread.isAlive()) {
+            appendGuardedFailure(failure, new org.apache.kafka.common.errors.TimeoutException("original producer Sender remains active"));
+            rememberGuardedFailure(failure.get());
+            throw new KafkaException("Guarded producer cleanup is pending", failure.get());
+        }
+        closeGuardedPart(GuardedCleanupPart.SENDER, () -> {
+            if (sender != null) {
+                sender.closeGuardedLocalResources();
+                if (!sender.guardedResourcesTerminated()) throw new IllegalStateException("original Sender resources remain live");
+                if (sender.guardedCleanupFailure() != null) rememberGuardedFailure(sender.guardedCleanupFailure());
+            }
+        }, failure);
+        closeGuardedPart(GuardedCleanupPart.ACCUMULATOR, () -> {
+            if (sender == null && accumulator != null) { accumulator.abortIncompleteBatches(); accumulator.close(); }
+            else if (sender != null && !sender.guardedResourcesTerminated()) throw new IllegalStateException("Sender cleanup is incomplete");
+        }, failure);
+        closeGuardedPart(GuardedCleanupPart.NETWORK, () -> {
+            if (sender == null) {
+                if (guardedNetworkClient != null) {
+                    if (!(guardedNetworkClient instanceof org.apache.kafka.clients.NetworkClient))
+                        throw new UnsupportedOperationException("original native producer network client is required");
+                    ((org.apache.kafka.clients.NetworkClient) guardedNetworkClient).closeGuardedResources();
+                }
+                if (guardedNetworkConstruction != null) guardedNetworkConstruction.reconcile();
+            } else if (!sender.guardedResourcesTerminated()) throw new IllegalStateException("Sender network cleanup is incomplete");
+        }, failure);
+        closeGuardedPart(GuardedCleanupPart.METADATA, () -> { if (sender == null && metadata != null) metadata.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.INTERCEPTORS, () -> { if (interceptors != null) interceptors.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.PRODUCER_METRICS, () -> { if (producerMetrics != null) producerMetrics.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.METRICS, () -> {
+            if (metrics != null) metrics.closeGuardedResources(remainingGuardedMillis(started, budget));
+            else {
+                Throwable reportersFailure = null;
+                for (MetricsReporter reporter : guardedConstructionReporters) {
+                    if (guardedClosedConstructionReporters.contains(reporter)) continue;
+                    try { reporter.close(); guardedClosedConstructionReporters.add(reporter); }
+                    catch (Throwable failed) {
+                        if (reportersFailure == null) reportersFailure = failed;
+                        else if (reportersFailure != failed) reportersFailure.addSuppressed(failed);
+                    }
+                }
+                if (reportersFailure != null) throw new KafkaException("Producer construction reporter cleanup failed", reportersFailure);
+            }
+        }, failure);
+        closeGuardedPart(GuardedCleanupPart.KEY_SERIALIZER, () -> { if (keySerializerPlugin != null) keySerializerPlugin.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.VALUE_SERIALIZER, () -> { if (valueSerializerPlugin != null) valueSerializerPlugin.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.PARTITIONER, () -> { if (partitionerPlugin != null) partitionerPlugin.close(); }, failure);
+        closeGuardedPart(GuardedCleanupPart.TELEMETRY, () -> clientTelemetryReporter.ifPresent(ClientTelemetryReporter::close), failure);
+        closeGuardedPart(GuardedCleanupPart.APP_INFO, () -> {
+            if (clientId != null && metrics != null) AppInfoParser.unregisterAppInfo(JMX_PREFIX, clientId, metrics);
+        }, failure);
+        guardedNativeTerminated = guardedCompleted.size() == GuardedCleanupPart.values().length;
+        if (firstObservation && guardedFirstFailure != null && failure.get() == null) appendGuardedFailure(failure, guardedFirstFailure);
+        if (failure.get() != null) {
+            rememberGuardedFailure(failure.get());
+            throw new KafkaException("Guarded producer cleanup failed", failure.get());
+        }
+    }
+
+    private void signalGuardedConstructionFailure(Throwable original) {
+        if (sender != null) {
+            try { sender.signalGuardedStop(); }
+            catch (Throwable failed) { if (failed != original) original.addSuppressed(failed); }
+        }
+    }
+
+    private void joinGuardedSender(long started, long budget) throws InterruptedException {
+        if (ioThread == null || Thread.currentThread() == ioThread) return;
+        final long remaining = budget - (System.nanoTime() - started);
+        if (remaining <= 0) return;
+        final long millis = TimeUnit.NANOSECONDS.toMillis(remaining);
+        try { ioThread.join(millis, (int) (remaining - TimeUnit.MILLISECONDS.toNanos(millis))); }
+        catch (InterruptedException failed) { Thread.currentThread().interrupt(); throw failed; }
+    }
+
+    private static long remainingGuardedMillis(long started, long budget) {
+        return TimeUnit.NANOSECONDS.toMillis(Math.max(0, budget - (System.nanoTime() - started)));
+    }
+
+    @FunctionalInterface
+    private interface GuardedCleanup { void close() throws Exception; }
+
+    private void closeGuardedPart(GuardedCleanupPart part, GuardedCleanup cleanup, AtomicReference<Throwable> failure) {
+        if (guardedCompleted.contains(part)) return;
+        try { cleanup.close(); guardedCompleted.add(part); }
+        catch (Throwable failed) { appendGuardedFailure(failure, failed); }
+    }
+
+    private static void appendGuardedFailure(AtomicReference<Throwable> failure, Throwable next) {
+        Throwable first = failure.get();
+        if (first == null) failure.set(next);
+        else if (first != next) first.addSuppressed(next);
+    }
+
+    private void rememberGuardedFailure(Throwable failure) {
+        if (guardedFirstFailure == null) guardedFirstFailure = failure;
+        else if (guardedFirstFailure != failure) guardedFirstFailure.addSuppressed(failure);
+    }
+
+    @Override public boolean guardedResourcesTerminated() {
+        return guardedNativeTerminated && (ioThread == null || !ioThread.isAlive());
+    }
+
+    @Override public Throwable guardedFirstCloseFailure() { return guardedFirstFailure; }
+
+    /** Only cleanup of the original partial object is exposed, never its producer business methods. */
+    public static final class ConstructionCleanupFailure extends KafkaException {
+        private static final long serialVersionUID = 1L;
+        private final KafkaProducer<?, ?> partial;
+        private ConstructionCleanupFailure(KafkaProducer<?, ?> partial, Throwable cause) {
+            super("Failed to construct kafka producer; native cleanup is retained", cause); this.partial = partial;
+        }
+        public void reconcile(Duration timeout) { partial.closeGuardedResources(timeout); }
+        public boolean resourcesTerminated() { return partial.guardedResourcesTerminated(); }
+        public Throwable firstCleanupFailure() { return partial.guardedFirstCloseFailure(); }
     }
 
     private void close(Duration timeout, boolean swallowException) {

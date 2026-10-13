@@ -110,6 +110,63 @@ public class Sender implements Runnable {
 
     /* true when the caller wants to ignore all unsent/inflight messages and force close.  */
     private volatile boolean forceClose;
+    private volatile Thread guardedRunThread;
+    private volatile boolean guardedRunExited;
+    private volatile boolean guardedAccumulatorClosed;
+    private volatile boolean guardedTransactionClosed;
+    private volatile boolean guardedBatchesAborted;
+    private volatile boolean guardedNetworkClosed;
+    private volatile Throwable guardedFailure;
+
+    private synchronized void rememberGuardedFailure(Throwable failure) {
+        if (guardedFailure == null) guardedFailure = failure;
+        else if (guardedFailure != failure) guardedFailure.addSuppressed(failure);
+    }
+
+    /** Only the Sender itself, or its owner after real thread exit, may finish original local resources. */
+    public synchronized void closeGuardedLocalResources() {
+        if (guardedRunThread != null && guardedRunThread != Thread.currentThread() && !guardedRunExited)
+            throw new IllegalStateException("Producer Sender has not exited its original run");
+        Throwable failure = null;
+        if (!guardedTransactionClosed) {
+            try { if (transactionManager != null) transactionManager.close(); guardedTransactionClosed = true; }
+            catch (Throwable failed) { failure = failed; }
+        }
+        if (!guardedBatchesAborted) {
+            try { accumulator.abortIncompleteBatches(); guardedBatchesAborted = true; }
+            catch (Throwable failed) { failure = appendGuardedFailure(failure, failed); }
+        }
+        if (!guardedAccumulatorClosed) {
+            try { accumulator.close(); guardedAccumulatorClosed = true; }
+            catch (Throwable failed) { failure = appendGuardedFailure(failure, failed); }
+        }
+        if (!guardedNetworkClosed) {
+            try {
+                if (!(client instanceof org.apache.kafka.clients.NetworkClient))
+                    throw new UnsupportedOperationException("Producer cleanup requires its actual native NetworkClient");
+                ((org.apache.kafka.clients.NetworkClient) client).closeGuardedResources(); guardedNetworkClosed = true;
+            } catch (Throwable failed) { failure = appendGuardedFailure(failure, failed); }
+        }
+        if (failure != null) {
+            rememberGuardedFailure(failure);
+            throw new org.apache.kafka.common.KafkaException("Producer Sender native cleanup failed", failure);
+        }
+    }
+
+    private static Throwable appendGuardedFailure(Throwable first, Throwable next) {
+        if (first == null) return next;
+        if (first != next) first.addSuppressed(next);
+        return first;
+    }
+
+    public boolean guardedResourcesTerminated() {
+        return guardedTransactionClosed && guardedBatchesAborted && guardedAccumulatorClosed && guardedNetworkClosed;
+    }
+
+    public Throwable guardedCleanupFailure() { return guardedFailure; }
+
+    /** Construction failure only signals the existing thread; actual cleanup belongs to its registered owner. */
+    public void signalGuardedStop() { forceClose = true; running = false; wakeup(); }
 
     /* metrics */
     private final SenderMetrics sensors;
@@ -240,6 +297,17 @@ public class Sender implements Runnable {
      */
     @Override
     public void run() {
+        guardedRunThread = Thread.currentThread();
+        try { runBody(); }
+        catch (Throwable failure) { rememberGuardedFailure(failure); throw failure; }
+        finally {
+            try { closeGuardedLocalResources(); }
+            catch (Throwable failure) { rememberGuardedFailure(failure); log.error("Producer native cleanup is incomplete", failure); }
+            guardedRunExited = true;
+        }
+    }
+
+    private void runBody() {
         log.debug("Starting Kafka producer I/O thread.");
 
         // main loop, runs until close is called
@@ -291,13 +359,18 @@ public class Sender implements Runnable {
             if (transactionManager != null) {
                 log.debug("Aborting incomplete transactional requests due to forced shutdown");
                 transactionManager.close();
+                guardedTransactionClosed = true;
             }
             log.debug("Aborting incomplete batches due to forced shutdown");
             this.accumulator.abortIncompleteBatches();
+            guardedBatchesAborted = true;
         }
         try {
-            this.client.close();
+            if (this.client instanceof org.apache.kafka.clients.NetworkClient) {
+                ((org.apache.kafka.clients.NetworkClient) this.client).closeGuardedResources(); guardedNetworkClosed = true;
+            } else { this.client.close(); }
         } catch (Exception e) {
+            rememberGuardedFailure(e);
             log.error("Failed to close network client", e);
         }
 
@@ -545,9 +618,9 @@ public class Sender implements Runnable {
     public void initiateClose() {
         // Ensure accumulator is closed first to guarantee that no more appends are accepted after
         // breaking from the sender loop. Otherwise, we may miss some callbacks when shutting down.
-        this.accumulator.close();
-        this.running = false;
-        this.wakeup();
+        try {
+            if (!guardedAccumulatorClosed) { this.accumulator.close(); guardedAccumulatorClosed = true; }
+        } finally { this.running = false; this.wakeup(); }
     }
 
     /**
