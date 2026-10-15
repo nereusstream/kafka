@@ -567,9 +567,9 @@ public class KafkaAdminClient extends AdminClient {
                 adminAddresses.usingBootstrapControllers());
             metadataManager.update(Cluster.bootstrap(adminAddresses.addresses()), time.milliseconds());
             List<MetricsReporter> reporters = CommonClientConfigs.metricsReporters(clientId, config);
+            if (cleanup != null) cleanup.reporters = reporters;
             clientTelemetryReporter = CommonClientConfigs.telemetryReporter(clientId, config);
             clientTelemetryReporter.ifPresent(reporters::add);
-            if (cleanup != null) cleanup.reporters = reporters;
             Map<String, String> metricTags = Collections.singletonMap("client-id", clientId);
             MetricConfig metricConfig = new MetricConfig().samples(config.getInt(AdminClientConfig.METRICS_NUM_SAMPLES_CONFIG))
                 .timeWindow(config.getLong(AdminClientConfig.METRICS_SAMPLE_WINDOW_MS_CONFIG), TimeUnit.MILLISECONDS)
@@ -824,7 +824,6 @@ public class KafkaAdminClient extends AdminClient {
         private Throwable firstFailure;
         private synchronized void remember(Throwable failure) {
             if (firstFailure == null) firstFailure = failure;
-            else if (firstFailure != failure) firstFailure.addSuppressed(failure);
         }
         private synchronized Throwable firstFailure() { return firstFailure; }
         private synchronized boolean terminated() {
