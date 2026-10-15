@@ -680,6 +680,7 @@ public class KafkaAdminClient extends AdminClient {
         this.partitionLeaderCache = new PartitionLeaderCache();
         this.adminFetchMetricsManager = new AdminFetchMetricsManager(metrics);
         config.logUnused();
+        if (cleanup != null) cleanup.appInfoAttempted = true;
         AppInfoParser.registerAppInfo(JMX_PREFIX, clientId, metrics, time.milliseconds());
         log.debug("Kafka admin client initialized");
         thread.start();
@@ -821,6 +822,7 @@ public class KafkaAdminClient extends AdminClient {
         private boolean networkClosed;
         private boolean metricsClosed;
         private boolean appInfoClosed;
+        private boolean appInfoAttempted;
         private Throwable firstFailure;
         private synchronized void remember(Throwable failure) {
             if (firstFailure == null) firstFailure = failure;
@@ -850,7 +852,7 @@ public class KafkaAdminClient extends AdminClient {
             }
             if (!appInfoClosed) {
                 try {
-                    if (clientId != null) AppInfoParser.unregisterAppInfo(JMX_PREFIX, clientId, metrics);
+                    if (appInfoAttempted) AppInfoParser.unregisterAppInfo(JMX_PREFIX, clientId, metrics);
                     appInfoClosed = true;
                 } catch (Throwable failure) { remember(failure); }
             }
