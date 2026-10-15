@@ -395,6 +395,7 @@ public class KafkaAdminClient extends AdminClient {
      * The network service thread for this admin client.
      */
     private final Thread thread;
+    private final GuardedCleanup guardedCleanup;
 
     /**
      * During a close operation, this is the time at which we will time out all pending operations
@@ -522,10 +523,30 @@ public class KafkaAdminClient extends AdminClient {
         return createInternal(config, timeoutProcessorFactory, null);
     }
 
+    /** Creates the original Admin with observable, retryable native cleanup, including failed construction. */
+    public static KafkaAdminClient createGuarded(Map<String, Object> configuration) {
+        final GuardedCleanup cleanup = new GuardedCleanup();
+        try {
+            return createInternal(new AdminClientConfig(configuration, true), null, null, cleanup);
+        } catch (Throwable failure) {
+            cleanup.cleanupLocal(0);
+            throw new ConstructionCleanupFailure(cleanup, failure);
+        }
+    }
+
     static KafkaAdminClient createInternal(
         AdminClientConfig config,
         TimeoutProcessorFactory timeoutProcessorFactory,
         HostResolver hostResolver
+    ) {
+        return createInternal(config, timeoutProcessorFactory, hostResolver, null);
+    }
+
+    private static KafkaAdminClient createInternal(
+        AdminClientConfig config,
+        TimeoutProcessorFactory timeoutProcessorFactory,
+        HostResolver hostResolver,
+        GuardedCleanup cleanup
     ) {
         Metrics metrics = null;
         NetworkClient networkClient = null;
@@ -534,6 +555,7 @@ public class KafkaAdminClient extends AdminClient {
         ApiVersions apiVersions = new ApiVersions();
         LogContext logContext = createLogContext(clientId);
         Optional<ClientTelemetryReporter> clientTelemetryReporter;
+        if (cleanup != null) cleanup.clientId = clientId;
 
         try {
             // Since we only request node information, it's safe to pass true for allowAutoTopicCreation (and it
@@ -547,6 +569,7 @@ public class KafkaAdminClient extends AdminClient {
             List<MetricsReporter> reporters = CommonClientConfigs.metricsReporters(clientId, config);
             clientTelemetryReporter = CommonClientConfigs.telemetryReporter(clientId, config);
             clientTelemetryReporter.ifPresent(reporters::add);
+            if (cleanup != null) cleanup.reporters = reporters;
             Map<String, String> metricTags = Collections.singletonMap("client-id", clientId);
             MetricConfig metricConfig = new MetricConfig().samples(config.getInt(AdminClientConfig.METRICS_NUM_SAMPLES_CONFIG))
                 .timeWindow(config.getLong(AdminClientConfig.METRICS_SAMPLE_WINDOW_MS_CONFIG), TimeUnit.MILLISECONDS)
@@ -555,6 +578,7 @@ public class KafkaAdminClient extends AdminClient {
             MetricsContext metricsContext = new KafkaMetricsContext(JMX_PREFIX,
                 config.originalsWithPrefix(CommonClientConfigs.METRICS_CONTEXT_PREFIX));
             metrics = new Metrics(metricConfig, reporters, time, metricsContext);
+            if (cleanup != null) cleanup.metrics = metrics;
             networkClient = ClientUtils.createNetworkClient(config,
                 clientId,
                 metrics,
@@ -569,9 +593,15 @@ public class KafkaAdminClient extends AdminClient {
                 (hostResolver == null) ? new DefaultHostResolver() : hostResolver,
                 null,
                 clientTelemetryReporter.map(ClientTelemetryReporter::telemetrySender).orElse(null));
+            if (cleanup != null) cleanup.network = networkClient;
             return new KafkaAdminClient(config, clientId, time, metadataManager, metrics, networkClient,
-                timeoutProcessorFactory, logContext, clientTelemetryReporter);
+                timeoutProcessorFactory, logContext, clientTelemetryReporter, cleanup);
         } catch (Throwable exc) {
+            if (cleanup != null) {
+                if (exc instanceof ClientUtils.NetworkConstructionCleanupFailure)
+                    cleanup.partialNetwork = (ClientUtils.NetworkConstructionCleanupFailure) exc;
+                throw exc;
+            }
             closeQuietly(metrics, "Metrics");
             closeQuietly(networkClient, "NetworkClient");
             throw new KafkaException("Failed to create new KafkaAdminClient", exc);
@@ -613,6 +643,15 @@ public class KafkaAdminClient extends AdminClient {
                              TimeoutProcessorFactory timeoutProcessorFactory,
                              LogContext logContext,
                              Optional<ClientTelemetryReporter> clientTelemetryReporter) {
+        this(config, clientId, time, metadataManager, metrics, client, timeoutProcessorFactory,
+            logContext, clientTelemetryReporter, null);
+    }
+
+    private KafkaAdminClient(AdminClientConfig config, String clientId, Time time,
+                             AdminMetadataManager metadataManager, Metrics metrics, KafkaClient client,
+                             TimeoutProcessorFactory timeoutProcessorFactory, LogContext logContext,
+                             Optional<ClientTelemetryReporter> clientTelemetryReporter, GuardedCleanup cleanup) {
+        this.guardedCleanup = cleanup;
         this.clientId = clientId;
         this.log = logContext.logger(KafkaAdminClient.class);
         this.logContext = logContext;
@@ -625,6 +664,7 @@ public class KafkaAdminClient extends AdminClient {
         this.runnable = new AdminClientRunnable();
         String threadName = NETWORK_THREAD_PREFIX + " | " + clientId;
         this.thread = new KafkaThread(threadName, runnable, true);
+        if (cleanup != null) { cleanup.admin = this; cleanup.thread = thread; }
         this.timeoutProcessorFactory = (timeoutProcessorFactory == null) ?
             new TimeoutProcessorFactory() : timeoutProcessorFactory;
         this.maxRetries = config.getInt(AdminClientConfig.RETRIES_CONFIG);
@@ -672,6 +712,7 @@ public class KafkaAdminClient extends AdminClient {
 
     @Override
     public void close(Duration timeout) {
+        if (guardedCleanup != null) { closeGuardedResources(timeout); return; }
         long waitTimeMs = timeout.toMillis();
         if (waitTimeMs < 0)
             throw new IllegalArgumentException("The timeout cannot be negative.");
@@ -713,6 +754,107 @@ public class KafkaAdminClient extends AdminClient {
         } catch (InterruptedException e) {
             log.debug("Interrupted while joining I/O thread", e);
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /** The original I/O thread and every original native part must exit before this returns success. */
+    public void closeGuardedResources(Duration timeout) {
+        if (guardedCleanup == null) throw new IllegalStateException("Admin was not opened with guarded ownership");
+        Objects.requireNonNull(timeout, "timeout");
+        if (timeout.isNegative()) throw new IllegalArgumentException("negative guarded Admin close timeout");
+        long waitMs = Math.min(TimeUnit.DAYS.toMillis(365), timeout.toMillis());
+        long started = System.nanoTime();
+        long deadline = time.milliseconds() + waitMs;
+        long prior = hardShutdownTimeMs.get();
+        while (prior == INVALID_SHUTDOWN_TIME || deadline < prior) {
+            if (hardShutdownTimeMs.compareAndSet(prior, deadline)) break;
+            prior = hardShutdownTimeMs.get();
+        }
+        try { client.wakeup(); }
+        catch (Throwable failure) { guardedCleanup.remember(failure); }
+        if (Thread.currentThread() == thread)
+            throw new IllegalStateException("Admin I/O thread cannot certify its own exit");
+        try { if (waitMs > 0) thread.join(waitMs); }
+        catch (InterruptedException failure) { Thread.currentThread().interrupt(); guardedCleanup.remember(failure); }
+        if (thread.isAlive()) {
+            org.apache.kafka.common.errors.TimeoutException pending =
+                new org.apache.kafka.common.errors.TimeoutException("original Admin I/O thread remains active");
+            guardedCleanup.remember(pending);
+            throw pending;
+        }
+        long remainingMs = Math.max(0, waitMs - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+        guardedCleanup.cleanupLocal(remainingMs);
+        if (!guardedCleanup.terminated())
+            throw new KafkaException("Guarded Admin cleanup is pending", guardedCleanup.firstFailure());
+    }
+
+    public boolean guardedResourcesTerminated() { return guardedCleanup != null && guardedCleanup.terminated(); }
+    public Throwable guardedFirstCloseFailure() { return guardedCleanup == null ? null : guardedCleanup.firstFailure(); }
+
+    /** No caller Boolean can release the retained partial-construction graph. */
+    public static final class ConstructionCleanupFailure extends KafkaException {
+        private static final long serialVersionUID = 1L;
+        private final transient GuardedCleanup cleanup;
+        private ConstructionCleanupFailure(GuardedCleanup cleanup, Throwable failure) {
+            super("Failed guarded Admin construction; original cleanup is retained", failure); this.cleanup = cleanup;
+        }
+        public void reconcile(Duration timeout) {
+            Objects.requireNonNull(timeout, "timeout");
+            if (timeout.isNegative()) throw new IllegalArgumentException("negative partial Admin close timeout");
+            if (cleanup.admin != null) cleanup.admin.closeGuardedResources(timeout);
+            else cleanup.cleanupLocal(timeout.toMillis());
+            if (!cleanup.terminated()) throw new KafkaException("Partial Admin cleanup is pending", cleanup.firstFailure());
+        }
+        public boolean resourcesTerminated() { return cleanup.terminated(); }
+        public Throwable firstCleanupFailure() { return cleanup.firstFailure(); }
+    }
+
+    private static final class GuardedCleanup {
+        private KafkaAdminClient admin;
+        private Thread thread;
+        private String clientId;
+        private Metrics metrics;
+        private NetworkClient network;
+        private ClientUtils.NetworkConstructionCleanupFailure partialNetwork;
+        private List<MetricsReporter> reporters = List.of();
+        private final Set<MetricsReporter> closedReporters = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        private boolean networkClosed;
+        private boolean metricsClosed;
+        private boolean appInfoClosed;
+        private Throwable firstFailure;
+        private synchronized void remember(Throwable failure) {
+            if (firstFailure == null) firstFailure = failure;
+            else if (firstFailure != failure) firstFailure.addSuppressed(failure);
+        }
+        private synchronized Throwable firstFailure() { return firstFailure; }
+        private synchronized boolean terminated() {
+            return (thread == null || !thread.isAlive()) && networkClosed && metricsClosed && appInfoClosed;
+        }
+        private synchronized void cleanupLocal(long timeoutMs) {
+            // The caller either owns the still-unstarted constructor or has observed actual thread exit.
+            if (thread != null && thread.isAlive() && Thread.currentThread() != thread) return;
+            if (!networkClosed) {
+                try {
+                    if (network != null) network.closeGuardedResources();
+                    if (partialNetwork != null) partialNetwork.reconcile();
+                    networkClosed = true;
+                } catch (Throwable failure) { remember(failure); }
+            }
+            if (!metricsClosed && (thread == null || Thread.currentThread() != thread)) {
+                try {
+                    if (metrics != null) metrics.closeGuardedResources(timeoutMs);
+                    else for (MetricsReporter reporter : reporters) {
+                        if (!closedReporters.contains(reporter)) { reporter.close(); closedReporters.add(reporter); }
+                    }
+                    metricsClosed = true;
+                } catch (Throwable failure) { remember(failure); }
+            }
+            if (!appInfoClosed) {
+                try {
+                    if (clientId != null) AppInfoParser.unregisterAppInfo(JMX_PREFIX, clientId, metrics);
+                    appInfoClosed = true;
+                } catch (Throwable failure) { remember(failure); }
+            }
         }
     }
 
@@ -1482,22 +1624,32 @@ public class KafkaAdminClient extends AdminClient {
                 processRequests();
             } finally {
                 closing = true;
-                AppInfoParser.unregisterAppInfo(JMX_PREFIX, clientId, metrics);
+                try {
+                    if (guardedCleanup == null) AppInfoParser.unregisterAppInfo(JMX_PREFIX, clientId, metrics);
 
-                int numTimedOut = 0;
-                TimeoutProcessor timeoutProcessor = new TimeoutProcessor(Long.MAX_VALUE);
-                synchronized (this) {
-                    numTimedOut += timeoutProcessor.handleTimeouts(newCalls, "The AdminClient thread has exited.");
+                    int numTimedOut = 0;
+                    TimeoutProcessor timeoutProcessor = new TimeoutProcessor(Long.MAX_VALUE);
+                    synchronized (this) {
+                        numTimedOut += timeoutProcessor.handleTimeouts(newCalls, "The AdminClient thread has exited.");
+                    }
+                    numTimedOut += timeoutProcessor.handleTimeouts(pendingCalls, "The AdminClient thread has exited.");
+                    numTimedOut += timeoutCallsToSend(timeoutProcessor);
+                    numTimedOut += timeoutProcessor.handleTimeouts(correlationIdToCalls.values(),
+                        "The AdminClient thread has exited.");
+                    if (numTimedOut > 0) {
+                        log.info("Timed out {} remaining operation(s) during close.", numTimedOut);
+                    }
+                } catch (Throwable failure) {
+                    if (guardedCleanup != null) guardedCleanup.remember(failure);
+                    throw failure;
+                } finally {
+                    if (guardedCleanup == null) {
+                        closeQuietly(client, "KafkaClient");
+                        closeQuietly(metrics, "Metrics");
+                    } else {
+                        guardedCleanup.cleanupLocal(0);
+                    }
                 }
-                numTimedOut += timeoutProcessor.handleTimeouts(pendingCalls, "The AdminClient thread has exited.");
-                numTimedOut += timeoutCallsToSend(timeoutProcessor);
-                numTimedOut += timeoutProcessor.handleTimeouts(correlationIdToCalls.values(),
-                    "The AdminClient thread has exited.");
-                if (numTimedOut > 0) {
-                    log.info("Timed out {} remaining operation(s) during close.", numTimedOut);
-                }
-                closeQuietly(client, "KafkaClient");
-                closeQuietly(metrics, "Metrics");
                 log.debug("Exiting AdminClientRunnable thread.");
             }
         }
