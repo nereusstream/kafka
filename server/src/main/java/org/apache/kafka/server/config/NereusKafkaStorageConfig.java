@@ -388,7 +388,26 @@ public record NereusKafkaStorageConfig(
                         config.getBoolean(
                                 NereusKafkaConfigs.BOOKKEEPER_GC_ENABLED_CONFIG),
                         config.getBoolean(
-                                NereusKafkaConfigs.BOOKKEEPER_GC_DRY_RUN_CONFIG)));
+                                NereusKafkaConfigs.BOOKKEEPER_GC_DRY_RUN_CONFIG),
+                        m5SealedTargetProfile(config)));
+    }
+
+    private static Optional<NereusKafkaBookKeeperConfig.M5SealedTargetProfile> m5SealedTargetProfile(
+            AbstractConfig config) {
+        var profile = optionalText(config, NereusKafkaConfigs.BOOKKEEPER_M5_GC_PROFILE_CONFIG);
+        var audit = optionalText(config, NereusKafkaConfigs.BOOKKEEPER_M5_GC_AUDIT_POLICY_FILE_CONFIG);
+        long graceMillis = config.getLong(NereusKafkaConfigs.BOOKKEEPER_M5_GC_GRACE_MS_CONFIG);
+        if (profile.isEmpty() && audit.isEmpty() && graceMillis == 0) return Optional.empty();
+        if (profile.filter(NereusKafkaBookKeeperConfig.M5SealedTargetProfile.NAME::equals).isEmpty()) {
+            throw invalid(NereusKafkaConfigs.BOOKKEEPER_M5_GC_PROFILE_CONFIG, "requires the explicit sealed-target profile");
+        }
+        if (graceMillis <= 0) {
+            throw invalid(NereusKafkaConfigs.BOOKKEEPER_M5_GC_GRACE_MS_CONFIG, "must be positive for the selected M5 profile");
+        }
+        var auditFile = audit.orElseThrow(() -> invalid(
+                NereusKafkaConfigs.BOOKKEEPER_M5_GC_AUDIT_POLICY_FILE_CONFIG, "is required for first M5 admission"));
+        return Optional.of(new NereusKafkaBookKeeperConfig.M5SealedTargetProfile(
+                Duration.ofMillis(graceMillis), Path.of(auditFile)));
     }
 
     private static Duration multiply(Duration value, int multiplier) {

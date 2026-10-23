@@ -22,6 +22,7 @@ import kafka.utils.TestUtils
 
 import org.apache.kafka.common.config.ConfigException
 import org.apache.kafka.common.metrics.Metrics
+import org.apache.kafka.common.test.{KafkaClusterTestKit, TestKitNodes}
 import org.apache.kafka.common.utils.Time
 import org.apache.kafka.coordinator.group.GroupCoordinatorConfig
 import org.apache.kafka.coordinator.share.ShareCoordinatorConfig
@@ -30,12 +31,13 @@ import org.apache.kafka.metadata.KRaftMetadataCache
 import org.apache.kafka.server.config.{NereusKafkaConfigs, ReplicationConfigs, ServerLogConfigs}
 import org.apache.kafka.server.util.KafkaScheduler
 import org.apache.kafka.storage.internals.log.CleanerConfig
-import org.junit.jupiter.api.Assertions.{assertFalse, assertThrows, assertTrue}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertSame, assertThrows, assertTrue}
 import org.junit.jupiter.api.Test
 import org.mockito.Mockito.mock
 
 import java.time.Duration
 import java.util.Properties
+import java.util.concurrent.atomic.AtomicInteger
 
 class BrokerStorageRuntimeFactoryTest {
   @Test
@@ -73,6 +75,47 @@ class BrokerStorageRuntimeFactoryTest {
       Time.SYSTEM,
       mock(classOf[Metrics]),
       mock(classOf[KafkaScheduler])))
+  }
+
+  @Test
+  def testBrokerShutdownRetainsFirstStorageCloseFailureAfterFinalRetry(): Unit = {
+    val first = new IllegalStateException("first storage close failure")
+    val second = new IllegalStateException("second storage close failure")
+    val attempts = new AtomicInteger()
+    val factory: BrokerStorageRuntimeFactory = context => {
+      val stock = BrokerStorageRuntimeFactory.Disabled.create(context)
+      new BrokerStorageRuntime {
+        override def start() = stock.start()
+        override def unifiedLogFactory = stock.unifiedLogFactory
+        override def appendExecutor = stock.appendExecutor
+        override def fetchExecutor = stock.fetchExecutor
+        override def asyncTopicDeltaLifecycle(replicaManager: kafka.server.ReplicaManager) =
+          stock.asyncTopicDeltaLifecycle(replicaManager)
+        override def beginDrain(reason: BrokerStorageDrainReason) = stock.beginDrain(reason)
+        override def awaitDrained(timeout: Duration) = stock.awaitDrained(timeout)
+        override def close(): Unit = if (attempts.incrementAndGet() == 1) throw first else throw second
+      }
+    }
+    val cluster = new KafkaClusterTestKit.Builder(new TestKitNodes.Builder()
+      .setNumBrokerNodes(1)
+      .setNumControllerNodes(1)
+      .build())
+      .setBrokerStorageRuntimeFactory(factory)
+      .build()
+    try {
+      cluster.format()
+      cluster.startup()
+      cluster.waitForReadyBrokers()
+      val broker = cluster.brokers().values().iterator().next()
+      val failure = assertThrows(classOf[IllegalStateException], () => broker.shutdown())
+      assertSame(first, failure)
+      assertEquals(2, attempts.get())
+      assertEquals(1, failure.getSuppressed.length)
+      assertSame(second, failure.getSuppressed.head)
+      assertTrue(broker.isShutdown)
+    } finally {
+      cluster.close()
+    }
   }
 
   private def context(config: KafkaConfig): BrokerStorageRuntimeContext = BrokerStorageRuntimeContext(

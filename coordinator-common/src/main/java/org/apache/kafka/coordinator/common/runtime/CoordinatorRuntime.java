@@ -615,6 +615,9 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
          */
         CoordinatorBatch currentBatch;
 
+        /** A shard cleanup failure retained for completion-aware unload callers. */
+        Throwable unloadFailure;
+
         /**
          * The batch epoch. Incremented every time a new batch is started.
          * Only valid for the lifetime of the CoordinatorContext. The first batch has an epoch of 1.
@@ -684,6 +687,9 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                             .build(),
                         tp
                     );
+                    // A newly built shard starts a distinct cleanup lifetime. FAILED -> CLOSED must
+                    // retain the previous shard's failure when no new shard was built.
+                    unloadFailure = null;
                     load();
                     break;
 
@@ -768,6 +774,7 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                     coordinator.onUnloaded();
                 } catch (Throwable ex) {
                     log.error("Failed to unload coordinator for {} due to {}.", tp, ex.getMessage(), ex);
+                    unloadFailure = ex;
                 }
             }
             coordinator = null;
@@ -1853,6 +1860,8 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
          */
         final Runnable op;
 
+        final CompletableFuture<Void> completion;
+
         /**
          * The time this event was created.
          */
@@ -1870,9 +1879,19 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
             TopicPartition tp,
             Runnable op
         ) {
+            this(name, tp, op, null);
+        }
+
+        CoordinatorInternalEvent(
+            String name,
+            TopicPartition tp,
+            Runnable op,
+            CompletableFuture<Void> completion
+        ) {
             this.tp = tp;
             this.name = name;
             this.op = op;
+            this.completion = completion;
             this.createdTimeMs = time.milliseconds();
         }
 
@@ -1892,6 +1911,9 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         public void run() {
             try {
                 op.run();
+                if (completion != null) {
+                    completion.complete(null);
+                }
             } catch (Throwable t) {
                 complete(t);
             }
@@ -1906,6 +1928,13 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         public void complete(Throwable exception) {
             if (exception != null) {
                 log.error("Execution of {} failed due to {}.", name, exception.getMessage(), exception);
+            }
+            if (completion != null) {
+                if (exception == null) {
+                    completion.complete(null);
+                } else {
+                    completion.completeExceptionally(exception);
+                }
             }
         }
 
@@ -2453,6 +2482,17 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         enqueueLast(new CoordinatorInternalEvent(name, tp, op));
     }
 
+    private CompletableFuture<Void> scheduleInternalOperationAndWait(
+        String name,
+        TopicPartition tp,
+        Runnable op
+    ) {
+        var completion = new CompletableFuture<Void>();
+        log.debug("Scheduled execution of internal operation {}.", name);
+        enqueueLast(new CoordinatorInternalEvent(name, tp, op, completion));
+        return completion;
+    }
+
     /**
      * Schedules the loading of a coordinator. This is called when the broker is elected as
      * the leader for a partition.
@@ -2519,28 +2559,54 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
         TopicPartition tp,
         OptionalInt partitionEpoch
     ) {
+        scheduleUnloadOperation(tp, partitionEpoch, false);
+    }
+
+    /** Completes after this partition's queued unload has finished or fails if the event is rejected. */
+    public CompletableFuture<Void> scheduleUnloadOperationAndWait(
+        TopicPartition tp,
+        OptionalInt partitionEpoch
+    ) {
+        return scheduleUnloadOperation(tp, partitionEpoch, true);
+    }
+
+    private CompletableFuture<Void> scheduleUnloadOperation(
+        TopicPartition tp,
+        OptionalInt partitionEpoch,
+        boolean awaitCompletion
+    ) {
         throwIfNotRunning();
         log.info("Scheduling unloading of metadata for {} with epoch {}", tp, partitionEpoch);
 
-        scheduleInternalOperation("UnloadCoordinator(tp=" + tp + ", epoch=" + partitionEpoch + ")", tp, () -> {
+        Runnable unload = () -> {
             CoordinatorContext context = coordinators.get(tp);
             if (context != null) {
                 context.lock.lock();
                 try {
                     if (partitionEpoch.isEmpty() || context.epoch < partitionEpoch.getAsInt()) {
                         log.info("Started unloading metadata for {} with epoch {}.", tp, partitionEpoch);
+                        Throwable unloadFailure = null;
                         try {
                             context.transitionTo(CoordinatorState.CLOSED);
-                            log.info("Finished unloading metadata for {} with epoch {}.", tp, partitionEpoch);
+                            if (awaitCompletion) {
+                                unloadFailure = context.unloadFailure;
+                            }
+                            if (unloadFailure == null) {
+                                log.info("Finished unloading metadata for {} with epoch {}.", tp, partitionEpoch);
+                            }
                         } catch (Throwable ex) {
                             // It's very unlikely that we will ever see an exception here, since we
                             // already make an effort to catch exceptions in the unload method.
                             log.error("Failed to unload metadata for {} with epoch {} due to {}.",
                                 tp, partitionEpoch, ex.getMessage(), ex);
+                            unloadFailure = ex;
                         } finally {
                             // Always remove the coordinator context, otherwise the coordinator
                             // shard could be permanently stuck.
                             coordinators.remove(tp, context);
+                        }
+                        if (awaitCompletion && unloadFailure != null) {
+                            throw new IllegalStateException("Coordinator unload failed for " + tp, unloadFailure);
                         }
                     } else {
                         log.info("Ignored unloading metadata for {} in epoch {} since current epoch is {}.",
@@ -2553,7 +2619,13 @@ public class CoordinatorRuntime<S extends CoordinatorShard<U>, U> implements Aut
                 log.info("Ignored unloading metadata for {} in epoch {} since metadata was never loaded.",
                     tp, partitionEpoch);
             }
-        });
+        };
+        String name = "UnloadCoordinator(tp=" + tp + ", epoch=" + partitionEpoch + ")";
+        if (awaitCompletion) {
+            return scheduleInternalOperationAndWait(name, tp, unload);
+        }
+        scheduleInternalOperation(name, tp, unload);
+        return null;
     }
 
     /**

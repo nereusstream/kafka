@@ -437,6 +437,12 @@ public interface GroupCoordinator {
         OptionalInt groupMetadataPartitionLeaderEpoch
     );
 
+    /** Completes after the partition's queued coordinator unload has finished. */
+    CompletableFuture<Void> onResignationAndWait(
+        int groupMetadataPartitionIndex,
+        OptionalInt groupMetadataPartitionLeaderEpoch
+    );
+
     /**
      * A new metadata image is available.
      *

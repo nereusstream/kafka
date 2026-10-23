@@ -46,6 +46,7 @@ plugins {
 // Nereus inject start: isolated development artifact inputs
 def nereusDevelopmentRepository = providers.gradleProperty('nereusDevelopmentRepository')
 def nereusDevelopmentVersion = providers.gradleProperty('nereusDevelopmentVersion')
+def nereusLockedOxiaRepository = providers.gradleProperty('nereusLockedOxiaRepository')
 def nereusDevelopmentEnabled = nereusDevelopmentRepository.isPresent() && nereusDevelopmentVersion.isPresent()
 if (nereusDevelopmentRepository.isPresent() != nereusDevelopmentVersion.isPresent()) {
   throw new GradleException('nereusDevelopmentRepository and nereusDevelopmentVersion must be provided together')
@@ -209,6 +210,16 @@ allprojects {
         url = uri(nereusDevelopmentRepository.get())
         content {
           includeGroup 'com.nereusstream'
+        }
+      }
+      if (nereusLockedOxiaRepository.isPresent()) {
+        maven {
+          name = 'nereusLockedOxia'
+          url = uri(nereusLockedOxiaRepository.get())
+          content {
+            includeModule 'io.github.oxia-db', 'oxia-client'
+            includeModule 'io.github.oxia-db', 'oxia-client-api'
+          }
         }
       }
     }
@@ -1122,6 +1133,35 @@ project(':core') {
       doFirst {
         systemProperty 'nereus.nsip.bkUri', providers.gradleProperty('v2M2BookKeeperMetadataServiceUri').get()
         systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+      }
+    }
+    def sourceFenceFixtures = tasks.register('compileNereusM5SourceFenceFixtures', JavaCompile) {
+      description = 'Compiles the existing synthetic negative-fence fixtures for the Kafka Java 17 test runtime.'
+      source providers.gradleProperty('v2M5KafkaRunSourceRoot').map { root ->
+        fileTree("${root}/nereus-storage-object/src/test/java") {
+          include '**/M5DeleteEligibilityTestFixtures.java', '**/SyntheticDeleteAuthorityFixturesV2.java'
+        }
+      }
+      classpath = sourceSets.test.runtimeClasspath
+      destinationDirectory = layout.buildDirectory.dir('classes/nereusM5SourceFenceFixtures')
+      options.release = 17
+    }
+    tasks.register('nereusBookKeeperM4AdmissionRealTest', Test) {
+      group = 'verification'
+      description = 'Exercises current-source M4 admission and cold native Broker relocation over real BK/Oxia.'
+      testClassesDirs = sourceSets.test.output.classesDirs
+      classpath = sourceSets.test.runtimeClasspath + files(sourceFenceFixtures.flatMap { it.destinationDirectory })
+      useJUnitPlatform()
+      maxParallelForks = 1
+      filter { includeTestsMatching 'kafka.server.nsip.KafkaBookKeeperM4AdmissionRealTest' }
+      dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain', sourceFenceFixtures
+      outputs.upToDateWhen { false }
+      doFirst {
+        systemProperty 'nereus.nsip.bkUri', providers.gradleProperty('v2M2BookKeeperMetadataServiceUri').get()
+        systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+        systemProperty 'nereus.nsip.m4SourceRoot', providers.gradleProperty('v2M5KafkaRunSourceRoot').get()
+        systemProperty 'nereus.nsip.m4RunSummary', providers.gradleProperty('v2M5KafkaRunSummaryFile').get()
+        systemProperty 'nereus.nsip.m5SealedGcProfile', providers.gradleProperty('v2M5KafkaSealedGcProfile').getOrElse('false')
       }
     }
   }

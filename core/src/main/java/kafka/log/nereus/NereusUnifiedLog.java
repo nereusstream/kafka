@@ -83,6 +83,9 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private int publishedEpoch = -1;
     private java.util.function.BooleanSupplier currentOwner = () -> false;
     private long configMetadataOffset = -1;
+    private long m5PolicyMetadataOffset = -1;
+    private java.util.function.BiConsumer<LogConfig, Long> m5PolicyWriter;
+    private final Object m5PolicyGuard = new Object();
     private final ThreadLocal<Boolean> physicallyDispatched = new ThreadLocal<>();
 
     private NereusUnifiedLog(
@@ -194,6 +197,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             if (publishedEpoch == epoch && (expected == null || storage == expected)) {
                 storage = null;
                 publishedEpoch = -1;
+                m5PolicyWriter = null;
             }
         }
     }
@@ -472,13 +476,72 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         return new OffsetResultHolder(await(lookupTimestamp(timestamp, publishedEpoch), fetchTimeout));
     }
 
+    /** Policy and source state captured under the same native append/configuration guard. */
+    public record NativeM5InputCut(
+            KafkaBookKeeperPartitionV1.NativeInputSources inputs, LogConfig config, long policyMetadataOffset) { }
+
+    public NativeM5InputCut captureM5InputCut(
+            int epoch, KafkaBookKeeperPartitionV1 expected, LogConfig imageConfig, long metadataOffset) {
+        synchronized (guard) {
+            if (requireStorage(epoch) != expected || metadataOffset < 0)
+                throw new KafkaStorageException("native M5 policy belongs to a foreign owner or metadata image");
+            var applied = config();
+            if (!applied.values().equals(imageConfig.values()))
+                throw new KafkaStorageException("native M5 topic policy has not reached the current metadata image");
+            // Initial shells and unversioned default-config updates have no topic-config callback offset.
+            // Their effective values must first match this actual KRaft image and broker defaults.
+            if (configMetadataOffset > metadataOffset)
+                throw new KafkaStorageException("native M5 configuration is newer than its metadata image");
+            if (m5PolicyMetadataOffset < 0) m5PolicyMetadataOffset = metadataOffset;
+            return new NativeM5InputCut(expected.nativeInputSources(), applied, m5PolicyMetadataOffset);
+        }
+    }
+
+    /** Installs the original native owner's policy writer before request readiness. */
+    public void installM5PolicyWriter(int epoch, KafkaBookKeeperPartitionV1 expected,
+            java.util.function.BiConsumer<LogConfig, Long> writer) {
+        synchronized (m5PolicyGuard) {
+            final LogConfig current;
+            synchronized (guard) {
+                if (requireStorage(epoch) != expected) throw new KafkaStorageException("native M5 policy writer has another owner");
+                current = config();
+            }
+            writer.accept(current, -1L);
+            synchronized (guard) {
+                if (requireStorage(epoch) != expected) throw new KafkaStorageException("native M5 policy writer owner changed");
+                m5PolicyWriter = java.util.Objects.requireNonNull(writer);
+            }
+        }
+    }
+
+    @Override
+    public LogConfig updateConfig(LogConfig config) {
+        return updateNativeM5Config(config, -1);
+    }
+
     @Override
     public LogConfig updateConfigAtMetadataOffset(LogConfig config, long metadataOffset) {
-        synchronized (guard) {
-            if (metadataOffset < configMetadataOffset) throw new KafkaStorageException("stale metadata config update");
-            var previous = super.updateConfig(config);
-            configMetadataOffset = metadataOffset;
-            return previous;
+        if (metadataOffset < 0) throw new KafkaStorageException("negative metadata config update");
+        return updateNativeM5Config(config, metadataOffset);
+    }
+
+    private LogConfig updateNativeM5Config(LogConfig config, long metadataOffset) {
+        synchronized (m5PolicyGuard) {
+            final java.util.function.BiConsumer<LogConfig, Long> writer;
+            synchronized (guard) {
+                if (metadataOffset >= 0 && metadataOffset < configMetadataOffset)
+                    throw new KafkaStorageException("stale metadata config update");
+                writer = m5PolicyWriter;
+            }
+            // Accepted scans may still need the log guard while this callback drains them.
+            if (writer != null) writer.accept(config, metadataOffset);
+            synchronized (guard) {
+                if (writer != m5PolicyWriter) throw new KafkaStorageException("native M5 policy writer owner changed");
+                var previous = super.updateConfig(config);
+                configMetadataOffset = metadataOffset;
+                m5PolicyMetadataOffset = -1;
+                return previous;
+            }
         }
     }
 

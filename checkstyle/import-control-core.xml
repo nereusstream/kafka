@@ -101,9 +101,66 @@
       <allow pkg="com.nereusstream.storage.api.lifecycle" />
       <allow pkg="com.nereusstream.storage.bookkeeper" />
       <allow pkg="com.nereusstream.storage.object.gc" />
+      <!-- Exact M5 input/control values used by the native owner adapter. -->
+      <allow class="com.nereusstream.storage.object.control.ControlMutationOutcome" />
+      <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain" />
+      <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.ProtocolCoverage" />
+      <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceExtent" />
+      <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceKind" />
+      <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IdentityEnvelope" />
+      <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationSourceCut" />
+      <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PublicationOutcome" />
+      <allow class="com.nereusstream.storage.object.materialization.M5MaterializationCodecV1" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.AdmissionState" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.CapabilityBinding" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingIdentity" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.SelectorMode" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.ProtectionState" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.SourceProtection" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.SourceProtectionIdentity" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlCoordinatorV1" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlCodecV1" />
+      <allow class="com.nereusstream.storage.object.read.control.M4ReadControlKeysV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5MaterializationWorkerCoordinatorV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5TaskSelectionCoordinatorV2" />
+      <allow class="com.nereusstream.storage.object.retention.M5TaskSelectionDecisionV2" />
+      <allow class="com.nereusstream.storage.object.retention.M5BindingAuthorityCodecV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5KafkaBindingPolicyV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5BindingLogicalTrimCoordinatorV2" />
+      <allow class="com.nereusstream.storage.object.retention.M5ClosedWriterRegistryV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5ClosedWriterRegistryV1.WriterDeclarationV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionRecordsV1.FloorClassV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5BindingAuthorityRecordsV1.BindingAuthorityStateV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionRecordsV1.AuthorityFactV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionRecordsV1.M4ReleaseBindingV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionRecordsV1.ReferenceObservationV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionRecordsV1.ReferenceKindV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionRecordsV1.ReferenceDispositionV1" />
+      <allow class="com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1.VersionedValue" />
+      <allow class="com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1" />
+      <allow class="com.nereusstream.metadata.spi.model.MetadataVersion" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionEvidenceAssemblerV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionEvidenceAssemblerV1.FloorAdapterResultV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionEvidenceAssemblerV1.ReferenceAdapterResultV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionRecordsV1.ReferenceScanSummaryV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionRecordsV1.RetentionFloorObservationV1" />
+      <allow class="com.nereusstream.storage.object.gc.DeleteObservationContextV2" />
+      <allow class="com.nereusstream.storage.object.gc.DeleteObservationAuthorityVerifierV2" />
+      <allow class="com.nereusstream.storage.object.gc.M5GcQuotaCoordinatorV2" />
+      <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityCoordinatorV1" />
+      <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityCodecV1" />
+      <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteStoredValueV2" />
+      <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityRecordsV1.ExactExternalIdentityV1" />
+      <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityRecordsV1.TargetDeleteAuthorityStateV1" />
+      <allow class="com.nereusstream.storage.object.retention.M5RetentionRecordsV1" />
       <allow pkg="com.nereusstream.metadata.oxia.v2" />
       <allow pkg="io.oxia.client.api" />
       <allow pkg="org.apache.bookkeeper" />
+      <!-- Only the deterministic native release fixture implements the existing raw Cell CAS contract. -->
+      <file name="NereusKafkaNativeInputReleaseTest(\.java)?" regex="true">
+        <allow class="com.nereusstream.storage.object.control.CanonicalControlMetadataStore" />
+      </file>
     </subpackage>
     <!-- Nereus inject end: exact adapter-backed broker runtime -->
   </subpackage>

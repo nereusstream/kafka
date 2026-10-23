@@ -21,6 +21,7 @@ import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.server.ServerSocketFactory;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.channels.ServerSocketChannel;
 import java.util.HashMap;
@@ -151,9 +152,10 @@ public class PreboundSocketFactoryManager implements AutoCloseable {
             if (closed) {
                 throw new RuntimeException("Cannot open new socket: manager is closed.");
             }
+            // TestKit advertises loopback. A wildcard port can alias a service bound to that specific address.
             socketChannel = ServerSocketFactory.INSTANCE.openServerSocket(
                 listener,
-                new InetSocketAddress(0),
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
                 -1,
                 -1);
             socketsForNode.put(listener, socketChannel);

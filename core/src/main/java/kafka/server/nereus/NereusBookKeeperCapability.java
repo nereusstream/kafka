@@ -32,6 +32,15 @@ import com.nereusstream.storage.api.bookkeeper.BookKeeperTimeoutClassV1;
 import com.nereusstream.storage.api.bookkeeper.CellProviderScopeId;
 import com.nereusstream.storage.bookkeeper.BookKeeperV3Crc32cAddPayloadLimitV1;
 
+import com.nereusstream.domain.identity.KafkaTopicId;
+import com.nereusstream.domain.identity.StorageEpochId;
+import com.nereusstream.domain.identity.TopicBindingId;
+import com.nereusstream.domain.protocol.KafkaTopicIncarnationIdentity;
+import com.nereusstream.domain.protocol.KafkaTopicName;
+import com.nereusstream.domain.identity.Id128;
+import com.nereusstream.storage.api.kafka.KafkaRunRootRecordV2;
+import org.apache.kafka.common.TopicIdPartition;
+
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -41,6 +50,24 @@ import java.util.Properties;
 /** Reads the deployment capability input and checks it against the actual loaded client and native policy. */
 final class NereusBookKeeperCapability {
     private NereusBookKeeperCapability() {}
+
+    static KafkaRunRootRecordV2.Scope nativeScope(TopicIdPartition identity, TopicBindingAggregateRecord aggregate,
+            BookKeeperCapabilitySnapshotV1 capability) {
+        return new KafkaRunRootRecordV2.Scope(
+                new TopicBindingId(Sha256Digest.copyOf(aggregate.bindingId())),
+                new KafkaTopicIncarnationIdentity(new KafkaTopicId(new Id128(identity.topicId().getMostSignificantBits(),
+                        identity.topicId().getLeastSignificantBits())), new KafkaTopicName(identity.topic())),
+                identity.partition(), new StorageEpochId(Sha256Digest.copyOf(aggregate.storageEpochId())), capability.providerScopeId());
+    }
+
+    static com.nereusstream.metadata.oxia.v2.retention.OxiaBindingLifecycleMetadataStoreV2 lifecycleFacts(
+            io.oxia.client.api.AsyncOxiaClient client, com.nereusstream.storage.api.lifecycle.MetadataNamespaceIdentityV2 namespace,
+            KafkaRunRootRecordV2.Scope scope) {
+        var binding = new com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingIdentity(scope.bindingId(),
+                Sha256Digest.hash(com.nereusstream.domain.codec.TopicIncarnationIdentityCodecV1.encode(scope.topic())), scope.storageEpoch().digest());
+        return new com.nereusstream.metadata.oxia.v2.retention.OxiaBindingLifecycleMetadataStoreV2(client,
+                "/nereus/cells/kafka_bk_" + namespace.instanceId().toHex(), scope.partition(), binding);
+    }
 
     static BookKeeperCapabilitySnapshotV1 loadAndValidate(KafkaConfig config) throws Exception {
         var cap = capability(Path.of(config.getString(NereusKafkaConfigs.BOOKKEEPER_CAPABILITY_FILE_CONFIG)));
@@ -70,6 +97,7 @@ final class NereusBookKeeperCapability {
     }
 
     static void validateAggregate(KafkaConfig config, TopicBindingAggregateRecord aggregate) throws Exception {
+        org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1.fromRecord(aggregate, (short) 0);
         var policy = metadataPolicy(config);
         if (!Uuid.fromString(config.nereusKafkaStorageConfig()
                                 .bookKeeper()
@@ -84,6 +112,18 @@ final class NereusBookKeeperCapability {
                 || !Arrays.equals(
                         policy.policyCatalogDigest().digest().bytes().toByteArray(), aggregate.policyCatalogDigest()))
             throw new IllegalArgumentException("native BK activation aggregate differs from local deployment policy");
+    }
+
+    /** Canonical Protocol Cell identity from the aggregate admitted by validateAggregate. */
+    static Sha256Digest protocolCell(TopicBindingAggregateRecord aggregate) {
+        return Sha256Digest.hash(com.nereusstream.domain.codec.ProtocolCellIdentityCodecV1.encode(
+                new com.nereusstream.domain.protocol.KafkaProtocolCellIdentity(
+                        new com.nereusstream.domain.identity.DeploymentId(new com.nereusstream.domain.identity.Id128(
+                                aggregate.deploymentId().getMostSignificantBits(),
+                                aggregate.deploymentId().getLeastSignificantBits())),
+                        new com.nereusstream.domain.identity.KafkaCellId(new com.nereusstream.domain.identity.Id128(
+                                aggregate.kafkaCellId().getMostSignificantBits(),
+                                aggregate.kafkaCellId().getLeastSignificantBits())))));
     }
 
     static org.apache.kafka.metadata.nereus.NereusKafkaMetadataPolicyV1 metadataPolicy(kafka.server.KafkaConfig config)
@@ -102,7 +142,7 @@ final class NereusBookKeeperCapability {
                 false);
     }
 
-    private static Properties descriptor(Path file) throws Exception {
+    static Properties descriptor(Path file) throws Exception {
         if (Files.size(file) > 65_536) throw new IllegalArgumentException("BK capability descriptor exceeds its bound");
         var props = new Properties();
         try (var input = Files.newInputStream(file)) {

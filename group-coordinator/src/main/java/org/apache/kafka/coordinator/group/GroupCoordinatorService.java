@@ -2248,6 +2248,18 @@ public class GroupCoordinatorService implements GroupCoordinator {
         );
     }
 
+    @Override
+    public CompletableFuture<Void> onResignationAndWait(
+        int groupMetadataPartitionIndex,
+        OptionalInt groupMetadataPartitionLeaderEpoch
+    ) {
+        throwIfNotActive();
+        return runtime.scheduleUnloadOperationAndWait(
+            new TopicPartition(Topic.GROUP_METADATA_TOPIC_NAME, groupMetadataPartitionIndex),
+            groupMetadataPartitionLeaderEpoch
+        );
+    }
+
     /**
      * See {@link GroupCoordinator#onMetadataUpdate(MetadataDelta, MetadataImage)}.
      */

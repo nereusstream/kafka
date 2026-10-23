@@ -17,20 +17,28 @@
 
 package org.apache.kafka.common.test;
 
+import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.metadata.properties.MetaPropertiesEnsemble;
+import org.apache.kafka.network.SocketServerConfigs;
+import org.apache.kafka.raft.QuorumConfig;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.channels.SocketChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -41,6 +49,70 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 public class KafkaClusterTestKitTest {
+    @Test
+    public void testDefaultAdvertisedBootstrapAndQuorumEndpointsUseExactLoopback() throws Exception {
+        try (var cluster = new KafkaClusterTestKit.Builder(new TestKitNodes.Builder()
+                .setNumBrokerNodes(1).setNumControllerNodes(1).build()).build()) {
+            cluster.format();
+            cluster.startup();
+            cluster.waitForReadyBrokers();
+            String host = InetAddress.getLoopbackAddress().getHostAddress();
+            assertEquals(host, Utils.getHost(cluster.bootstrapServers()));
+            assertEquals(host, Utils.getHost(cluster.bootstrapControllers()));
+            for (var address : QuorumConfig.parseVoterConnections(cluster.brokers().get(0).config().quorumConfig().voters()).values()) {
+                assertEquals(host, address.getHostString());
+                assertTrue(address.getAddress().isLoopbackAddress());
+            }
+            try (var admin = cluster.admin()) {
+                var nodes = admin.describeCluster().nodes().get(30, TimeUnit.SECONDS);
+                assertEquals(1, nodes.size());
+                for (var node : nodes) {
+                    assertEquals(host, node.host());
+                    var address = new InetSocketAddress(node.host(), node.port());
+                    try (var client = SocketChannel.open(address)) {
+                        assertEquals(address, client.getRemoteAddress());
+                        assertTrue(((InetSocketAddress) client.getRemoteAddress()).getAddress().isLoopbackAddress());
+                        System.out.println("TestKit advertised Broker socket: " + client.getRemoteAddress());
+                    }
+                }
+            }
+            var controller = new InetSocketAddress(Utils.getHost(cluster.bootstrapControllers()), Utils.getPort(cluster.bootstrapControllers()));
+            try (var client = SocketChannel.open(controller)) {
+                assertEquals(controller, client.getRemoteAddress());
+                System.out.println("TestKit Controller bootstrap socket: " + client.getRemoteAddress());
+            }
+        }
+    }
+
+    @Test
+    public void testExplicitListenerAndAdvertisedOverridesRemainExact() throws Exception {
+        var listeners = "EXTERNAL://localhost:0";
+        var advertised = "EXTERNAL://example.invalid:9092";
+        var nodes = new TestKitNodes.Builder().setNumBrokerNodes(1).setNumControllerNodes(1)
+                .setPerServerProperties(Map.of(0, Map.of(SocketServerConfigs.LISTENERS_CONFIG, listeners,
+                        SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG, advertised))).build();
+        try (var cluster = new KafkaClusterTestKit.Builder(nodes).build()) {
+            assertEquals(List.of(listeners), cluster.brokers().get(0).config().getList(SocketServerConfigs.LISTENERS_CONFIG));
+            assertEquals(List.of(advertised), cluster.brokers().get(0).config().getList(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG));
+        }
+    }
+
+    @Test
+    public void testPreboundListenersReserveExactLoopbackEndpoints() throws Exception {
+        try (var manager = new PreboundSocketFactoryManager()) {
+            int port = manager.getOrCreatePortForListener(0, "EXTERNAL");
+            try (var listener = manager.getSocketForListenerAndMarkAsUsed(0, "EXTERNAL")) {
+                var endpoint = new InetSocketAddress(InetAddress.getLoopbackAddress(), port);
+                assertEquals(endpoint, listener.getLocalAddress());
+                try (var client = SocketChannel.open(endpoint); var accepted = listener.accept()) {
+                    assertNotNull(accepted);
+                    assertEquals(client.getLocalAddress(), accepted.getRemoteAddress());
+                    assertEquals(endpoint, accepted.getLocalAddress());
+                }
+            }
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(ints = {0, -1})
     public void testCreateClusterWithBadNumDisksThrows(int disks) {

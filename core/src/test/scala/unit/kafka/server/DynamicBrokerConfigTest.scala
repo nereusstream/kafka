@@ -56,6 +56,26 @@ import scala.collection.Set
 class DynamicBrokerConfigTest {
 
   @Test
+  def testLogDefaultsAtMetadataImageUsesStockPrecedenceWithoutApplying(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, port = 8181)
+    props.put(ServerLogConfigs.LOG_ROLL_TIME_HOURS_CONFIG, "2")
+    val config = KafkaConfig(props)
+    val dynamic = config.dynamicConfig
+    dynamic.initialize(None)
+    val defaults = new Properties()
+    defaults.put(ServerLogConfigs.LOG_ROLL_TIME_MILLIS_CONFIG, "6000")
+    val broker = new Properties()
+    broker.put(ServerLogConfigs.LOG_ROLL_TIME_MILLIS_CONFIG, "7000")
+    val segmentMs = org.apache.kafka.common.config.TopicConfig.SEGMENT_MS_CONFIG
+    assertEquals(7000L, dynamic.logDefaultsAtMetadataImage(defaults, broker).get(segmentMs))
+    assertEquals(6000L, dynamic.logDefaultsAtMetadataImage(defaults, new Properties()).get(segmentMs))
+    assertEquals(7200000L, dynamic.logDefaultsAtMetadataImage(new Properties(), new Properties()).get(segmentMs))
+    assertEquals(7200000L, config.logRollTimeMillis)
+    assertTrue(dynamic.currentDynamicDefaultConfigs.isEmpty)
+    assertTrue(dynamic.currentDynamicBrokerConfigs.isEmpty)
+  }
+
+  @Test
   def testConfigUpdate(): Unit = {
     val props = TestUtils.createBrokerConfig(0, port = 8181)
     val oldKeystore = "oldKs.jks"

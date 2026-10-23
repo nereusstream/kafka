@@ -851,6 +851,21 @@ class PartitionTest extends AbstractPartitionTest {
       partition.beginLeaderEpochAwareOffsetLookup(leaderEpoch - 1))
     partition.beginLeaderEpochAwareOffsetLookup(leaderEpoch)
 
+    val fetch = new FetchRequest.PartitionData(
+      topicId.get,
+      0L,
+      FetchRequest.INVALID_LOG_START_OFFSET,
+      1024,
+      Optional.of(leaderEpoch),
+      Optional.empty[Integer]())
+    assertThrows(classOf[OffsetNotAvailableException], () => partition.fetchRecords(
+      consumerFetchParams(maxBytes = 1024, isolation = FetchIsolation.TXN_COMMITTED),
+      fetch,
+      0L,
+      1024,
+      minOneMessage = false,
+      updateFetchState = false))
+
     assertThrows(classOf[OffsetNotAvailableException], () => partition.fetchOffsetForTimestamp(
       ListOffsetsRequest.LATEST_TIMESTAMP,
       None,

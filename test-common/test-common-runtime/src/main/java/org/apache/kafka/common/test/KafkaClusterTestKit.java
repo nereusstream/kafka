@@ -58,6 +58,7 @@ import org.slf4j.event.Level;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.AbstractMap.SimpleImmutableEntry;
@@ -199,9 +200,7 @@ public class KafkaClusterTestKit implements AutoCloseable {
                     quorumVoterStringBuilder.append(prefix).
                         append(nodeId).
                         append("@").
-                        append("localhost").
-                        append(":").
-                        append(socketFactoryManager.getOrCreatePortForListener(nodeId, controllerListenerName));
+                        append(loopbackAddress(socketFactoryManager.getOrCreatePortForListener(nodeId, controllerListenerName)));
                     prefix = ",";
                 }
                 props.put(QuorumConfig.QUORUM_VOTERS_CONFIG, quorumVoterStringBuilder.toString());
@@ -210,9 +209,7 @@ public class KafkaClusterTestKit implements AutoCloseable {
                 String prefix = "";
                 for (int nodeId : nodes.controllerNodes().keySet()) {
                     bootstrapServersStringBuilder.append(prefix).
-                        append("localhost").
-                        append(":").
-                        append(socketFactoryManager.getOrCreatePortForListener(nodeId, controllerListenerName));
+                        append(loopbackAddress(socketFactoryManager.getOrCreatePortForListener(nodeId, controllerListenerName)));
                     prefix = ",";
                 }
                 props.put(QuorumConfig.QUORUM_BOOTSTRAP_SERVERS_CONFIG, bootstrapServersStringBuilder.toString());
@@ -372,12 +369,12 @@ public class KafkaClusterTestKit implements AutoCloseable {
 
         private String listeners(int node) {
             if (nodes.isCombined(node)) {
-                return String.format("%s://localhost:0,%s://localhost:0", brokerListenerName, controllerListenerName);
+                return String.format("%s://%s,%s://%s", brokerListenerName, loopbackAddress(0), controllerListenerName, loopbackAddress(0));
             }
             if (nodes.controllerNodes().containsKey(node)) {
-                return String.format("%s://localhost:0", controllerListenerName);
+                return String.format("%s://%s", controllerListenerName, loopbackAddress(0));
             }
-            return String.format("%s://localhost:0", brokerListenerName);
+            return String.format("%s://%s", brokerListenerName, loopbackAddress(0));
         }
 
         private String roles(int node) {
@@ -402,6 +399,7 @@ public class KafkaClusterTestKit implements AutoCloseable {
     }
 
     private static final String KAFKA_CLUSTER_THREAD_PREFIX = "kafka-cluster-test-kit-";
+
     private final ExecutorService executorService;
     private final KafkaClusterThreadFactory threadFactory = new KafkaClusterThreadFactory(KAFKA_CLUSTER_THREAD_PREFIX);
     private final TestKitNodes nodes;
@@ -446,6 +444,11 @@ public class KafkaClusterTestKit implements AutoCloseable {
         this.standalone = standalone;
         this.initialVoterSet = initialVoterSet;
         this.deleteOnClose = deleteOnClose;
+    }
+
+    // Use the same concrete address as the reserved sockets; localhost can resolve to other interfaces.
+    private static String loopbackAddress(int port) {
+        return Utils.formatAddress(InetAddress.getLoopbackAddress().getHostAddress(), port);
     }
 
     public void format() throws Exception {
@@ -495,10 +498,10 @@ public class KafkaClusterTestKit implements AutoCloseable {
                     final var controllerNode = nodes.controllerNodes().get(nodeId);
                     dynamicVotersBuilder.append(
                         String.format(
-                            "%d@localhost:%d:%s",
+                            "%d@%s:%s",
                             controllerNode.id(),
-                            socketFactoryManager.
-                                getOrCreatePortForListener(controllerNode.id(), controllerListenerName),
+                            loopbackAddress(socketFactoryManager.
+                                getOrCreatePortForListener(controllerNode.id(), controllerListenerName)),
                             controllerNode.metadataDirectoryId()
                         )
                     );
@@ -515,10 +518,10 @@ public class KafkaClusterTestKit implements AutoCloseable {
                     prefix = ",";
                     dynamicVotersBuilder.append(
                         String.format(
-                            "%d@localhost:%d:%s",
+                            "%d@%s:%s",
                             voterId,
-                            socketFactoryManager.
-                                getOrCreatePortForListener(voterId, controllerListenerName),
+                            loopbackAddress(socketFactoryManager.
+                                getOrCreatePortForListener(voterId, controllerListenerName)),
                             voterDirectoryId
                         )
                     );
@@ -632,7 +635,7 @@ public class KafkaClusterTestKit implements AutoCloseable {
                     "have a bound port for " + listenerName + ".  Did you start " +
                     "the cluster yet?");
             }
-            bld.append(prefix).append("localhost:").append(port);
+            bld.append(prefix).append(loopbackAddress(port));
             prefix = ",";
         }
         return bld.toString();
@@ -654,7 +657,7 @@ public class KafkaClusterTestKit implements AutoCloseable {
                         "have a bound port for " + listenerName + ".  Did you start " +
                         "the cluster yet?");
             }
-            bld.append(prefix).append("localhost:").append(port);
+            bld.append(prefix).append(loopbackAddress(port));
             prefix = ",";
         }
         return bld.toString();

@@ -77,6 +77,7 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
               guard.synchronized {
                 if (recoveryFailure == null && current(attempt)) {
                   try {
+                    opened.attachM5Log(log)
                     partition.installLeaderEpochAwareOffsetLookup(leaderEpoch, lookup)
                     attempt.result.complete(null)
                     signal(identity)
@@ -112,20 +113,28 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
       !registration.inControlledShutdown() && context.brokerEpochSupplier() == slot.brokerEpoch
   }
 
-  def resign(identity: TopicIdPartition, epoch: Int, timeout: Duration): CompletableFuture[Void] = {
+  def resign(identity: TopicIdPartition, epoch: Int, timeout: Duration,
+             onResigned: () => CompletableFuture[Void]): CompletableFuture[Void] = {
     val closing = guard.synchronized {
       slots.get(identity).filter(_.epoch <= epoch).map { slot => slots.remove(identity); revoke(slot); slot }
     }
-    closeSlot(closing)
+    closeSlot(closing, onResigned)
   }
-  def delete(identity: TopicIdPartition, metadataOffset: Long, timeout: Duration): CompletableFuture[Void] = {
+  def delete(identity: TopicIdPartition, metadataOffset: Long, timeout: Duration,
+             onResigned: () => CompletableFuture[Void]): CompletableFuture[Void] = {
     val closing = guard.synchronized { slots.remove(identity).map { slot => revoke(slot); slot } }
-    closeSlot(closing)
+    closeSlot(closing, onResigned)
   }
-  private def closeSlot(slot: Option[Slot]): CompletableFuture[Void] = {
-    // Physical session draining is owned by the provider; a stale resign cannot close another owner's admission.
-    slot.foreach(_.opened.foreach(_.fence()))
-    CompletableFuture.completedFuture(null)
+  private def closeSlot(slot: Option[Slot], onResigned: () => CompletableFuture[Void]): CompletableFuture[Void] = {
+    val coordinator = try {
+      java.util.Objects.requireNonNull(onResigned(), "coordinator resignation returned a null future")
+    } catch {
+      case failure: Throwable => return CompletableFuture.failedFuture(failure)
+    }
+    coordinator.thenCompose(_ => slot.flatMap(_.opened) match {
+      case Some(opened) => opened.closeAsync()
+      case None => CompletableFuture.completedFuture(null)
+    })
   }
   def beginDrain(): Unit = guard.synchronized {
     closed = true

@@ -34,6 +34,35 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NereusKafkaStorageConfigTest {
     @Test
+    void sealedTargetProfileRequiresExplicitSelectionGraceAndAuditWithoutChangingLegacyGc() {
+        var properties = enabledProperties();
+        var legacy = parse(properties).bookKeeper().orElseThrow().ledgerGc();
+        assertTrue(legacy.m5SealedTargetProfile().isEmpty());
+        assertFalse(legacy.enabled());
+        assertTrue(legacy.dryRun());
+
+        properties.put(NereusKafkaConfigs.BOOKKEEPER_M5_GC_PROFILE_CONFIG,
+                NereusKafkaBookKeeperConfig.M5SealedTargetProfile.NAME);
+        assertConfigFailure(properties, NereusKafkaConfigs.BOOKKEEPER_M5_GC_GRACE_MS_CONFIG);
+        properties.put(NereusKafkaConfigs.BOOKKEEPER_M5_GC_GRACE_MS_CONFIG, 25L);
+        assertConfigFailure(properties, NereusKafkaConfigs.BOOKKEEPER_M5_GC_AUDIT_POLICY_FILE_CONFIG);
+        properties.put(NereusKafkaConfigs.BOOKKEEPER_M5_GC_AUDIT_POLICY_FILE_CONFIG, "build/m5-audit-policy.json");
+        var selected = parse(properties).bookKeeper().orElseThrow().ledgerGc();
+        assertEquals(Duration.ofMillis(25), selected.m5SealedTargetProfile().orElseThrow().grace());
+        assertEquals(Path.of("build/m5-audit-policy.json").toAbsolutePath().normalize(),
+                selected.m5SealedTargetProfile().orElseThrow().auditPolicyFile());
+        assertFalse(selected.enabled());
+        assertTrue(selected.dryRun());
+        assertEquals(legacy.drainGrace(), selected.drainGrace());
+        assertEquals(legacy.lateCreateAuditGrace(), selected.lateCreateAuditGrace());
+
+        properties.put(NereusKafkaConfigs.BOOKKEEPER_M5_GC_PROFILE_CONFIG, "UNKNOWN");
+        assertConfigFailure(properties, NereusKafkaConfigs.BOOKKEEPER_M5_GC_PROFILE_CONFIG);
+        properties.remove(NereusKafkaConfigs.BOOKKEEPER_M5_GC_PROFILE_CONFIG);
+        assertConfigFailure(properties, NereusKafkaConfigs.BOOKKEEPER_M5_GC_PROFILE_CONFIG);
+    }
+
+    @Test
     void disabledDefaultsAreSideEffectFreeAndRegisteredInTheBrokerConfigDef() {
         NereusKafkaStorageConfig config = parse(Map.of());
 

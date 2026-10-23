@@ -58,6 +58,7 @@ import java.util.OptionalInt;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -212,6 +213,7 @@ public class CoordinatorRuntimeTest {
         when(builder.withExecutor(any())).thenReturn(builder);
         when(builder.build()).thenReturn(coordinator);
         when(supplier.get()).thenReturn(builder);
+        doThrow(new KafkaException("cleanup failed")).when(coordinator).onUnloaded();
         CompletableFuture<CoordinatorLoader.LoadSummary> future = new CompletableFuture<>();
         when(loader.load(eq(TP), argThat(coordinatorMatcher(runtime, TP)))).thenReturn(future);
 
@@ -229,6 +231,16 @@ public class CoordinatorRuntimeTest {
         assertEquals(FAILED, ctx.state);
 
         // Verify that onUnloaded is called.
+        verify(coordinator, times(1)).onUnloaded();
+
+        // FAILED already attempted this shard cleanup. A subsequent CLOSED transition cannot
+        // turn that unresolved failure into a successful completion-aware unload.
+        var closes = new AtomicInteger();
+        CompletableFuture<Void> unloaded = runtime.scheduleUnloadOperationAndWait(TP, OptionalInt.of(ctx.epoch + 1));
+        unloaded.thenRun(closes::incrementAndGet);
+        CompletionException failure = assertThrows(CompletionException.class, unloaded::join);
+        assertEquals("cleanup failed", failure.getCause().getCause().getMessage());
+        assertEquals(0, closes.get());
         verify(coordinator, times(1)).onUnloaded();
     }
 
@@ -322,6 +334,7 @@ public class CoordinatorRuntimeTest {
         when(builder.withExecutor(any())).thenReturn(builder);
         when(builder.build()).thenReturn(coordinator);
         when(supplier.get()).thenReturn(builder);
+        doThrow(new KafkaException("old shard cleanup failed")).when(coordinator).onUnloaded();
         CompletableFuture<CoordinatorLoader.LoadSummary> future = new CompletableFuture<>();
         when(loader.load(eq(TP), argThat(coordinatorMatcher(runtime, TP)))).thenReturn(future);
 
@@ -361,6 +374,11 @@ public class CoordinatorRuntimeTest {
 
         // Verify the state.
         assertEquals(ACTIVE, ctx.state);
+        // A newly built shard has its own cleanup lifetime and does not inherit the old error.
+        CompletableFuture<Void> unloaded = runtime.scheduleUnloadOperationAndWait(TP, OptionalInt.of(ctx.epoch + 1));
+        assertTrue(unloaded.isDone());
+        assertFalse(unloaded.isCompletedExceptionally());
+        verify(coordinator).onUnloaded();
     }
 
     @Test
@@ -404,7 +422,9 @@ public class CoordinatorRuntimeTest {
         assertEquals(10, ctx.epoch);
 
         // Schedule the unloading.
-        runtime.scheduleUnloadOperation(TP, OptionalInt.of(ctx.epoch + 1));
+        CompletableFuture<Void> unloaded = runtime.scheduleUnloadOperationAndWait(TP, OptionalInt.of(ctx.epoch + 1));
+        assertTrue(unloaded.isDone());
+        assertFalse(unloaded.isCompletedExceptionally());
         assertEquals(CLOSED, ctx.state);
 
         // Verify that onUnloaded is called.
@@ -418,6 +438,33 @@ public class CoordinatorRuntimeTest {
 
         // Getting the coordinator context fails because it no longer exists.
         assertThrows(NotCoordinatorException.class, () -> runtime.contextOrThrow(TP));
+    }
+
+    @Test
+    public void testUnloadCompletionWaitsForQueuedEvent() {
+        MockTimer timer = new MockTimer();
+        ManualEventProcessor processor = new ManualEventProcessor();
+        CoordinatorRuntime<MockCoordinatorShard, String> runtime =
+            new CoordinatorRuntime.Builder<MockCoordinatorShard, String>()
+                .withTime(timer.time())
+                .withTimer(timer)
+                .withDefaultWriteTimeOut(DEFAULT_WRITE_TIMEOUT)
+                .withLoader(new MockCoordinatorLoader())
+                .withEventProcessor(processor)
+                .withPartitionWriter(new MockPartitionWriter())
+                .withCoordinatorShardBuilderSupplier(new MockCoordinatorShardBuilderSupplier())
+                .withCoordinatorRuntimeMetrics(mock(CoordinatorRuntimeMetrics.class))
+                .withCoordinatorMetrics(mock(CoordinatorMetrics.class))
+                .withSerializer(new StringSerializer())
+                .withExecutorService(mock(ExecutorService.class))
+                .withCachedBufferMaxBytesSupplier(() -> CACHED_BUFFER_MAX_BYTES)
+                .build();
+
+        CompletableFuture<Void> unloaded = runtime.scheduleUnloadOperationAndWait(TP, OptionalInt.empty());
+        assertFalse(unloaded.isDone());
+        assertTrue(processor.poll());
+        assertTrue(unloaded.isDone());
+        assertFalse(unloaded.isCompletedExceptionally());
     }
 
     @Test
@@ -622,6 +669,51 @@ public class CoordinatorRuntimeTest {
         verify(coordinator, times(1)).onUnloaded();
 
         // Getting the coordinator context fails because it no longer exists.
+        assertThrows(NotCoordinatorException.class, () -> runtime.contextOrThrow(TP));
+    }
+
+    @Test
+    public void testCompletionAwareUnloadFailsWhenShardCleanupFails() {
+        MockTimer timer = new MockTimer();
+        MockCoordinatorShardBuilderSupplier supplier = mock(MockCoordinatorShardBuilderSupplier.class);
+        MockCoordinatorShardBuilder builder = mock(MockCoordinatorShardBuilder.class);
+        MockCoordinatorShard coordinator = mock(MockCoordinatorShard.class);
+        CoordinatorRuntime<MockCoordinatorShard, String> runtime =
+            new CoordinatorRuntime.Builder<MockCoordinatorShard, String>()
+                .withTime(timer.time())
+                .withTimer(timer)
+                .withDefaultWriteTimeOut(DEFAULT_WRITE_TIMEOUT)
+                .withLoader(new MockCoordinatorLoader())
+                .withEventProcessor(new DirectEventProcessor())
+                .withPartitionWriter(mock(MockPartitionWriter.class))
+                .withCoordinatorShardBuilderSupplier(supplier)
+                .withCoordinatorRuntimeMetrics(mock(CoordinatorRuntimeMetrics.class))
+                .withCoordinatorMetrics(mock(CoordinatorMetrics.class))
+                .withSerializer(new StringSerializer())
+                .withExecutorService(mock(ExecutorService.class))
+                .withCachedBufferMaxBytesSupplier(() -> CACHED_BUFFER_MAX_BYTES)
+                .build();
+
+        when(builder.withSnapshotRegistry(any())).thenReturn(builder);
+        when(builder.withLogContext(any())).thenReturn(builder);
+        when(builder.withTime(any())).thenReturn(builder);
+        when(builder.withTimer(any())).thenReturn(builder);
+        when(builder.withCoordinatorMetrics(any())).thenReturn(builder);
+        when(builder.withTopicPartition(any())).thenReturn(builder);
+        when(builder.withExecutor(any())).thenReturn(builder);
+        when(builder.build()).thenReturn(coordinator);
+        when(supplier.get()).thenReturn(builder);
+        doThrow(new KafkaException("error")).when(coordinator).onUnloaded();
+
+        runtime.scheduleLoadOperation(TP, 10);
+        int epoch = runtime.contextOrThrow(TP).epoch;
+        var closes = new AtomicInteger();
+        CompletableFuture<Void> unloaded = runtime.scheduleUnloadOperationAndWait(TP, OptionalInt.of(epoch + 1));
+        unloaded.thenRun(closes::incrementAndGet);
+        CompletionException failure = assertThrows(CompletionException.class, unloaded::join);
+        assertEquals("error", failure.getCause().getCause().getMessage());
+        assertEquals(0, closes.get());
+        verify(coordinator).onUnloaded();
         assertThrows(NotCoordinatorException.class, () -> runtime.contextOrThrow(TP));
     }
 

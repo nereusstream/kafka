@@ -158,6 +158,12 @@ public final class NereusKafkaConfigs {
             "nereus.kafka.storage.bookkeeper.gc.late.create.audit.grace.ms";
     public static final long BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_DEFAULT =
             7L * 24L * 60L * 60L * 1_000L;
+    public static final String BOOKKEEPER_M5_GC_PROFILE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.m5.gc.profile";
+    public static final String BOOKKEEPER_M5_GC_GRACE_MS_CONFIG =
+            "nereus.kafka.storage.bookkeeper.m5.gc.grace.ms";
+    public static final String BOOKKEEPER_M5_GC_AUDIT_POLICY_FILE_CONFIG =
+            "nereus.kafka.storage.bookkeeper.m5.gc.audit.policy.file";
     public static final String CACHE_DIR_CONFIG = "nereus.kafka.storage.cache.dir";
 
     public static final String APPEND_TIMEOUT_MS_CONFIG = "nereus.kafka.storage.append.timeout.ms";
@@ -432,6 +438,12 @@ public final class NereusKafkaConfigs {
             .define(BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_CONFIG, LONG,
                     BOOKKEEPER_GC_LATE_CREATE_AUDIT_GRACE_MS_DEFAULT, atLeast(1_000L), MEDIUM,
                     "Audit separation between two provider-absence observations.")
+            .define(BOOKKEEPER_M5_GC_PROFILE_CONFIG, STRING, null, HIGH,
+                    "Explicit M5 sealed-target profile; absent by default. Selection alone grants no deletion authority.")
+            .define(BOOKKEEPER_M5_GC_GRACE_MS_CONFIG, LONG, 0L, between(0L, Long.MAX_VALUE / 1_000_000L), HIGH,
+                    "Positive monotonic-epoch grace for the explicitly selected M5 profile; zero means unselected.")
+            .define(BOOKKEEPER_M5_GC_AUDIT_POLICY_FILE_CONFIG, STRING, null, HIGH,
+                    "Explicit deployment audit-policy input for first M5 admission; missing or unqualified policy vetoes GC.")
             .define(CACHE_DIR_CONFIG, STRING, null, HIGH,
                     "Dedicated ephemeral Nereus cache directory.")
             .define(APPEND_TIMEOUT_MS_CONFIG, LONG, APPEND_TIMEOUT_MS_DEFAULT,

@@ -72,7 +72,7 @@ final class NereusTopicDeltaLifecycle(
     delta: TopicsDelta,
     newImage: MetadataImage,
     onLeaderReady: (TopicPartition, Int) => Unit,
-    onResigned: (TopicPartition, Option[Int]) => Unit
+    onResigned: (TopicPartition, Option[Int]) => CompletableFuture[Void]
   ): CompletableFuture[Void] = {
     Objects.requireNonNull(delta, "delta")
     Objects.requireNonNull(newImage, "newImage")
@@ -118,11 +118,11 @@ final class NereusTopicDeltaLifecycle(
         val previousIdentity = deletedIdentity(delta, topicPartition)
         retainedLeaderEpoch(newImage, topicPartition, previousIdentity) match {
           case Some(observedLeaderEpoch) =>
-            partitionLifecycle.resign(previousIdentity, observedLeaderEpoch, operationTimeout)
-              .thenRun(() => onResigned(topicPartition, Some(observedLeaderEpoch)))
+            partitionLifecycle.resign(previousIdentity, observedLeaderEpoch, operationTimeout,
+              () => onResigned(topicPartition, Some(observedLeaderEpoch)))
           case None =>
-            partitionLifecycle.delete(previousIdentity, metadataOffset, operationTimeout)
-              .thenRun(() => onResigned(topicPartition, None))
+            partitionLifecycle.delete(previousIdentity, metadataOffset, operationTimeout,
+              () => onResigned(topicPartition, None))
         }
       }
     }
@@ -133,8 +133,8 @@ final class NereusTopicDeltaLifecycle(
         partitionLifecycle.resign(
           identity(topicPartition, info.topicId().toString),
           observedLeaderEpoch,
-          operationTimeout)
-          .thenRun(() => onResigned(topicPartition, Some(observedLeaderEpoch)))
+          operationTimeout,
+          () => onResigned(topicPartition, Some(observedLeaderEpoch)))
       }
     }
 

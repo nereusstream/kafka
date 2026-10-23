@@ -367,6 +367,19 @@ class DynamicBrokerConfig(private val kafkaConfig: KafkaConfig) extends Logging 
     require(nonDynamic.isEmpty, s"Reconfigurable contains non-dynamic configs $nonDynamic")
   }
 
+  /** Effective log defaults from this exact KRaft image, including the stock synonym/override precedence.
+    * M5 must not use older applied defaults while the metadata cache is ahead of configuration callbacks.
+    * This is a low-frequency control projection; it does not apply or notify configuration changes.
+    */
+  private[server] def logDefaultsAtMetadataImage(defaults: Properties, broker: Properties): util.Map[String, Object] =
+    CoreUtils.inReadLock(lock) {
+      val props = mutable.Map[String, String]()
+      props ++= staticBrokerConfigs
+      overrideProps(props, fromPersistentProps(defaults, perBrokerConfig = false).asScala)
+      overrideProps(props, fromPersistentProps(broker, perBrokerConfig = true).asScala)
+      new KafkaConfig(props.asJava, false).extractLogConfigMap
+    }
+
   // Visibility for testing
   private[server] def currentKafkaConfig: KafkaConfig = CoreUtils.inReadLock(lock) {
     currentConfig

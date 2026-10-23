@@ -20,6 +20,7 @@ package org.apache.kafka.server.config;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Optional;
 
 /** Immutable stock-owned snapshot of the complete BookKeeper primary-WAL binding. */
 public record NereusKafkaBookKeeperConfig(
@@ -94,9 +95,16 @@ public record NereusKafkaBookKeeperConfig(
             Duration drainGrace,
             Duration lateCreateAuditGrace,
             boolean enabled,
-            boolean dryRun
+            boolean dryRun,
+            Optional<M5SealedTargetProfile> m5SealedTargetProfile
     ) {
+        public LedgerGc(int maxConcurrentDeletes, Duration maxClockSkew, Duration drainGrace,
+                Duration lateCreateAuditGrace, boolean enabled, boolean dryRun) {
+            this(maxConcurrentDeletes, maxClockSkew, drainGrace, lateCreateAuditGrace, enabled, dryRun, Optional.empty());
+        }
+
         public LedgerGc {
+            m5SealedTargetProfile = Objects.requireNonNull(m5SealedTargetProfile, "m5SealedTargetProfile");
             if (maxConcurrentDeletes <= 0) {
                 throw new IllegalArgumentException(
                         "BookKeeper GC maxConcurrentDeletes must be positive");
@@ -143,6 +151,20 @@ public record NereusKafkaBookKeeperConfig(
                 throw new IllegalArgumentException(name + " must be non-negative");
             }
             return exact;
+        }
+    }
+
+    /** Operator selection only; actual provider/audit minima and first durable admission remain mandatory. */
+    public record M5SealedTargetProfile(Duration grace, Path auditPolicyFile) {
+        public static final String NAME = "M5_SEALED_TARGET_CONFIRMED_DRAIN_V1";
+
+        public M5SealedTargetProfile {
+            Objects.requireNonNull(grace, "grace");
+            auditPolicyFile = Objects.requireNonNull(auditPolicyFile, "auditPolicyFile").toAbsolutePath().normalize();
+            long millis = grace.toMillis();
+            if (millis <= 0 || millis > Long.MAX_VALUE / 1_000_000L || !grace.equals(Duration.ofMillis(millis))) {
+                throw new IllegalArgumentException("M5 sealed-target grace must be finite and positive");
+            }
         }
     }
 

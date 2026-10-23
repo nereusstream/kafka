@@ -325,8 +325,9 @@ class BrokerMetadataPublisher(
         },
         (topicPartition, leaderEpoch) => asyncAuthorityLock.synchronized {
           if (asyncAuthorities.get(topicPartition) == expected.getOrElse(topicPartition, None)) {
-            onAsyncResigned(deltaName, topicPartition, leaderEpoch)
-          }
+            onAsyncResigned(topicPartition, leaderEpoch)
+          } else CompletableFuture.failedFuture[Void](new FencedLeaderEpochException(
+            s"Coordinator resignation for $topicPartition was superseded"))
         })
     } catch {
       case t: Throwable => CompletableFuture.failedFuture[Void](t)
@@ -374,24 +375,22 @@ class BrokerMetadataPublisher(
   }
 
   private def onAsyncResigned(
-    deltaName: String,
     topicPartition: TopicPartition,
     leaderEpoch: Option[Int]
-  ): Unit = {
+  ): CompletableFuture[Void] = {
     try {
       topicPartition.topic() match {
         case Topic.GROUP_METADATA_TOPIC_NAME =>
-          groupCoordinator.onResignation(topicPartition.partition(), toOptionalInt(leaderEpoch))
+          groupCoordinator.onResignationAndWait(topicPartition.partition(), toOptionalInt(leaderEpoch))
         case Topic.TRANSACTION_STATE_TOPIC_NAME =>
           txnCoordinator.onResignation(topicPartition.partition(), leaderEpoch)
+          CompletableFuture.completedFuture(null)
         case Topic.SHARE_GROUP_STATE_TOPIC_NAME =>
-          shareCoordinator.onResignation(topicPartition.partition(), toOptionalInt(leaderEpoch))
-        case _ =>
+          shareCoordinator.onResignationAndWait(topicPartition.partition(), toOptionalInt(leaderEpoch))
+        case _ => CompletableFuture.completedFuture(null)
       }
     } catch {
-      case t: Throwable => metadataPublishingFaultHandler.handleFault(
-        s"Error resigning coordinator for $topicPartition after asynchronous lifecycle in $deltaName",
-        t)
+      case t: Throwable => CompletableFuture.failedFuture(t)
     }
   }
 

@@ -18,6 +18,7 @@ package kafka.server.nsip;
 
 import kafka.log.nereus.NereusUnifiedLog;
 import kafka.server.nereus.NereusBrokerStorageRuntimeFactory;
+import kafka.server.nereus.NereusClosedOwnerProbe;
 import kafka.server.nereus.NereusControllerStorageRuntimeFactory;
 
 import org.apache.kafka.clients.admin.Admin;
@@ -46,6 +47,7 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
+import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1;
 import org.apache.kafka.server.common.MetadataVersion;
 
 import org.junit.jupiter.api.Test;
@@ -53,6 +55,7 @@ import org.junit.jupiter.api.Timeout;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
@@ -74,17 +77,141 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /** Actual Kafka protocol, Controller and Brokers, over the admitted real BK/Oxia backend. */
 public class KafkaBookKeeperOwnerRelocationRealTest {
     @Test
+    @Timeout(value = 180)
+    public void liveMetadataDeltaHandoffPreservesGroupAndTransactionCoordinators() throws Exception {
+        String uri = System.getProperty("nereus.nsip.bkUri");
+        String oxia = System.getProperty("nereus.nsip.oxia");
+        if (uri == null || oxia == null) {
+            throw new IllegalStateException("real BK/Oxia inputs are required");
+        }
+        Path inputs = Files.createTempDirectory("nereus-nsip-live-handoff-");
+        writeCapability(inputs);
+        var bootstrap = BootstrapMetadata.fromVersion(MetadataVersion.latestTesting(), "nsip-live-handoff")
+                .copyWithFeatureRecord("nereus.storage.version", (short) 2);
+        try (var delayedMetadata = new DelayedMetadata(oxia)) {
+            var nodes = new TestKitNodes.Builder(bootstrap)
+                    .setPerServerProperties(
+                            Map.of(1, Map.of("nereus.kafka.storage.oxia.service.address", delayedMetadata.address())))
+                    .setNumBrokerNodes(2)
+                    .setNumControllerNodes(1)
+                    .build();
+            var builder = new KafkaClusterTestKit.Builder(nodes)
+                    .setBrokerStorageRuntimeFactory(new NereusBrokerStorageRuntimeFactory())
+                    .setControllerStorageRuntimeFactory(new NereusControllerStorageRuntimeFactory());
+            nativeConfig(inputs, uri, oxia).forEach(builder::setConfigProp);
+            try (KafkaClusterTestKit cluster = builder.build()) {
+                cluster.format();
+                cluster.startup();
+                cluster.waitForReadyBrokers();
+                var client = new Properties();
+                client.put("bootstrap.servers", cluster.bootstrapServers());
+                try (Admin admin = Admin.create(client)) {
+                    admin.createTopics(List.of(
+                                    new NewTopic("native-cold", Map.of(0, List.of(0))),
+                                    new NewTopic("__transaction_state", Map.of(0, List.of(0)))
+                                            .configs(Map.of("cleanup.policy", "compact")),
+                                    new NewTopic("__consumer_offsets", Map.of(0, List.of(0)))
+                                            .configs(Map.of("cleanup.policy", "compact"))))
+                            .all()
+                            .get(30, TimeUnit.SECONDS);
+                    var config = new Properties();
+                    config.putAll(client);
+                    config.put("key.serializer", StringSerializer.class.getName());
+                    config.put("value.serializer", StringSerializer.class.getName());
+                    config.put("enable.idempotence", "true");
+                    config.put("acks", "all");
+                    config.put("transactional.id", "native-live-handoff");
+                    try (KafkaProducer<String, String> producer = new KafkaProducer<>(config)) {
+                        producer.initTransactions();
+                        producer.beginTransaction();
+                        assertEquals(0, producer.send(new ProducerRecord<>("native-cold", 0, "key", "before"))
+                                .get(30, TimeUnit.SECONDS).offset());
+                        producer.commitTransaction();
+                        commitGroupOffset(client, 1);
+                        var topicPartition = new TopicPartition("native-cold", 0);
+                        var topicId = admin.describeTopics(List.of("native-cold"))
+                                .allTopicNames().get(30, TimeUnit.SECONDS).get("native-cold").topicId();
+                        var brokerZero = cluster.brokers().get(0);
+                        long oldOwnerEpoch = Math.addExact((long) brokerZero.replicaManager()
+                                .onlinePartition(topicPartition).get().getLeaderEpoch(), 1L);
+                        var aggregate = KafkaTopicBindingAggregateMapperV1.toRecord(brokerZero.metadataCache()
+                                .getImage().topics().getTopic(topicId).nereusAggregate().orElseThrow());
+                        try (var probe = new NereusClosedOwnerProbe(
+                                brokerZero.config(), topicId, topicPartition, aggregate, oldOwnerEpoch)) {
+                            assertFalse(probe.archived(oldOwnerEpoch));
+                            delayedMetadata.pauseResponses();
+                            admin.alterPartitionReassignments(Map.of(
+                                        new TopicPartition("native-cold", 0),
+                                                java.util.Optional.of(
+                                                        new org.apache.kafka.clients.admin.NewPartitionReassignment(List.of(1))),
+                                        new TopicPartition("__transaction_state", 0),
+                                                java.util.Optional.of(
+                                                        new org.apache.kafka.clients.admin.NewPartitionReassignment(List.of(1))),
+                                        new TopicPartition("__consumer_offsets", 0),
+                                                java.util.Optional.of(
+                                                        new org.apache.kafka.clients.admin.NewPartitionReassignment(List.of(1)))))
+                                    .all()
+                                    .get(30, TimeUnit.SECONDS);
+                            assertEquals(1, awaitLeader(admin, 0));
+                            delayedMetadata.awaitHeldResponse();
+                            awaitCondition(() -> cluster.brokers().get(1).replicaManager()
+                                    .onlinePartition(topicPartition).isDefined(),
+                                    "pending native partition was not published");
+                            assertFalse(log(cluster, 1).nereusWritable(cluster.brokers().get(1).replicaManager()
+                                    .onlinePartition(topicPartition).get().getLeaderEpoch()));
+                            awaitClosedOwner(probe, oldOwnerEpoch);
+                            for (var birth : probe.closedBirths(oldOwnerEpoch)) {
+                                assertEquals(0, probe.activeCreateTickets(birth.handle()),
+                                        "confirmed native creation must reconcile its writer ticket");
+                            }
+                            assertFalse(cluster.brokers().get(0).isShutdown());
+                            delayedMetadata.resumeResponses();
+                        }
+                        awaitTopicLeader(admin, "__transaction_state", 1);
+                        awaitTopicLeader(admin, "__consumer_offsets", 1);
+                        awaitCondition(() -> {
+                            var partition = cluster.brokers().get(1).replicaManager()
+                                    .onlinePartition(new TopicPartition("native-cold", 0));
+                            return partition.isDefined() && log(cluster, 1).nereusWritable(partition.get().getLeaderEpoch());
+                        }, "new online owner did not become native-writable");
+                        assertFalse(cluster.brokers().get(0).isShutdown());
+                        producer.beginTransaction();
+                        assertEquals(2, producer.send(new ProducerRecord<>("native-cold", 0, "key", "after"))
+                                .get(30, TimeUnit.SECONDS).offset());
+                        producer.commitTransaction();
+                        assertEquals(List.of("before", "after"), consume(client, 2));
+                        assertEquals(1, readGroupOffset(client));
+                    }
+                    cluster.fatalFaultHandler().maybeRethrowFirstException();
+                    cluster.nonFatalFaultHandler().maybeRethrowFirstException();
+                }
+            }
+        } finally {
+            try (var files = Files.walk(inputs)) {
+                for (var file : files.sorted(java.util.Comparator.reverseOrder()).toList()) {
+                    Files.deleteIfExists(file);
+                }
+            }
+        }
+    }
+
+    @Test
     @Timeout(value = 240)
     public void coldOwnerContinuesProduceFetchAndTransactionAcrossTwoNativeRelocations() throws Exception {
+        runColdOwnerRelocations(java.util.Optional.empty());
+    }
+
+    static void runColdOwnerRelocations(java.util.Optional<Path> m4Summary) throws Exception {
         String uri = System.getProperty("nereus.nsip.bkUri");
         String oxia = System.getProperty("nereus.nsip.oxia");
         if (uri == null || oxia == null) throw new IllegalStateException("real BK URI and Oxia address are required");
         Path inputs = Files.createTempDirectory("nereus-nsip-native-");
-        writeCapability(inputs);
+        writeCapability(inputs, m4Summary);
         var bootstrap = BootstrapMetadata.fromVersion(MetadataVersion.latestTesting(), "nsip-native")
                 .copyWithFeatureRecord("nereus.storage.version", (short) 2);
         try (var delayedMetadata = new DelayedMetadata(oxia)) {
@@ -105,6 +232,10 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                 var client = new Properties();
                 client.put("bootstrap.servers", cluster.bootstrapServers());
                 try (Admin admin = Admin.create(client)) {
+                    for (var broker : admin.describeCluster().nodes().get(30, TimeUnit.SECONDS)) {
+                        assertEquals(InetAddress.getLoopbackAddress().getHostAddress(), broker.host());
+                        System.out.println("Native cold relocation advertised Broker: " + broker.host() + ":" + broker.port());
+                    }
                     admin.createTopics(List.of(
                                     new NewTopic("native-cold", Map.of(0, List.of(0))),
                                     new NewTopic("__transaction_state", Map.of(0, List.of(0)))
@@ -247,8 +378,9 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                 .setNumBrokerNodes(3)
                 .setNumControllerNodes(1)
                 .build();
+        var storageFactory = new FailFirstNereusStorageCloseFactory(0);
         var builder = new KafkaClusterTestKit.Builder(nodes)
-                .setBrokerStorageRuntimeFactory(new NereusBrokerStorageRuntimeFactory())
+                .setBrokerStorageRuntimeFactory(storageFactory)
                 .setControllerStorageRuntimeFactory(new NereusControllerStorageRuntimeFactory());
         nativeConfig(inputs, uri, oxia).forEach(builder::setConfigProp);
         builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.entries.per.ledger", "8");
@@ -319,8 +451,15 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                                         .get(30, TimeUnit.SECONDS)
                                         .offset());
                     }
+                    assertEquals(55, log(cluster, 0).highWatermark());
+                    assertEquals(41, log(cluster, 0).lastStableOffset());
                     cluster.brokers().get(0).shutdown();
+                    assertEquals(2, storageFactory.attempts());
+                    assertEquals(1, storageFactory.completedNativeCloses());
                     int next = awaitLeader(admin, 0);
+                    awaitCondition(
+                            () -> log(cluster, next).nereusWritable(257),
+                            "second cold Owner did not install recovered native state");
                     awaitCondition(
                             () -> log(cluster, next).highWatermark() == 55, "second cold Owner did not recover tail");
                     assertEquals(41, log(cluster, next).lastStableOffset());
@@ -348,6 +487,10 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
     }
 
     private static void writeCapability(Path inputs) throws Exception {
+        writeCapability(inputs, java.util.Optional.empty());
+    }
+
+    public static void writeCapability(Path inputs, java.util.Optional<Path> m4Summary) throws Exception {
         Path capability = inputs.resolve("capability.properties");
         Path password = inputs.resolve("password");
         Files.write(password, new byte[0]);
@@ -376,9 +519,21 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
             configurationDigest=eaf41c4b42b767b8ea6e86023a784425b8073f174dbade92b4249c8f3d301dbd
             policyCatalogDigest=40e2a412af649dfdfbcb02060d8c686c32ee9212f5f72f810e60c503d3778985
             """);
+        if (m4Summary.isPresent()) {
+            Path summary = m4Summary.orElseThrow().toRealPath();
+            String sourceRoot = System.getProperty("nereus.nsip.m4SourceRoot");
+            if (sourceRoot == null) throw new IllegalStateException("current-source M4 source root is required");
+            byte[] bytes = Files.readAllBytes(summary);
+            String digest = java.util.HexFormat.of().formatHex(
+                    java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
+            Files.writeString(capability, "\nm4IsolatedAdmission.sourceRoot=" + Path.of(sourceRoot).toRealPath()
+                    + "\nm4IsolatedAdmission.runSummaryFile=" + summary
+                    + "\nm4IsolatedAdmission.runSummarySha256=" + digest + "\n",
+                    java.nio.file.StandardOpenOption.APPEND);
+        }
     }
 
-    private static Map<String, Object> nativeConfig(Path inputs, String uri, String oxia) {
+    public static Map<String, Object> nativeConfig(Path inputs, String uri, String oxia) {
         Path capability = inputs.resolve("capability.properties");
         Path password = inputs.resolve("password");
         Map<String, Object> config = Map.ofEntries(
@@ -438,7 +593,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
             }
             Thread.sleep(25);
         }
-        throw new AssertionError(failure);
+        fail(failure);
     }
 
     private static Properties groupProperties(Properties client) {
@@ -581,7 +736,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                     var gate = responseGate;
                     if (response && gate.getCount() != 0) {
                         held.countDown();
-                        if (!gate.await(30, TimeUnit.SECONDS))
+                        if (!gate.await(90, TimeUnit.SECONDS))
                             throw new java.io.IOException("Oxia response hold exceeded test bound");
                     }
                     to.getOutputStream().write(bytes, 0, length);
@@ -615,10 +770,14 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
     }
 
     private static int leader(Admin admin) throws Exception {
-        var partition = admin.describeTopics(List.of("native-cold"))
+        return leader(admin, "native-cold");
+    }
+
+    private static int leader(Admin admin, String topic) throws Exception {
+        var partition = admin.describeTopics(List.of(topic))
                 .allTopicNames()
                 .get(10, TimeUnit.SECONDS)
-                .get("native-cold")
+                .get(topic)
                 .partitions()
                 .get(0);
         assertEquals(1, partition.replicas().size());
@@ -626,17 +785,39 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
         return partition.leader() == null ? -1 : partition.leader().id();
     }
 
-    private static int awaitLeader(Admin admin, int previous) throws Exception {
+    public static int awaitLeader(Admin admin, int previous) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
         while (System.nanoTime() < deadline) {
             int owner = leader(admin);
             if (owner >= 0 && owner != previous) return owner;
             Thread.sleep(50);
         }
-        throw new AssertionError("Controller did not relocate the sole native replica");
+        return fail("Controller did not relocate the sole native replica");
     }
 
-    private static List<String> consume(Properties client, int count) {
+    private static void awaitTopicLeader(Admin admin, String topic, int expected) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (System.nanoTime() < deadline) {
+            if (leader(admin, topic) == expected) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        fail("Controller did not relocate " + topic + " to Broker " + expected);
+    }
+
+    private static void awaitClosedOwner(NereusClosedOwnerProbe probe, long ownerEpoch) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (System.nanoTime() < deadline) {
+            if (probe.archived(ownerEpoch)) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        fail("old native owner was not durably archived after online handoff");
+    }
+
+    public static List<String> consume(Properties client, int count) {
         Properties config = new Properties();
         config.putAll(client);
         config.put("key.deserializer", StringDeserializer.class.getName());

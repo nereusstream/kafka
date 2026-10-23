@@ -1429,6 +1429,10 @@ class Partition(val topicPartition: TopicPartition,
     fetchIsolation: FetchIsolation,
     minOneMessage: Boolean
   ): LogReadInfo = {
+    if (leaderEpochAwareOffsetLookupPending.contains(leaderEpoch)) {
+      throw new OffsetNotAvailableException(
+        s"Nereus Fetch for partition $topicPartition at leader epoch $leaderEpoch is still recovering")
+    }
     // Note we use the log end offset prior to the read. This ensures that any appends following
     // the fetch do not prevent a follower from coming into sync.
     val initialHighWatermark = localLog.highWatermark

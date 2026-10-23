@@ -1080,6 +1080,14 @@ public class ShareCoordinatorService implements ShareCoordinator {
     }
 
     @Override
+    public CompletableFuture<Void> onResignationAndWait(int partitionIndex, OptionalInt partitionLeaderEpoch) {
+        throwIfNotActive();
+        TopicPartition tp = new TopicPartition(Topic.SHARE_GROUP_STATE_TOPIC_NAME, partitionIndex);
+        lastPrunedOffsets.remove(tp);
+        return runtime.scheduleUnloadOperationAndWait(tp, partitionLeaderEpoch);
+    }
+
+    @Override
     public void onTopicsDeleted(Set<Uuid> deletedTopicIds, BufferSupplier bufferSupplier) throws ExecutionException, InterruptedException {
         throwIfNotActive();
         if (deletedTopicIds.isEmpty()) {

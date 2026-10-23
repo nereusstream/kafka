@@ -35,6 +35,6 @@ trait AsyncTopicDeltaLifecycle {
     delta: TopicsDelta,
     newImage: MetadataImage,
     onLeaderReady: (TopicPartition, Int) => Unit,
-    onResigned: (TopicPartition, Option[Int]) => Unit
+    onResigned: (TopicPartition, Option[Int]) => CompletableFuture[Void]
   ): CompletableFuture[Void]
 }

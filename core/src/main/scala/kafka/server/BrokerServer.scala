@@ -167,6 +167,7 @@ class BrokerServer(
   private var brokerStorageRuntimeReady: CompletableFuture[Void] = _
   private var brokerStorageDrainReason: BrokerStorageDrainReason = BrokerStorageDrainReason.BrokerShutdown
   private var brokerStorageRuntimeClosed = false
+  private var brokerStorageRuntimeCloseFailure: Throwable = _
   // Nereus inject end: optional runtime is created before log/partition IO and closed after logs
 
   var brokerRegistrationTracker: BrokerRegistrationTracker = _
@@ -240,6 +241,7 @@ class BrokerServer(
           kafkaScheduler)),
         "broker storage runtime")
       brokerStorageRuntimeClosed = false
+      brokerStorageRuntimeCloseFailure = null
       brokerStorageDrainReason = BrokerStorageDrainReason.BrokerShutdown
       // Nereus inject end: disabled default is inert; enabled without an installed factory fails before log IO
 
@@ -820,6 +822,7 @@ class BrokerServer(
 
   override def shutdown(timeout: Duration): Unit = {
     if (!maybeChangeStatus(STARTED, SHUTTING_DOWN)) return
+    var shutdownFailure: Throwable = null
     try {
       val deadline = time.milliseconds() + timeout.toMillis
       info("shutting down")
@@ -953,15 +956,22 @@ class BrokerServer(
       CoreUtils.swallow(config.dynamicConfig.clear(), this)
       Utils.closeQuietly(clientMetricsManager, "client metrics manager")
       sharedServer.stopForBroker()
-      info("shut down completed")
     } catch {
       case e: Throwable =>
+        shutdownFailure = e
         fatal("Fatal error during broker shutdown.", e)
         throw e
     } finally {
       // Best-effort leak prevention when an earlier stock shutdown stage throws.
       closeBrokerStorageRuntime()
       maybeChangeStatus(SHUTTING_DOWN, SHUTDOWN)
+      if (brokerStorageRuntimeCloseFailure != null) {
+        if (shutdownFailure == null) throw brokerStorageRuntimeCloseFailure
+        if (shutdownFailure ne brokerStorageRuntimeCloseFailure)
+          shutdownFailure.addSuppressed(brokerStorageRuntimeCloseFailure)
+      } else if (shutdownFailure == null) {
+        info("shut down completed")
+      }
     }
   }
 
@@ -974,8 +984,17 @@ class BrokerServer(
 
   private def closeBrokerStorageRuntime(): Unit = {
     if (brokerStorageRuntime != null && !brokerStorageRuntimeClosed) {
-      brokerStorageRuntimeClosed = true
-      Utils.closeQuietly(brokerStorageRuntime, "broker storage runtime")
+      try {
+        brokerStorageRuntime.close()
+        brokerStorageRuntimeClosed = true
+        brokerStorageRuntimeCloseFailure = null
+      } catch {
+        case closeFailure: Throwable =>
+          if (brokerStorageRuntimeCloseFailure == null) brokerStorageRuntimeCloseFailure = closeFailure
+          else if (brokerStorageRuntimeCloseFailure ne closeFailure)
+            brokerStorageRuntimeCloseFailure.addSuppressed(closeFailure)
+          error("Failed to close broker storage runtime", closeFailure)
+      }
     }
   }
   // Nereus inject end: bound storage drain by both configured and caller shutdown deadlines

@@ -124,6 +124,9 @@ public interface ShareCoordinator {
      */
     void onResignation(int partitionIndex, OptionalInt partitionLeaderEpoch);
 
+    /** Completes after the partition's queued coordinator unload has finished. */
+    CompletableFuture<Void> onResignationAndWait(int partitionIndex, OptionalInt partitionLeaderEpoch);
+
     /**
      * Remove share group state related to deleted topic ids.
      *
