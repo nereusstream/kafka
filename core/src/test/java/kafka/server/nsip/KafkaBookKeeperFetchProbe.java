@@ -16,8 +16,11 @@
  */
 package kafka.server.nsip;
 
+import kafka.log.nereus.NereusUnifiedLog;
 import kafka.server.storage.BrokerStorageFetchExecutor;
 
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicIdPartition;
@@ -29,9 +32,11 @@ import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.server.storage.log.FetchParams;
 import org.apache.kafka.storage.internals.log.LogReadResult;
+import org.apache.kafka.test.TestUtils;
 
 import java.net.SocketTimeoutException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -39,6 +44,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import scala.Function1;
 import scala.Tuple2;
@@ -52,9 +58,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 final class KafkaBookKeeperFetchProbe {
     private static final short FETCH_VERSION = 12;
     private static final int MAX_WAIT_MS = 20_000;
+    private static final int IDLE_WAIT_MS = 1_500;
+    private static final int DELETE_WAIT_MS = 18_000;
+    private static final String PEER_TOPIC = "native-fetch-peer";
 
     private final CompletableFuture<LogReadResult> firstRead = new CompletableFuture<>();
     private final ConcurrentLinkedQueue<String> observedWaves = new ConcurrentLinkedQueue<>();
+    private final IdleProbe idleProbe = new IdleProbe();
+    private final IdleProbe deletionProbe = new IdleProbe();
 
     BrokerStorageFetchExecutor observe(BrokerStorageFetchExecutor nativeExecutor) {
         return new BrokerStorageFetchExecutor() {
@@ -64,14 +75,17 @@ final class KafkaBookKeeperFetchProbe {
                     Seq<Tuple2<TopicIdPartition, FetchRequest.PartitionData>> partitions,
                     Function1<Object, Seq<Tuple2<TopicIdPartition, LogReadResult>>> read) {
                 return nativeExecutor.submit(params, partitions, initial -> {
+                    boolean first = Boolean.TRUE.equals(initial);
                     if (params.maxWaitMs == MAX_WAIT_MS) observedWaves.add("read started");
                     var response = read.apply(initial);
                     if (params.maxWaitMs == MAX_WAIT_MS) {
                         var result = response.head()._2();
                         observedWaves.add("HW=" + result.highWatermark() + " LSO=" + result.lastStableOffset()
                                 + " bytes=" + result.info().records.sizeInBytes() + " " + result.error());
-                        if (Boolean.TRUE.equals(initial)) firstRead.complete(result);
+                        if (first) firstRead.complete(result);
                     }
+                    if (params.maxWaitMs == IDLE_WAIT_MS) idleProbe.record(first);
+                    if (params.maxWaitMs == DELETE_WAIT_MS) deletionProbe.record(first);
                     return response;
                 });
             }
@@ -86,6 +100,58 @@ final class KafkaBookKeeperFetchProbe {
                 nativeExecutor.close();
             }
         };
+    }
+
+    void verifyIdleAndDeletion(
+            KafkaClusterTestKit cluster, Admin admin, int broker, Uuid topicId, TopicPartition primary, long end)
+            throws Exception {
+        var peer = new TopicPartition(PEER_TOPIC, 0);
+        var peerId = admin.createTopics(List.of(new NewTopic(PEER_TOPIC, Map.of(0, List.of(broker)))))
+                .topicId(PEER_TOPIC).get(30, TimeUnit.SECONDS);
+        TestUtils.waitForCondition(() -> {
+            var local = cluster.brokers().get(broker).replicaManager().onlinePartition(peer);
+            return local.isDefined() && local.get().log().isDefined()
+                    && ((NereusUnifiedLog) local.get().log().get()).nereusWritable(local.get().getLeaderEpoch());
+        }, "Second native Fetch partition did not become ready");
+        var partitions = new LinkedHashMap<TopicPartition, FetchRequest.PartitionData>();
+        partitions.put(primary, fetchPartition(topicId, end));
+        partitions.put(peer, fetchPartition(peerId, 0));
+        var names = Map.of(topicId, primary.topic(), peerId, peer.topic());
+
+        try (var wire = new NativeKafkaRequest(cluster, broker, fetchRequest(partitions, IDLE_WAIT_MS, 1))) {
+            idleProbe.initial.get(5, TimeUnit.SECONDS);
+            assertThrows(SocketTimeoutException.class, () -> wire.receive(250),
+                    "Empty multi-partition Fetch returned before its deadline");
+            assertEquals(1, idleProbe.waves.get(), "Idle Fetch polled without a publication event");
+            var response = ((FetchResponse) wire.receive(5_000)).responseData(names, FETCH_VERSION);
+            assertEquals(2, idleProbe.waves.get(), "Idle Fetch must have one initial and one deadline wave");
+            assertEquals(2, response.size());
+            assertEmpty(response.get(primary), end);
+            assertEmpty(response.get(peer), 0);
+        }
+
+        try (var wire = new NativeKafkaRequest(cluster, broker, fetchRequest(partitions, DELETE_WAIT_MS, 1))) {
+            deletionProbe.initial.get(5, TimeUnit.SECONDS);
+            assertThrows(SocketTimeoutException.class, () -> wire.receive(250),
+                    "Multi-partition Fetch did not wait on both frontiers");
+            admin.deleteTopics(List.of(PEER_TOPIC)).all().get(5, TimeUnit.SECONDS);
+            var response = ((FetchResponse) wire.receive(5_000)).responseData(names, FETCH_VERSION);
+            assertEquals(2, response.size());
+            assertEmpty(response.get(primary), end);
+            var error = Errors.forCode(response.get(peer).errorCode());
+            assertTrue(error == Errors.UNKNOWN_TOPIC_OR_PARTITION || error == Errors.UNKNOWN_TOPIC_ID
+                            || error == Errors.NOT_LEADER_OR_FOLLOWER,
+                    "Deleted Fetch partition returned " + error);
+            assertEquals(0, FetchResponse.recordsSize(response.get(peer)));
+        }
+    }
+
+    private static void assertEmpty(
+            org.apache.kafka.common.message.FetchResponseData.PartitionData result, long end) {
+        assertEquals(Errors.NONE.code(), result.errorCode());
+        assertEquals(end, result.highWatermark());
+        assertEquals(end, result.lastStableOffset());
+        assertEquals(0, FetchResponse.recordsSize(result));
     }
 
     void commitAndVerifyFetch(
@@ -162,10 +228,28 @@ final class KafkaBookKeeperFetchProbe {
 
     private static FetchRequest fetchRequest(
             Uuid topicId, TopicPartition partition, long offset, int maxWait, int minBytes) {
-        return FetchRequest.Builder.forConsumer(FETCH_VERSION, maxWait, minBytes,
-                        Map.of(partition, new FetchRequest.PartitionData(topicId, offset,
-                                FetchRequest.INVALID_LOG_START_OFFSET, 1 << 20, Optional.empty())))
+        return fetchRequest(Map.of(partition, fetchPartition(topicId, offset)), maxWait, minBytes);
+    }
+
+    private static FetchRequest.PartitionData fetchPartition(Uuid topicId, long offset) {
+        return new FetchRequest.PartitionData(topicId, offset, FetchRequest.INVALID_LOG_START_OFFSET,
+                1 << 20, Optional.empty());
+    }
+
+    private static FetchRequest fetchRequest(
+            Map<TopicPartition, FetchRequest.PartitionData> partitions, int maxWait, int minBytes) {
+        return FetchRequest.Builder.forConsumer(FETCH_VERSION, maxWait, minBytes, partitions)
                 .isolationLevel(IsolationLevel.READ_COMMITTED)
                 .build(FETCH_VERSION);
+    }
+
+    private static final class IdleProbe {
+        private final CompletableFuture<Void> initial = new CompletableFuture<>();
+        private final AtomicInteger waves = new AtomicInteger();
+
+        private void record(boolean first) {
+            waves.incrementAndGet();
+            if (first) initial.complete(null);
+        }
     }
 }

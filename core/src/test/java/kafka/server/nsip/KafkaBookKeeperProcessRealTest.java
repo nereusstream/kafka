@@ -62,6 +62,14 @@ public class KafkaBookKeeperProcessRealTest {
     @Timeout(240)
     public void productionLauncherRecoversSnapshotAndRelocatesToColdBroker(
             @TempDir(cleanup = CleanupMode.ON_SUCCESS) Path work) throws Exception {
+        try {
+            runProductionNodes(work);
+        } finally {
+            copyProcessLogs(work);
+        }
+    }
+
+    private static void runProductionNodes(Path work) throws Exception {
         String bkUri = System.getProperty("nereus.nsip.bkUri");
         String oxia = System.getProperty("nereus.nsip.oxia");
         KafkaBookKeeperOwnerRelocationRealTest.writeCapability(work, Optional.empty());
@@ -106,12 +114,15 @@ public class KafkaBookKeeperProcessRealTest {
                 awaitControllerFailover(admin, quorum.leaderId());
                 var failoverTopicId = admin.createTopics(List.of(new NewTopic(CONTROLLER_RESTART_TOPIC, Map.of(0, List.of(0)))))
                         .topicId(CONTROLLER_RESTART_TOPIC).get(30, TimeUnit.SECONDS);
-                long failoverFloor = admin.describeMetadataQuorum().quorumInfo().get(30, TimeUnit.SECONDS).highWatermark();
+                var failoverQuorum = admin.describeMetadataQuorum().quorumInfo().get(30, TimeUnit.SECONDS);
+                long failoverFloor = failoverQuorum.highWatermark();
                 assertTrue(failoverFloor > floor);
                 formerLeader.assertRejectsDisabledRestart();
                 formerLeader.start();
                 TestUtils.waitForCondition(() -> formerLeader.hasSnapshotAtOrAfter(failoverFloor),
                         "Restarted Controller did not catch up to the metadata written after failover");
+                System.out.printf("Controller election: %d -> %d, restart snapshot floor %d%n",
+                        quorum.leaderId(), failoverQuorum.leaderId(), failoverFloor);
                 assertEquals(topicId, topicId(admin, TOPIC));
                 assertEquals(failoverTopicId, topicId(admin, CONTROLLER_RESTART_TOPIC));
                 // This observer has an empty metadata log and cannot reconstruct the topic
@@ -146,6 +157,22 @@ public class KafkaBookKeeperProcessRealTest {
                 try (Admin relocatedAdmin = Admin.create(relocated)) {
                     assertEquals(topicId, topicId(relocatedAdmin, TOPIC));
                 }
+            }
+        }
+    }
+
+    private static void copyProcessLogs(Path work) throws Exception {
+        String evidence = System.getProperty("nereus.nsip.processEvidenceDir");
+        if (evidence == null) return;
+        Path destination = Files.createDirectory(Path.of(evidence));
+        for (int id = 0; id < 5; id++) {
+            Path source = work.resolve("node-" + id);
+            if (!Files.isDirectory(source)) continue;
+            Path node = Files.createDirectory(destination.resolve(source.getFileName()));
+            for (String name : List.of("server.log", "format.log", "server.properties",
+                    "implicit-format.log", "disabled-restart.log", "disabled.properties", "shutdown-threads.log")) {
+                var file = source.resolve(name);
+                if (Files.isRegularFile(file)) Files.copy(file, node.resolve(name));
             }
         }
     }
@@ -239,11 +266,13 @@ public class KafkaBookKeeperProcessRealTest {
                     "-Dkafka.logs.dir=" + directory,
                     "-cp", System.getProperty("nereus.nsip.processClasspath"), entryPoint));
             command.addAll(List.of(args));
-            return new ProcessBuilder(command)
+            Process launched = new ProcessBuilder(command)
                     .directory(directory.toFile())
                     .redirectErrorStream(true)
                     .redirectOutput(ProcessBuilder.Redirect.appendTo(directory.resolve(log).toFile()))
                     .start();
+            System.out.printf("%s: PID %d, %s %s%n", directory.getFileName(), launched.pid(), entryPoint, List.of(args));
+            return launched;
         }
 
         void format(String clusterId) throws Exception {
