@@ -46,6 +46,7 @@ import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRout
 import com.nereusstream.storage.api.kafka.KafkaOwnerAdmissionV1;
 import com.nereusstream.storage.api.kafka.KafkaOwnerIdentityV1;
 import com.nereusstream.storage.api.kafka.KafkaRunRootRecordV2;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaQuotaTargetDeleteStoreV2;
 import com.nereusstream.storage.api.kafka.KafkaRunRootSnapshotV1;
 import com.nereusstream.storage.api.lifecycle.PhysicalResourceIdV2;
 import com.nereusstream.storage.bookkeeper.M5BookKeeperNativeCreateClientV2;
@@ -100,6 +101,7 @@ public final class NereusKafkaNativeInputV2 {
     private final KafkaBookKeeperRunSourceV2.Bounds bounds;
     private final M5BookKeeperNativeCreateClientV2 nativeClient;
     private final M5TargetDeleteMultiWriterGuardV2 writerGuard;
+    private final OxiaQuotaTargetDeleteStoreV2 bookKeeperPhysical;
 
     record NativeCut(NativeInputSources inputs, TopicPolicy policy) { }
 
@@ -193,7 +195,8 @@ public final class NereusKafkaNativeInputV2 {
     NereusKafkaNativeInputV2(NereusKafkaOwnedProviderRuntime.Opened opened, NativeCut cut,
             KafkaOwnerIdentityV1 owner, OxiaKafkaRunRootAuthorityV2 roots, OxiaKafkaBookKeeperM4ReadRouteV2 m4,
             BooleanSupplier current, M5BookKeeperNativeCreateClientV2 client, M5TargetDeleteMultiWriterGuardV2 guard,
-            KafkaBookKeeperReadCellBudgetV2 budget, KafkaBookKeeperRunSourceV2.Bounds bounds, Executor control) {
+            OxiaQuotaTargetDeleteStoreV2 bookKeeperPhysical, KafkaBookKeeperReadCellBudgetV2 budget,
+            KafkaBookKeeperRunSourceV2.Bounds bounds, Executor control) {
         this.opened = opened;
         this.nativeCut = cut.inputs();
         this.topicPolicy = cut.policy();
@@ -206,6 +209,7 @@ public final class NereusKafkaNativeInputV2 {
         this.bounds = bounds;
         this.nativeClient = Objects.requireNonNull(client, "native source client");
         this.writerGuard = Objects.requireNonNull(guard, "native writer guard");
+        this.bookKeeperPhysical = Objects.requireNonNull(bookKeeperPhysical, "native BK physical route");
         var active = nativeCut.sources().activeRoot();
         binding = new BindingIdentity(active.bindingId(),
                 Sha256Digest.hash(TopicIncarnationIdentityCodecV1.encode(active.topicIncarnation())),
@@ -920,6 +924,26 @@ public final class NereusKafkaNativeInputV2 {
                     throw new CompletionException(failure);
                 }
             }, control)));
+        }
+
+        CompletionStage<Void> publishObjectMaterialization(NereusKafkaObjectMaterialization.Verified verified,
+                NereusKafkaObjectProvider provider, Executor providerReads, java.time.Duration timeout) {
+            if (reservation == null || !verified.stored().task().prepared().plan().sourceCut().sources().equals(extents)) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException(
+                        "native Kafka Object publication requires its original retained source cut"));
+            }
+            return opened.ownInputOperation(() -> reservation.own(() -> verifyInputs(extents, batches)
+                    .thenComposeAsync(membership -> {
+                        try {
+                            return NereusKafkaObjectPublication.publish(verified, provider, opened.storage(),
+                                    bookKeeperPhysical, membership, () -> {
+                                        requireOpen();
+                                        requireCurrentLocal();
+                                    }, control, providerReads, timeout);
+                        } catch (Exception failure) {
+                            return CompletableFuture.failedFuture(failure);
+                        }
+                    }, control)));
         }
 
         private CompletionStage<M5MaterializationWorkerCoordinatorV1.Proposal> proposeWorker(

@@ -350,7 +350,7 @@ final class NereusKafkaObjectMaterialization {
                 original.identity(), Optional.of(version)), resource);
     }
 
-    private static void requireWriteAuthority(Registered task, NereusKafkaObjectProvider provider,
+    static void requireWriteAuthority(Registered task, NereusKafkaObjectProvider provider,
             Runnable requireCurrent, Duration timeout) throws Exception {
         requireCurrent.run();
         await(provider.requireCurrent(), timeout);

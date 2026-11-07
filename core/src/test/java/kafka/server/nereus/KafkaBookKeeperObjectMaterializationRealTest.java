@@ -42,6 +42,7 @@ import com.nereusstream.storage.api.kafka.KafkaRunRootRecordV2;
 import com.nereusstream.storage.object.gc.M5ObjectBirthCreditV3;
 import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
 import com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1;
+import com.nereusstream.storage.object.materialization.M5MaterializationCodecV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PayloadKind;
 import com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport;
 
@@ -62,8 +63,10 @@ import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 
 import io.oxia.client.api.OxiaClientBuilder;
@@ -76,7 +79,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** Verified Object output from native sealed BK bytes, before any selector publication. */
+/** Verified Object output and native Fetch after the exact selector transition on real BK/Oxia/MinIO. */
 public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final String TOPIC = "native-cold";
 
@@ -135,9 +138,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertTrue(sealedRuns(opened) >= 2, "native Produce did not seal two real BK sources");
             assertAppendWhileFetchHeld(cluster, client, topicId, heldFetch, produced);
             produced++;
-            materialize(cluster, opened, work);
-            assertEquals(IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList(),
-                    KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
+            materialize(cluster, opened, work, client, produced);
             cluster.fatalFaultHandler().maybeRethrowFirstException();
             cluster.nonFatalFaultHandler().maybeRethrowFirstException();
         }
@@ -196,8 +197,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 .filter(root -> root.kafkaEndOffsetExclusive().orElseThrow() > root.kafkaStartOffset()).count();
     }
 
-    private static void materialize(KafkaClusterTestKit cluster, NereusKafkaOwnedProviderRuntime.Opened opened, Path work)
-            throws Exception {
+    private static void materialize(KafkaClusterTestKit cluster, NereusKafkaOwnedProviderRuntime.Opened opened,
+            Path work, Properties client, int produced) throws Exception {
         var endpoint = URI.create(System.getProperty("nereus.nsip.s3Endpoint"));
         var config = cluster.brokers().get(0).config();
         try (var minio = KafkaObjectProviderAdmissionRealTest.minio(endpoint);
@@ -232,13 +233,14 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                             .prefix(profile.exclusiveNamespacePrefix() + "/m5/materialization/"));
                     assertTrue(objects.versions().isEmpty(), "an incomplete quota reservation wrote Object data");
                 };
-                verifyOutputs(opened, provider, profile, verifyNoOutputs);
+                verifyOutputs(opened, provider, profile, verifyNoOutputs, client, produced);
             }
         }
     }
 
     private static void verifyOutputs(NereusKafkaOwnedProviderRuntime.Opened opened,
-            NereusKafkaObjectProvider provider, M5CellProviderProfileV2 profile, Runnable verifyNoOutputs) throws Exception {
+            NereusKafkaObjectProvider provider, M5CellProviderProfileV2 profile, Runnable verifyNoOutputs,
+            Properties client, int produced) throws Exception {
         var metadata = opened.nativeM5BindingRoute().materializationMetadata(profile.protocolCellSha256());
         var admission = new M5MaterializationAdmissionV1(metadata, profile.protocolCellSha256());
         assertEquals(M5MaterializationAdmissionV1.Outcome.APPLIED_EXACT,
@@ -276,7 +278,40 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         assertEquals(verified.generation(), replay.generation());
         verifyPrefixRead(captured, prepared, verified, provider);
         assertEquals(captured.predecessorSelector(), opened.nativeM5BindingRoute().readSelector().orElseThrow());
+        publishAndRead(opened, captured, verified, provider, client, produced);
         captured.discard().toCompletableFuture().get(30, TimeUnit.SECONDS);
+    }
+
+    private static void publishAndRead(NereusKafkaOwnedProviderRuntime.Opened opened,
+            NereusKafkaNativeInputV2.Captured captured, NereusKafkaObjectMaterialization.Verified verified,
+            NereusKafkaObjectProvider provider, Properties client, int produced) throws Exception {
+        var reads = Executors.newSingleThreadExecutor();
+        var dispatched = new AtomicInteger();
+        try {
+            captured.publishObjectMaterialization(verified, provider, task -> reads.execute(() -> {
+                dispatched.incrementAndGet();
+                task.run();
+            }), Duration.ofSeconds(10)).toCompletableFuture().get(30, TimeUnit.SECONDS);
+            var selector = opened.nativeM5BindingRoute().readSelector().orElseThrow();
+            assertEquals(M5MaterializationCodecV1.manifestSha256(verified.generation().manifestView()),
+                    selector.selectedViewSha256());
+            assertTrue(selector.fallbackSetSha256().isPresent());
+            long before = sealedRuns(opened);
+            int end = produced;
+            while (sealedRuns(opened) == before && end < produced + 32) {
+                KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + end, end);
+                end++;
+            }
+            assertTrue(sealedRuns(opened) > before, "BK did not roll its tail after Object selection");
+            assertEquals(selector.selectedViewSha256(),
+                    opened.nativeM5BindingRoute().readSelector().orElseThrow().selectedViewSha256());
+            assertEquals(IntStream.range(0, end).mapToObj(offset -> "input-" + offset).toList(),
+                    KafkaBookKeeperOwnerRelocationRealTest.consume(client, end));
+            assertTrue(dispatched.get() > 0, "native Kafka Fetch never dispatched its selected Object reads");
+        } finally {
+            reads.shutdown();
+            assertTrue(reads.awaitTermination(30, TimeUnit.SECONDS));
+        }
     }
 
     private static void verifyPrefixRead(NereusKafkaNativeInputV2.Captured captured,
