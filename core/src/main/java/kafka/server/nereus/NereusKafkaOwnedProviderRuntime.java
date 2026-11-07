@@ -1620,7 +1620,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         if (asyncObject != null && !asyncObjectReleased) asyncObject.beginDrain();
     }
 
-    public CompletableFuture<Void> drainNativeSourceScans() {
+    public CompletionStage<Void> drainNativeSourceScans() {
         return Opened.stopNativeM5SourceScans(List.copyOf(owned));
     }
 
@@ -1675,7 +1675,8 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         // while accepted operations can still close their provider clients on openings.
         var scans = drainNativeSourceScans();
         drainObjectReads();
-        scans.get(context.config().nereusKafkaStorageConfig().rollout().shutdownDrainTimeout().toMillis(), TimeUnit.MILLISECONDS);
+        scans.toCompletableFuture().get(
+                context.config().nereusKafkaStorageConfig().rollout().shutdownDrainTimeout().toMillis(), TimeUnit.MILLISECONDS);
         if (objectMaterializer != null) objectMaterializer.close();
         openings.shutdown();
         if (!openings.awaitTermination(
