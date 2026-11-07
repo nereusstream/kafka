@@ -84,6 +84,13 @@ final class KafkaObjectCompactionRealScenario {
     }
 
     static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client) throws Exception {
+        // The provider can finish before the Controller acknowledges RECOVERED. The official Admin client
+        // retries the broker's recovery response; the wire Fetches below then inspect the exact ready owner.
+        try (var admin = Admin.create(client)) {
+            assertEquals(1, admin.listOffsets(Map.of(PARTITION, OffsetSpec.forTimestamp(0)))
+                    .partitionResult(PARTITION).get(30, TimeUnit.SECONDS).offset());
+        }
+
         var first = fetch(cluster, topic, broker, 0);
         assertEquals(Errors.NONE, Errors.forCode(first.errorCode()));
         assertEquals(end, first.highWatermark());
@@ -100,11 +107,6 @@ final class KafkaObjectCompactionRealScenario {
         var tombstone = FetchResponse.recordsOrFail(gap).records().iterator().next();
         assertEquals(6, tombstone.offset(), "Fetch did not skip the fully compacted batch");
         assertNull(tombstone.value(), "compaction discarded or rewrote the latest tombstone");
-
-        try (var admin = Admin.create(client)) {
-            assertEquals(1, admin.listOffsets(Map.of(PARTITION, OffsetSpec.forTimestamp(0)))
-                    .partitionResult(PARTITION).get(30, TimeUnit.SECONDS).offset());
-        }
     }
 
     static void verifyMissingFailsClosed(KafkaClusterTestKit cluster, Uuid topic, int broker) throws Exception {
