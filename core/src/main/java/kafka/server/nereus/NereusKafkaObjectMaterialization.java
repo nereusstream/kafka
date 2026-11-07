@@ -121,7 +121,7 @@ final class NereusKafkaObjectMaterialization {
         var plan = new M5MaterializationPlannerV1().plan(cut, new M5MaterializationPlannerV1.PlanningPolicy(
                 PayloadKind.KAFKA_BATCH_PRESERVING_V1, true, digest(provider.references().allowedEncryptionScope()),
                 KEEP_KAFKA_ENCODING, SHA256_AND_KAFKA_CRC,
-                List.of(IndexKind.OFFSET_OR_POSITION, IndexKind.PAYLOAD_LOCATOR, IndexKind.CHECKSUM_COVERAGE),
+                List.of(IndexKind.OFFSET_OR_POSITION, IndexKind.TIMESTAMP, IndexKind.PAYLOAD_LOCATOR, IndexKind.CHECKSUM_COVERAGE),
                 provider.exclusiveNamespacePrefix()));
         var batches = capture.batches().stream().collect(Collectors.groupingBy(InputBatch::sourceIdentitySha256));
         M5BytePreservingMaterializerV1.SourceReader reader = source -> {

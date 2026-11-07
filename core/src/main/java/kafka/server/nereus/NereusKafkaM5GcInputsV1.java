@@ -138,7 +138,7 @@ final class NereusKafkaM5GcInputsV1 {
     }
 
     Sha256Digest scopeIdentity() {
-        return isReplacement() ? replacement.selected().descriptor().task().taskIdSha256() : unpublished.terminal().task().taskIdSha256();
+        return isReplacement() ? replacement.taskId() : unpublished.terminal().task().taskIdSha256();
     }
 
     java.util.Set<PhysicalResourceIdV2> resources() {
@@ -195,9 +195,8 @@ final class NereusKafkaM5GcInputsV1 {
     }
 
     private KafkaBookKeeperPartitionV1.NativeInputSources currentProtocol() {
-        var current = scan.opened().storage().nativeInputSources();
-        return isReplacement() ? scan.opened().storage().nativeSelectedInputSources(current,
-                replacement.selector().selector()).orElseThrow().recoveryInputs() : current;
+        var storage = scan.opened().storage();
+        return isReplacement() ? replacement.currentProtocol(storage) : storage.nativeInputSources();
     }
 
     private void retainUnpublished() {
@@ -215,6 +214,7 @@ final class NereusKafkaM5GcInputsV1 {
         var nativeFacts = new ArrayList<VersionedValue>();
         nativeFacts.add(replacement.nativeDescriptor());
         nativeFacts.add(replacement.nativeSemantics());
+        replacement.object().ifPresent(selection -> nativeFacts.addAll(selection.nativeFacts()));
         replacement.readers().closedOwner().ifPresent(owner -> nativeFacts.add(VersionedValue.of(
                 owner.authority().key(), owner.admission().encode(), owner.authority().metadataVersion())));
         replacement.sealed().values().forEach(value -> value.rawRoot().ifPresent(root -> nativeFacts.add(VersionedValue.of(
@@ -236,7 +236,7 @@ final class NereusKafkaM5GcInputsV1 {
     }
 
     com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationSourceCut sourceCut() {
-        return isReplacement() ? replacement.selected().descriptor().sourceCut()
+        return isReplacement() ? replacement.sourceCut()
                 : M5MaterializationCodecV1.decodeSourceCut(unpublished.terminal().task().sourceCut());
     }
 
@@ -300,6 +300,12 @@ final class NereusKafkaM5GcInputsV1 {
         inputs.sources().sealedRoots().forEach(root -> result.add(new PhysicalResourceIdV2.BookKeeperLedger(namespace, root.ledgerIdentity().ledgerId())));
         inputs.protocol().activeTail().locators().forEach(locator -> result.add(new PhysicalResourceIdV2.BookKeeperLedger(namespace, locator.handle().ledgerIdentity().ledgerId())));
         var selector = M5BindingAuthorityCodecV1.decodeAuthority(scan.exactAuthority().canonicalStoredBytes()).selectorProjection();
+        if (isReplacement() && replacement.object().isPresent()) {
+            var selection = replacement.object().orElseThrow();
+            selection.currentProtocol(scan.opened().storage(), selector);
+            result.addAll(selection.replacementResources(replacement.nativeDescriptor()));
+            return result.stream().distinct().sorted().toList();
+        }
         var selected = scan.opened().storage().nativeSelectedInputSources(inputs, selector);
         if (selected.isPresent()) {
             var actual = selected.orElseThrow();

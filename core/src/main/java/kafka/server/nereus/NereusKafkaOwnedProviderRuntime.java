@@ -535,7 +535,8 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
     private NereusKafkaM5SourceScanV1 newNativeM5SourceScan(Opened owner) {
         return new NereusKafkaM5SourceScanV1(owner, owner.m4Route, owner.rootsAuthority, owner.currentAssignment,
                 owner.nativeOwner, route, owner.source, m4Admission.orElseThrow(), this,
-                NereusBookKeeperCapability.lifecycleFacts(oxia, namespace.identity(), owner.nativeScope));
+                NereusBookKeeperCapability.lifecycleFacts(oxia, namespace.identity(), owner.nativeScope),
+                asyncObject, context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout());
     }
 
     CompletionStage<NereusKafkaM5GcScopeV1> openNativeM5Gc(NereusKafkaM5SourceScanV1 scan, Optional<Sha256Digest> task) {
@@ -1075,6 +1076,10 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                     (record, maximumHandles, verification) -> verifyRoot(owner, record, maximumHandles, verification),
                     () -> recoveredBirth);
             return verifier;
+        }
+
+        private M5BookKeeperNativeCreateSpecV2 createSpecFor(KafkaRunRootRecordV2 record) {
+            return nativeRunSpec(source, record);
         }
 
         private CompletionStage<Void> verifyRoot(KafkaOwnerIdentityV1 owner, KafkaRunRootRecordV2 record,
@@ -1739,6 +1744,70 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
     }
 
     static final class SelectedRecoveryMetadata {
+        static CompletionStage<NereusKafkaReadScopeV2.ReplacementEvidence> captureReplacement(NereusKafkaM5SourceScanV1 scan,
+                NereusKafkaObjectProvider provider, java.time.Duration timeout) {
+            var opened = scan.opened();
+            return scan.route().readSourceScanSelectorFact(scan.exactAuthority()).thenCompose(fact ->
+                    scan.observe(() -> objectSelection(opened, provider, timeout, fact.selector())).thenCompose(selection ->
+                            selection.isPresent() ? captureObjectReplacement(scan, selection.orElseThrow(), fact)
+                                    : opened.captureNativeM5ReplacementEvidence(scan)));
+        }
+
+        private static Optional<NereusKafkaObjectReplacementV1.Selection> objectSelection(Opened opened,
+                NereusKafkaObjectProvider provider, java.time.Duration timeout, BindingReadSelector selector) {
+            try {
+                var original = NereusKafkaObjectRecovery.recover(opened.m4Route, opened.nativeScope.partition(),
+                        selector, provider, timeout);
+                if (original.isEmpty()) return Optional.empty();
+                var scope = recoverObjectScope(opened, Optional.of(selector), original, true, timeout).orElseThrow(
+                        () -> new IllegalStateException("Object replacement has no durable released native scope"));
+                return Optional.of(NereusKafkaObjectReplacementV1.capture(original.orElseThrow(), scope,
+                        opened.m4Route, opened.source.spec().namespace(), opened.nativeScope.partition()));
+            } catch (Exception failure) {
+                throw new CompletionException(failure);
+            }
+        }
+
+        private static CompletionStage<NereusKafkaReadScopeV2.ReplacementEvidence> captureObjectReplacement(
+                NereusKafkaM5SourceScanV1 scan, NereusKafkaObjectReplacementV1.Selection selected,
+                OxiaKafkaBookKeeperM4ReadRouteV2.SelectorFact fact) {
+            var opened = scan.opened();
+            var scope = selected.nativePrefix().scope();
+            return opened.storage.verifySelectedObjectPrefix(scope.manifest()).thenCompose(ignored -> scan.requireCurrent())
+                    .thenCompose(ignored -> {
+                        var recovery = selected.currentProtocol(opened.storage, fact.selector());
+                        var carrier = recovery.sources().sealedRoots().stream().filter(scope::namesRetainedCarrier)
+                                .findFirst().orElseThrow();
+                        return opened.readAdmittedNativeRoot(opened.nativeOwner, opened.rootsAuthority, carrier);
+                    }).thenCompose(record -> readObjectCarrier(opened, selected, record)).thenCompose(carrier -> scan.observe(() -> {
+                        var transport = scan.route().compactionRecordFacts();
+                        var stored = transport.getVersioned(scope.key()).toCompletableFuture().join().orElseThrow();
+                        var nativeScope = transport.nativeFact(stored).toCompletableFuture().join();
+                        var sources = NereusKafkaObjectReplacementV1.sources(selected, opened.rootsAuthority, nativeScope, carrier);
+                        for (var input : selected.nativeFacts()) {
+                            if (!scan.physical().read(input.key()).toCompletableFuture().join().equals(Optional.of(input))) {
+                                throw new IllegalStateException("Kafka Object scan changed its exact original materialization fact");
+                            }
+                        }
+                        return NereusKafkaReadScopeV2.ObjectCapture.capture(scan.route(), opened.storage, scan.physical(),
+                                opened.nativeProtocolCell, opened.source, opened.rootsAuthority, scan.owner(),
+                                record -> opened.createSpecFor(record), fact, selected, sources, selected.validation());
+                    }));
+        }
+
+        private static CompletionStage<com.nereusstream.kafka.bookkeeper.compaction.KafkaBookKeeperObjectReadScopeV1.CarrierProof>
+                readObjectCarrier(Opened opened, NereusKafkaObjectReplacementV1.Selection selected, KafkaRunRootRecordV2 record) {
+            var capability = opened.session.capabilitySnapshot();
+            var root = record.root();
+            var handle = new RunLedgerHandleV1(root.providerScopeId(), root.runId(), root.ledgerIdentity(),
+                    capability.configurationDigest());
+            var scope = selected.nativePrefix().scope();
+            return opened.source.readSealedScopeFacts(opened.createSpecFor(record), handle)
+                    .thenCompose(sealed -> opened.historyReads(opened.nativeOwner).read(record,
+                            KafkaBookKeeperClosedHistoryRecoveryV1.ReadPhase.CHECKPOINT,
+                            owned -> scope.readRetainedCarrier(owned, root, sealed.closedMetadata().sealedLastEntryId())));
+        }
+
         static Optional<KafkaBookKeeperClosedHistoryRecoveryV1.ObjectPrefix> recoverObjectScope(Opened opened,
                 Optional<BindingReadSelector> predecessor, Optional<NereusKafkaObjectRecovery.Selected> recovered,
                 boolean asyncObject, java.time.Duration timeout) throws Exception {

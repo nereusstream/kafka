@@ -41,6 +41,8 @@ import java.util.function.BooleanSupplier;
 final class NereusKafkaM5SourceScanV1 implements AutoCloseable {
     private final NereusKafkaOwnedProviderRuntime.Opened opened;
     private final NereusKafkaOwnedProviderRuntime runtime;
+    private final NereusKafkaObjectProvider object;
+    private final java.time.Duration recoveryTimeout;
     private CompletableFuture<NereusKafkaM5GcScopeV1> gcOpening;
     private final OxiaKafkaBookKeeperM4ReadRouteV2 route;
     private final OxiaKafkaRunRootAuthorityV2 roots;
@@ -64,10 +66,13 @@ final class NereusKafkaM5SourceScanV1 implements AutoCloseable {
     NereusKafkaM5SourceScanV1(NereusKafkaOwnedProviderRuntime.Opened opened,
             OxiaKafkaBookKeeperM4ReadRouteV2 route, OxiaKafkaRunRootAuthorityV2 roots, BooleanSupplier current, KafkaOwnerIdentityV1 expectedOwner,
             OxiaQuotaTargetDeleteStoreV2 physical, M5BookKeeperNativeCreateClientV2 nativeClient, NereusKafkaM4AdmissionV2 admission, NereusKafkaOwnedProviderRuntime runtime,
-            com.nereusstream.metadata.oxia.v2.retention.OxiaBindingLifecycleMetadataStoreV2 lifecycle) {
+            com.nereusstream.metadata.oxia.v2.retention.OxiaBindingLifecycleMetadataStoreV2 lifecycle,
+            NereusKafkaObjectProvider object, java.time.Duration recoveryTimeout) {
         this.opened = opened;
         this.runtime = runtime;
         this.lifecycle = lifecycle;
+        this.object = object;
+        this.recoveryTimeout = recoveryTimeout;
         this.admission = admission;
         this.route = route;
         this.roots = roots;
@@ -157,7 +162,9 @@ final class NereusKafkaM5SourceScanV1 implements AutoCloseable {
     }
 
     CompletionStage<NereusKafkaReadScopeV2.ReplacementEvidence> captureReplacement() {
-        return track(() -> requireCurrent().thenCompose(ignored -> opened.captureNativeM5ReplacementEvidence(this)));
+        return track(() -> requireCurrent().thenCompose(ignored -> object == null
+                ? opened.captureNativeM5ReplacementEvidence(this)
+                : NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata.captureReplacement(this, object, recoveryTimeout)));
     }
 
     private synchronized <T> CompletionStage<T> track(Supplier<CompletionStage<T>> operation) {

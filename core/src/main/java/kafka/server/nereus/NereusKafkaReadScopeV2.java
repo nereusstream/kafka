@@ -71,7 +71,8 @@ final class NereusKafkaReadScopeV2 {
     private NereusKafkaReadScopeV2() { }
 
     /** Actual current actor/metadata observations; other references, floors, grace and GC admission remain separate. */
-    record ReplacementEvidence(KafkaBookKeeperPartitionV1.NativeSelectedInputSources selected,
+    record ReplacementEvidence(Optional<KafkaBookKeeperPartitionV1.NativeSelectedInputSources> bookKeeper,
+            Optional<NereusKafkaObjectReplacementV1.Selection> object,
             List<KafkaBookKeeperReplacementSemanticsV2.SourceEvidence> sources,
             List<M4ReleaseBindingV1> releases, List<VersionedValue> records,
             VersionedValue nativeDescriptor, VersionedValue nativeSemantics,
@@ -83,6 +84,8 @@ final class NereusKafkaReadScopeV2 {
             java.util.Map<PhysicalResourceIdV2, com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMemberInventoryV2.Fact> members,
             TaskFacts tasks, ReaderFacts readers, KafkaBookKeeperPartitionV1.NativeInputSources recovery, List<VersionedValue> completed) {
         ReplacementEvidence {
+            if (bookKeeper.isPresent() == object.isPresent())
+                throw new IllegalArgumentException("native replacement requires exactly one selected carrier");
             completed = List.copyOf(completed);
             sources = List.copyOf(sources);
             releases = List.copyOf(releases);
@@ -98,6 +101,26 @@ final class NereusKafkaReadScopeV2 {
             java.util.Objects.requireNonNull(recovery, "recovery");
         }
 
+        KafkaBookKeeperPartitionV1.NativeSelectedInputSources selected() {
+            return bookKeeper.orElseThrow();
+        }
+
+        Sha256Digest taskId() {
+            return object.map(NereusKafkaObjectReplacementV1.Selection::taskId)
+                    .orElseGet(() -> selected().descriptor().task().taskIdSha256());
+        }
+
+        com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationSourceCut sourceCut() {
+            return object.map(NereusKafkaObjectReplacementV1.Selection::sourceCut)
+                    .orElseGet(() -> selected().descriptor().sourceCut());
+        }
+
+        KafkaBookKeeperPartitionV1.NativeInputSources currentProtocol(KafkaBookKeeperPartitionV1 storage) {
+            return object.map(selection -> selection.currentProtocol(storage, selector.selector()))
+                    .orElseGet(() -> storage.nativeSelectedInputSources(storage.nativeInputSources(),
+                            selector.selector()).orElseThrow().recoveryInputs());
+        }
+
         /** Native facts for one fully replaced resource; full member/reference/grace admission remains required. */
         com.nereusstream.storage.object.gc.DeleteEligibilitySnapshotV2.ReplacementEvidence replacementTaskEvidence(
                 PhysicalResourceIdV2 resource) {
@@ -105,22 +128,28 @@ final class NereusKafkaReadScopeV2 {
                     .orElseThrow(() -> new IllegalArgumentException("resource is outside the original replacement cut"));
             if (!sealed.containsKey(resource) || !physical.containsKey(resource) || !members.containsKey(resource))
                 throw new IllegalStateException("native replacement resource lacks its sealed physical member facts");
-            var verifier = fact(nativeSemantics);
             var transfers = source.transfers().stream().map(row -> {
+                var verifier = object.isPresent() && row.verifierAuthority().equals(fact(nativeDescriptor))
+                        ? fact(nativeDescriptor) : fact(nativeSemantics);
                 if (!row.verifierAuthority().valueSha256().equals(verifier.valueSha256()))
                     throw new IllegalStateException("native replacement verifier differs from its captured comparison");
                 return new com.nereusstream.storage.object.gc.DeleteEligibilitySnapshotV2.SemanticTransfer(
                         row.aspect(), row.coverage(), row.priorSemanticRoot(), row.replacementSemanticRoot(), verifier);
             }).toList();
-            var descriptor = selected.descriptor();
+            var replacements = object.map(selection -> selection.replacementResources(nativeDescriptor))
+                    .orElseGet(() -> bookKeeperReplacementResources(selected().descriptor(), nativeDescriptor));
+            return new com.nereusstream.storage.object.gc.DeleteEligibilitySnapshotV2.ReplacementEvidence(
+                    fact(nativeDescriptor), replacements, transfers);
+        }
+
+        private static List<PhysicalResourceIdV2> bookKeeperReplacementResources(
+                KafkaSealedBookKeeperDescriptorV2 descriptor, VersionedValue nativeDescriptor) {
             if (!nativeDescriptor.canonicalStoredBytes().equals(descriptor.encode()))
                 throw new IllegalStateException("native selected descriptor differs from its original captured generation");
-            var replacements = descriptor.sealedParts().stream()
+            return descriptor.sealedParts().stream()
                     .map(part -> (PhysicalResourceIdV2) new PhysicalResourceIdV2.BookKeeperLedger(
                             descriptor.task().namespace(), part.handle().ledgerIdentity().ledgerId()))
                     .sorted().toList();
-            return new com.nereusstream.storage.object.gc.DeleteEligibilitySnapshotV2.ReplacementEvidence(
-                    fact(nativeDescriptor), replacements, transfers);
         }
     }
 
@@ -344,8 +373,71 @@ final class NereusKafkaReadScopeV2 {
             throw new IllegalStateException("native replacement Binding authority changed during fact capture");
         requireCurrentCompleted(completed, physicalRoute);
         selected.recoveryInputs();
-        return new ReplacementEvidence(selected, sources, releases, records, nativeDescriptor, nativeSemantics,
+        return new ReplacementEvidence(Optional.of(selected), Optional.empty(), sources, releases, records, nativeDescriptor, nativeSemantics,
                 selector, references, quiescence, physical, sealed, members, tasks, readers, recovery, completed);
+    }
+
+    static final class ObjectCapture {
+        private ObjectCapture() { }
+
+        static ReplacementEvidence capture(OxiaKafkaBookKeeperM4ReadRouteV2 route,
+                KafkaBookKeeperPartitionV1 storage, OxiaQuotaTargetDeleteStoreV2 physicalRoute,
+                Sha256Digest protocolCell, M5BookKeeperNativeCreateClientV2 nativeClient,
+                OxiaKafkaRunRootAuthorityV2 roots, OxiaKafkaRunRootAuthorityV2.OwnerAdmissionFact owner,
+                Function<KafkaRunRootRecordV2, M5BookKeeperNativeCreateSpecV2> nativeRunSpec,
+                OxiaKafkaBookKeeperM4ReadRouteV2.SelectorFact selector,
+                NereusKafkaObjectReplacementV1.Selection selected,
+                List<KafkaBookKeeperReplacementSemanticsV2.SourceEvidence> sources, VersionedValue nativeSemantics) {
+            var projection = selector.selector();
+            var recovery = selected.currentProtocol(storage, projection);
+            var scope = selected.nativePrefix().scope();
+            var transport = route.compactionRecordFacts();
+            var storedScope = transport.getVersioned(scope.key()).toCompletableFuture().join().orElseThrow();
+            if (!storedScope.canonicalStoredBytes().equals(scope.encode()) || owner.admission().closed()
+                    || owner.admission().owner().ownerEpoch() != projection.ownerEpoch()
+                    || owner.admission().owner().kafkaLeaderEpoch() != recovery.protocol().root().fence().kafkaLeaderEpoch())
+                throw new IllegalStateException("Object replacement scan lacks its actual retained scope and Owner");
+            var nativeScope = transport.nativeFact(storedScope).toCompletableFuture().join();
+            var releases = selected.nativePrefix().prefix().originalFallbackSources().stream().map(source -> {
+                var found = route.readProtectionFact(source.sourceIdentitySha256(), source.protectionGeneration())
+                        .toCompletableFuture().join().orElseThrow();
+                var release = M4ReadControlCodecV1.decodeProtection(found.canonicalStoredBytes());
+                if (!release.identity().equals(source) || release.state() != ProtectionState.RELEASED
+                        || !release.releasedByBatchSha256().equals(Optional.of(scope.retirementBatch()))
+                        || !release.releaseProofHeadSha256().equals(Optional.of(scope.releaseProofHead())))
+                    throw new IllegalStateException("Object replacement scan changed its exact released BK set");
+                return new M4ReleaseBindingV1(source.sourceIdentitySha256(), source.protectionGeneration(), fact(found),
+                        found.canonicalStoredBytes(), scope.retirementBatch(), scope.releaseProofHead());
+            }).toList();
+            var quiescence = route.readQuiescenceFacts(selector, releases);
+            var cut = replacementPhysicalCut(sources, physicalRoute, selector);
+            var physical = physicalFacts(cut.sources(), physicalRoute, cut.sourceScan());
+            var sealed = new java.util.TreeMap<PhysicalResourceIdV2, SealedSourceFact>();
+            for (var source : cut.sources()) {
+                var extent = selected.sourceCut().sources().stream()
+                        .filter(value -> value.sourceIdentitySha256().equals(source.sourceIdentity())).findFirst().orElseThrow();
+                sealed.put(source.resource(), RawSealedSource.capture(source, extent, roots, nativeClient, nativeRunSpec,
+                        physical.get(source.resource()), cut.sourceScan(), nativeScope));
+            }
+            var members = memberFacts(cut.sources(), physicalRoute, protocolCell, projection.binding(),
+                    recovery.sources().activeRoot().providerScopeId().digest());
+            var tasks = taskFacts(route, protocolCell, nativeClient);
+            var readers = new ReaderFacts(owner, java.util.Map.of(scope.key(), Optional.of(storedScope)), Optional.empty());
+            var references = referenceFacts(cut.sources(), releases, selector.stored(), tasks, readers, quiescence, recovery);
+            requireCurrentPhysicalFacts(physical, physicalRoute);
+            requireCurrentTaskFacts(tasks, route, protocolCell, nativeClient);
+            requireCurrentReaderFacts(readers, route, roots);
+            requireCurrentSealedSourceFacts(sealed, roots, nativeClient);
+            requireCurrentMemberFacts(members, physicalRoute);
+            requireCurrentCompleted(cut.completed(), physicalRoute);
+            if (!route.readQuiescenceFacts(selector, releases).equals(quiescence)
+                    || !route.readBindingAuthority().toCompletableFuture().join().equals(Optional.of(selector.stored())))
+                throw new IllegalStateException("Object replacement reference scan changed its exact Binding cut");
+            selected.currentProtocol(storage, projection);
+            return new ReplacementEvidence(Optional.empty(), Optional.of(selected), sources, releases, List.of(storedScope),
+                    nativeScope, nativeSemantics, selector, references, quiescence, physical, sealed, members, tasks,
+                    readers, recovery, cut.completed());
+        }
     }
 
     private record ReplacementPhysicalCut(List<KafkaBookKeeperReplacementSemanticsV2.SourceEvidence> sources,
@@ -415,28 +507,8 @@ final class NereusKafkaReadScopeV2 {
             var extent = descriptor.sourceCut().sources().stream().filter(value -> value.sourceIdentitySha256().equals(source.sourceIdentity())).findFirst().orElseThrow();
             SealedSourceFact observed;
             if (extent.kind() == com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceKind.BOOKKEEPER_LEDGER) {
-                var raw = roots.readSelectedRootFact(extent.physicalKey()).toCompletableFuture().join().orElseThrow();
-                var root = raw.record().root();
-                if (!raw.record().resource().equals(source.resource()) || root.state() != com.nereusstream.storage.api.kafka.KafkaRunRootStateV1.SEALED
-                        || root.kafkaStartOffset() != source.coverage().inclusiveStart()
-                        || root.kafkaEndOffsetExclusive().orElseThrow() != source.coverage().exclusiveEnd())
-                    throw new IllegalStateException("sealed native source differs from its actual admitted run root");
-                var handle = new com.nereusstream.storage.api.bookkeeper.RunLedgerHandleV1(root.providerScopeId(), root.runId(), root.ledgerIdentity(), nativeClient.capabilitySnapshot().configurationDigest());
-                var expected = nativeRunSpec.apply(raw.record());
-                var absent = absentIntentScope(source, nativeDescriptor, physical.get(source.resource()), sourceScan, nativeClient, expected, handle);
-                if (absent.isPresent()) {
-                    result.put(source.resource(), new SealedSourceFact(Optional.of(raw), Optional.empty(), absent));
-                    continue;
-                }
-                var scope = nativeClient.readSealedScopeFacts(expected, handle).toCompletableFuture().join();
-                var stable = new KafkaRunRootRecordV2(raw.record().resource(), root, true, Optional.empty(), false, raw.record().recoveryCut()).encode();
-                var identity = Sha256Digest.hash(com.nereusstream.domain.bytes.CanonicalBytes.copyOf(java.nio.ByteBuffer.allocate(84 + stable.length())
-                        .putInt(0x4d354e53).put(stable.toByteArray()).putLong(scope.closedMetadata().sealedLastEntryId())
-                        .putLong(scope.closedMetadata().sealedLength()).put(extent.formatRootSha256().bytes().toByteArray())
-                        .put(extent.bodySha256().bytes().toByteArray()).array()));
-                if (!identity.equals(source.sourceIdentity()))
-                    throw new IllegalStateException("sealed native metadata differs from the replaced raw source identity");
-                observed = new SealedSourceFact(Optional.of(raw), scope);
+                observed = RawSealedSource.capture(source, extent, roots, nativeClient, nativeRunSpec,
+                        physical.get(source.resource()), sourceScan, nativeDescriptor);
             } else {
                 var predecessor = previous.orElseThrow();
                 var part = predecessor.sealedParts().stream().filter(value -> value.handle().ledgerIdentity().ledgerId()
@@ -457,6 +529,40 @@ final class NereusKafkaReadScopeV2 {
             result.put(source.resource(), observed);
         }
         return result;
+    }
+
+    private static final class RawSealedSource {
+        private RawSealedSource() { }
+
+        static SealedSourceFact capture(
+                KafkaBookKeeperReplacementSemanticsV2.SourceEvidence source,
+                com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceExtent extent,
+                OxiaKafkaRunRootAuthorityV2 roots, M5BookKeeperNativeCreateClientV2 nativeClient,
+                Function<KafkaRunRootRecordV2, M5BookKeeperNativeCreateSpecV2> nativeRunSpec,
+                OxiaQuotaTargetDeleteStoreV2.ResourceFact physical, boolean sourceScan, VersionedValue selected) {
+            var raw = roots.readSelectedRootFact(extent.physicalKey()).toCompletableFuture().join().orElseThrow();
+            var root = raw.record().root();
+            if (!raw.record().resource().equals(source.resource())
+                    || root.state() != com.nereusstream.storage.api.kafka.KafkaRunRootStateV1.SEALED
+                    || root.kafkaStartOffset() != source.coverage().inclusiveStart()
+                    || root.kafkaEndOffsetExclusive().orElseThrow() != source.coverage().exclusiveEnd())
+                throw new IllegalStateException("sealed native source differs from its actual admitted run root");
+            var handle = new com.nereusstream.storage.api.bookkeeper.RunLedgerHandleV1(
+                    root.providerScopeId(), root.runId(), root.ledgerIdentity(), nativeClient.capabilitySnapshot().configurationDigest());
+            var expected = nativeRunSpec.apply(raw.record());
+            var absent = absentIntentScope(source, selected, physical, sourceScan, nativeClient, expected, handle);
+            if (absent.isPresent()) return new SealedSourceFact(Optional.of(raw), Optional.empty(), absent);
+            var scope = nativeClient.readSealedScopeFacts(expected, handle).toCompletableFuture().join();
+            var stable = new KafkaRunRootRecordV2(raw.record().resource(), root, true, Optional.empty(), false,
+                    raw.record().recoveryCut()).encode();
+            var identity = Sha256Digest.hash(com.nereusstream.domain.bytes.CanonicalBytes.copyOf(java.nio.ByteBuffer.allocate(84 + stable.length())
+                    .putInt(0x4d354e53).put(stable.toByteArray()).putLong(scope.closedMetadata().sealedLastEntryId())
+                    .putLong(scope.closedMetadata().sealedLength()).put(extent.formatRootSha256().bytes().toByteArray())
+                    .put(extent.bodySha256().bytes().toByteArray()).array()));
+            if (!identity.equals(source.sourceIdentity()))
+                throw new IllegalStateException("sealed native metadata differs from the replaced raw source identity");
+            return new SealedSourceFact(Optional.of(raw), scope);
+        }
     }
 
     private static Optional<M5BookKeeperNativeCreateClientV2.FencedLedgerScopeFacts> absentIntentScope(

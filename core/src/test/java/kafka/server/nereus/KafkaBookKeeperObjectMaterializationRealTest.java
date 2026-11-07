@@ -131,7 +131,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                     return new NereusBrokerStorageRuntime(context, new NereusKafkaOwnedProviderRuntime(
                             context, observer(ready, heldFetch, ready == first ? fault : new PublicationFault("known"))));
                 });
-        KafkaBookKeeperM5PolicyRealScenario.configure(builder, work, fixture.settings(), true, "OBJECT_BYTES_DISABLED");
+        KafkaBookKeeperM5PolicyRealScenario.configure(builder, work, fixture.settings(), true,
+                fault.retireFallback ? "OBJECT_GC_ENABLED" : "OBJECT_BYTES_DISABLED");
         builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.bytes.per.ledger", "1048576");
         builder.setConfigProp("message.max.bytes", "4096");
         if (fault.automatic) builder.setConfigProp("nereus.kafka.storage.retention.check.interval.ms", "1000");
@@ -347,6 +348,29 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             releasedLedgers.set(transfer.original().sealedRoots().stream().filter(root -> !tail.contains(root))
                     .map(root -> root.ledgerIdentity().ledgerId()).toList());
             assertFalse(releasedLedgers.get().isEmpty());
+        }
+
+        private void reclaimReleasedSources(NereusKafkaOwnedProviderRuntime.Opened owner) throws Exception {
+            assertTrue(owner.nativeM5GcAdmissionOpen().toCompletableFuture().get(30, TimeUnit.SECONDS));
+            try (var scan = owner.openNativeM5SourceScan().toCompletableFuture().get(30, TimeUnit.SECONDS)) {
+                var inputs = NereusKafkaM5GcInputsV1.captureReplacement(scan).toCompletableFuture().get(30, TimeUnit.SECONDS);
+                var targets = inputs.resources().stream().map(resource -> inputs.handle(resource).ledgerIdentity().ledgerId()).sorted().toList();
+                assertEquals(releasedLedgers.get().stream().sorted().toList(), targets);
+                assertFalse(targets.contains(retainedLedger));
+                scan.reclaimReplacedSources().toCompletableFuture().get(60, TimeUnit.SECONDS);
+                for (var resource : inputs.resources()) {
+                    var done = scan.physical().read(resource.authorityKey()).toCompletableFuture().get(30, TimeUnit.SECONDS).orElseThrow();
+                    assertTrue(com.nereusstream.storage.object.gc.M5TargetDeleteStoredValueV2.decode(done).compactDone().isPresent());
+                    assertTrue(scan.physical().quota().requireExistingReservation(resource).toCompletableFuture().get(30, TimeUnit.SECONDS).settled());
+                    assertEquals(com.nereusstream.storage.bookkeeper.M5BookKeeperDeleteAdapterV1.CaptureOutcome.DEFINITIVELY_ABSENT,
+                            scan.nativeClient().captureExactTarget(inputs.handle(resource)).toCompletableFuture().get(30, TimeUnit.SECONDS).outcome());
+                }
+            }
+        }
+
+        private void beginColdRecoveryObservation() {
+            releasedLedgerReads.set(0);
+            retainedCheckpointReads.set(0);
         }
 
         private void assertRetainedRecovery() {
@@ -750,6 +774,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata.persistObjectScope(owner, provider, transfer, Duration.ofSeconds(10))
                 .toCompletableFuture().get(30, TimeUnit.SECONDS);
         probe.held().observeRetainedCheckpoint(transfer);
+        probe.held().reclaimReleasedSources(owner);
+        assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
+        probe.held().beginColdRecoveryObservation();
         verifyColdSelector(selector, cold.relocate(), client, expected, probe.held());
         probe.held().assertRetainedRecovery();
     }

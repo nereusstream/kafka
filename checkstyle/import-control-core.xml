@@ -239,6 +239,13 @@
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1" />
       </file>
+      <file name="NereusKafkaObjectReplacementV1(\.java)?" regex="true">
+        <allow class="com.nereusstream.kafka.bookkeeper.compaction.KafkaBookKeeperObjectReadScopeV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationKeysV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IndexKind" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.TaskState" />
+      </file>
       <file name="NereusKafkaObjectRecovery(\.java)?" regex="true">
         <allow class="com.nereusstream.kafka.bookkeeper.compaction.KafkaBookKeeperObjectReadScopeV1" />
         <allow class="com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1" />
