@@ -38,6 +38,7 @@ final class FailFirstNereusStorageCloseFactory implements BrokerStorageRuntimeFa
     private final NereusBrokerStorageRuntimeFactory nativeFactory = new NereusBrokerStorageRuntimeFactory();
     private final AtomicInteger attempts = new AtomicInteger();
     private final AtomicInteger completedNativeCloses = new AtomicInteger();
+    private final KafkaBookKeeperFetchProbe fetchProbe = new KafkaBookKeeperFetchProbe();
     private final int brokerId;
 
     FailFirstNereusStorageCloseFactory(int brokerId) {
@@ -50,6 +51,10 @@ final class FailFirstNereusStorageCloseFactory implements BrokerStorageRuntimeFa
 
     int completedNativeCloses() {
         return completedNativeCloses.get();
+    }
+
+    KafkaBookKeeperFetchProbe fetchProbe() {
+        return fetchProbe;
     }
 
     @Override
@@ -74,7 +79,7 @@ final class FailFirstNereusStorageCloseFactory implements BrokerStorageRuntimeFa
 
             @Override
             public Option<BrokerStorageFetchExecutor> fetchExecutor() {
-                return nativeRuntime.fetchExecutor();
+                return nativeRuntime.fetchExecutor().map(fetchProbe::observe);
             }
 
             @Override

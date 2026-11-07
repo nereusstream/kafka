@@ -439,7 +439,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                     assertEquals(0, log(cluster, 0).lastStableOffset());
                     TopicPartition topicPartition = new TopicPartition("native-cold", 0);
                     producer.sendOffsetsToTransaction(Map.of(topicPartition, new OffsetAndMetadata(40)), group.groupMetadata());
-                    KafkaBookKeeperFetchProbe.commitAndVerifyFetch(cluster, 0, topicId, topicPartition, producer, expected);
+                    storageFactory.fetchProbe().commitAndVerifyFetch(cluster, 0, topicId, topicPartition, producer, expected);
                     assertEquals(expected, consume(client, 40));
                     assertEquals(40, readGroupOffset(client));
                     producer.beginTransaction();

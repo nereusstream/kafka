@@ -16,23 +16,35 @@
  */
 package kafka.server.nsip;
 
+import kafka.server.storage.BrokerStorageFetchExecutor;
+
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
-import org.apache.kafka.test.TestUtils;
+import org.apache.kafka.server.storage.log.FetchParams;
+import org.apache.kafka.storage.internals.log.LogReadResult;
 
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 
+import scala.Function1;
+import scala.Tuple2;
+import scala.collection.Seq;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** A single Fetch request remains pending at LSO until the transaction commits. */
@@ -40,9 +52,37 @@ final class KafkaBookKeeperFetchProbe {
     private static final short FETCH_VERSION = 12;
     private static final int MAX_WAIT_MS = 20_000;
 
-    private KafkaBookKeeperFetchProbe() {}
+    private final CompletableFuture<LogReadResult> firstRead = new CompletableFuture<>();
 
-    static void commitAndVerifyFetch(
+    BrokerStorageFetchExecutor observe(BrokerStorageFetchExecutor nativeExecutor) {
+        return new BrokerStorageFetchExecutor() {
+            @Override
+            public CompletionStage<Seq<Tuple2<TopicIdPartition, LogReadResult>>> submit(
+                    FetchParams params,
+                    Seq<Tuple2<TopicIdPartition, FetchRequest.PartitionData>> partitions,
+                    Function1<Object, Seq<Tuple2<TopicIdPartition, LogReadResult>>> read) {
+                return nativeExecutor.submit(params, partitions, initial -> {
+                    var response = read.apply(initial);
+                    if (Boolean.TRUE.equals(initial) && params.maxWaitMs == MAX_WAIT_MS) {
+                        firstRead.complete(response.head()._2());
+                    }
+                    return response;
+                });
+            }
+
+            @Override
+            public CompletionStage<Void> drained() {
+                return nativeExecutor.drained();
+            }
+
+            @Override
+            public void close() throws Exception {
+                nativeExecutor.close();
+            }
+        };
+    }
+
+    void commitAndVerifyFetch(
             KafkaClusterTestKit cluster,
             int broker,
             Uuid topicId,
@@ -54,12 +94,15 @@ final class KafkaBookKeeperFetchProbe {
                                 topicId, 0, FetchRequest.INVALID_LOG_START_OFFSET, 1 << 20, Optional.empty())))
                 .isolationLevel(IsolationLevel.READ_COMMITTED)
                 .build(FETCH_VERSION);
-        var purgatory = cluster.brokers().get(broker).replicaManager().delayedFetchPurgatory();
-        assertEquals(0, purgatory.numDelayed(), "no other client should have a delayed Fetch");
         long start = System.nanoTime();
         try (var wire = new NativeKafkaRequest(cluster, broker, fetch)) {
-            TestUtils.waitForCondition(() -> purgatory.numDelayed() == 1, 5_000,
-                    "read_committed Fetch did not wait at the open transaction");
+            var initial = firstRead.get(5, TimeUnit.SECONDS);
+            assertEquals(Errors.NONE, initial.error());
+            assertEquals(expected.size(), initial.highWatermark());
+            assertEquals(0, initial.lastStableOffset().orElseThrow());
+            assertEquals(0, initial.info().records.sizeInBytes());
+            assertThrows(SocketTimeoutException.class, () -> wire.receive(250),
+                    "read_committed Fetch returned while the transaction was open");
             producer.commitTransaction();
             // The first and only request must return before Kafka's delayed Fetch timer fires.
             var response = (FetchResponse) wire.receive(5_000);
