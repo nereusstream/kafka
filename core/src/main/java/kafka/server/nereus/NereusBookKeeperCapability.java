@@ -119,6 +119,11 @@ final class NereusBookKeeperCapability {
             throw new IllegalArgumentException("native BK activation aggregate differs from local deployment policy");
     }
 
+    static boolean usesAsyncObject(TopicBindingAggregateRecord aggregate) {
+        return org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1.fromRecord(aggregate, (short) 0)
+                .storageProfile() == StorageProfileV1.BOOKKEEPER_WAL_ASYNC_OBJECT;
+    }
+
     /** Canonical Protocol Cell identity from the aggregate admitted by validateAggregate. */
     static Sha256Digest protocolCell(TopicBindingAggregateRecord aggregate) {
         return Sha256Digest.hash(com.nereusstream.domain.codec.ProtocolCellIdentityCodecV1.encode(
@@ -134,6 +139,9 @@ final class NereusBookKeeperCapability {
     static org.apache.kafka.metadata.nereus.NereusKafkaMetadataPolicyV1 metadataPolicy(kafka.server.KafkaConfig config)
             throws Exception {
         var props = descriptor(Path.of(config.getString(NereusKafkaConfigs.BOOKKEEPER_CAPABILITY_FILE_CONFIG)));
+        var selected = config.nereusKafkaStorageConfig().core().profile()
+                == org.apache.kafka.server.config.NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT
+                ? StorageProfileV1.BOOKKEEPER_WAL_ASYNC_OBJECT : StorageProfileV1.BOOKKEEPER_WAL_ONLY;
         return new org.apache.kafka.metadata.nereus.NereusKafkaMetadataPolicyV1(
                 Uuid.fromString(config.nereusKafkaStorageConfig()
                         .bookKeeper()
@@ -142,10 +150,15 @@ final class NereusBookKeeperCapability {
                 Uuid.fromString(
                         config.nereusKafkaStorageConfig().core().cluster().orElseThrow()),
                 sha(props, "policyCatalogDigest").bytes().toByteArray(),
-                StorageProfileV1.BOOKKEEPER_WAL_ONLY,
-                Set.of(StorageProfileV1.BOOKKEEPER_WAL_ONLY),
+                selected,
+                selected == StorageProfileV1.BOOKKEEPER_WAL_ONLY
+                        ? Set.of(selected) : Set.of(StorageProfileV1.BOOKKEEPER_WAL_ONLY, selected),
                 1,
                 false);
+    }
+
+    static void requireControllerObjectProfile(KafkaConfig config) throws Exception {
+        NereusKafkaObjectProvider.profile(config, metadataPolicy(config).cellIdentity());
     }
 
     static Properties descriptor(Path file) throws Exception {

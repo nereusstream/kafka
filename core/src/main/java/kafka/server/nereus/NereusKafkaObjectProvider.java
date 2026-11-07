@@ -46,12 +46,16 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Map;
 import java.util.ArrayDeque;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -71,17 +75,28 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
     private final S3C1ObjectProviderTransport transport;
     private final C1ObjectProviderSession session;
     private final OxiaQuotaTargetDeleteStoreV2 physicalQuota;
+    private final ThreadPoolExecutor fetchReads;
+    private final Duration shutdownTimeout;
     private final ArrayDeque<PendingRead> readCleanup = new ArrayDeque<>();
 
     private record PendingRead(VerifiedReadCleanupException failure, CompletableFuture<Void> drain) { }
 
     private NereusKafkaObjectProvider(OxiaCellProviderScopeRegistryV2.Admission admission,
             S3C1ObjectProviderTransport transport, C1ObjectProviderSession session,
-            OxiaQuotaTargetDeleteStoreV2 physicalQuota) {
+            OxiaQuotaTargetDeleteStoreV2 physicalQuota, KafkaConfig config) {
         this.admission = admission;
         this.transport = transport;
         this.session = session;
         this.physicalQuota = physicalQuota;
+        var storage = config.nereusKafkaStorageConfig();
+        var fetch = storage.fetch();
+        shutdownTimeout = storage.rollout().shutdownDrainTimeout();
+        fetchReads = new ThreadPoolExecutor(fetch.executorThreads(), fetch.executorThreads(), 0, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(fetch.executorQueueCapacity()), task -> {
+                    var thread = new Thread(task, "nereus-object-fetch-" + config.brokerId());
+                    thread.setDaemon(true);
+                    return thread;
+                });
     }
 
     static M5CellProviderProfileV2 profile(KafkaConfig config, KafkaProtocolCellIdentity cell) throws IOException {
@@ -137,7 +152,7 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
             }
             var session = new C1ObjectProviderSession(transport, profile.scopeId(), profile.exclusiveNamespacePrefix(),
                     profile.maximumObjectBytes(), Math.min(profile.maximumRangeBytes(), 65_536));
-            return new NereusKafkaObjectProvider(admission, transport, session, physicalQuota);
+            return new NereusKafkaObjectProvider(admission, transport, session, physicalQuota, config);
         } catch (Exception | Error failure) {
             try {
                 client.close();
@@ -235,6 +250,24 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
 
     void beginDrain() {
         session.drain();
+        fetchReads.shutdown();
+    }
+
+    Executor fetchExecutor() {
+        return fetchReads;
+    }
+
+    void drainFetches() {
+        beginDrain();
+        try {
+            if (!fetchReads.awaitTermination(shutdownTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
+                throw new IllegalStateException("Kafka Object Fetch executor has not drained");
+            }
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Kafka Object Fetch drain was interrupted", failure);
+        }
+        reconcileOriginalReads();
     }
 
     /** Reconcile only the original SDK response; no subsequent GET can prove the former one closed. */
@@ -252,10 +285,11 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
     }
 
     @Override
-    public synchronized void close() {
-        session.drain();
-        reconcileOriginalReads();
-        session.close();
-        transport.close();
+    public void close() {
+        drainFetches();
+        synchronized (this) {
+            session.close();
+            transport.close();
+        }
     }
 }

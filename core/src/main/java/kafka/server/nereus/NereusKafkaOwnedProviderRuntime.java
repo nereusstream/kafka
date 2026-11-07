@@ -31,6 +31,7 @@ import com.nereusstream.domain.codec.TopicIncarnationIdentityCodecV1;
 import com.nereusstream.domain.identity.Id128;
 import com.nereusstream.kafka.bookkeeper.admission.KafkaBookKeeperRecoveryEnvelopeV1;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1;
+import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperNativeObjectReadSourcesV1;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaBookKeeperReadCellBudgetV2;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaBookKeeperRunSourceV2;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionAdmissionV1;
@@ -47,6 +48,7 @@ import com.nereusstream.kafka.bookkeeper.pipeline.KafkaAppendCapacityBudgetV1;
 import com.nereusstream.kafka.bookkeeper.pipeline.KafkaAppendCapacityControllerV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionFenceV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionPublicationObserver;
+import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
 import com.nereusstream.kafka.bookkeeper.recovery.KafkaBookKeeperRunBirthRecoveryV1;
 import com.nereusstream.kafka.bookkeeper.run.KafkaBookKeeperNativeRootVerifierV2;
 import com.nereusstream.metadata.oxia.v2.retention.Oxia09ExactMetadataTransactionStoreV1;
@@ -209,6 +211,8 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
     private final KafkaAppendCapacityControllerV1 globalCapacity;
     private BookKeeperCapabilitySnapshotV1 capability;
     private Optional<NereusKafkaM4AdmissionV2> m4Admission = Optional.empty();
+    private volatile NereusKafkaObjectProvider asyncObject;
+    private volatile boolean asyncObjectReleased;
     private Optional<NereusKafkaM5PolicyInputV1> m5PolicyInput = Optional.empty();
     private ExecutorService m4ReadOwnerLoop;
     private final Semaphore cellReadSlots;
@@ -257,17 +261,20 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                 () -> {
                     try {
                         var config = context.config().nereusKafkaStorageConfig();
-                        if (config.core().profile()
-                                != org.apache.kafka.server.config.NereusKafkaStorageConfig.Profile
-                                        .BOOKKEEPER_WAL_ONLY) {
+                        if (!config.core().profile().usesBookKeeper()) {
                             throw new IllegalArgumentException(
-                                    "NSIP-1 native activation currently admits BOOKKEEPER_WAL_ONLY; Object authority is pending");
+                                    "NSIP-1 native BookKeeper runtime cannot activate Object WAL");
                         }
+                        boolean wantsAsyncObject = config.core().profile()
+                                == org.apache.kafka.server.config.NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT;
                         capability = NereusBookKeeperCapability.loadAndValidate(context.config());
                         m4Admission = NereusKafkaM4AdmissionV2.load(context.config(), capability);
                         m5PolicyInput = NereusKafkaM5PolicyInputV1.load(context.config(), capability);
                         if (m5PolicyInput.isPresent() && m4Admission.isEmpty()) {
                             throw new IllegalArgumentException("M5 sealed-target selection requires actual M4 admission");
+                        }
+                        if (wantsAsyncObject && (m4Admission.isEmpty() || m5PolicyInput.isEmpty())) {
+                            throw new IllegalArgumentException("native Kafka async Object requires the exact M4 and M5 policy inputs");
                         }
                         oxia = runResponses.controlClient(await(OxiaClientBuilder.create(
                                         config.core().oxiaServiceAddress().orElseThrow())
@@ -287,6 +294,10 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                                                 oxia, bound.orElseThrow().metadataNamespace())
                                         : OxiaPhysicalMetadataNamespaceV2.provision(oxia));
                         namespaceBinding = await(namespace.bind(backend));
+                        if (wantsAsyncObject) {
+                            var cell = NereusBookKeeperCapability.metadataPolicy(context.config()).cellIdentity();
+                            asyncObject = NereusKafkaObjectProvider.open(context.config(), cell, namespace);
+                        }
                         if (m5PolicyInput.isPresent()) {
                             // Native epoch capacity must precede the first permanent ledger reservation.
                             // Existing counters/limits are verified without importing or expanding old history.
@@ -386,7 +397,10 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                                 ownerEpoch,
                                 leaderEpoch);
                         var recoveryOwner = opened;
-                        var selected = opened.recoverNativeSelectedPrefix(m4.readSelector(), closedOwner);
+                        var predecessorSelector = m4.readSelector();
+                        var recoveredObject = recoverObjectView(aggregate, m4, scope.partition(), predecessorSelector);
+                        var selected = recoveredObject.isPresent() ? Optional.<KafkaBookKeeperClosedHistoryRecoveryV1.SelectedPrefix>empty()
+                                : opened.recoverNativeSelectedPrefix(predecessorSelector, closedOwner);
                         opened.storage = await(KafkaBookKeeperPartitionV1.openSelected(
                                 new AdmittingSession(session, source, owner, opened),
                                 roots,
@@ -421,36 +435,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                                 Topic.GROUP_METADATA_TOPIC_NAME.equals(identity.topic())));
                         opened.requireRecoveredBirthSelection();
                         await(namespace.requireCurrent());
-                        if (m4Admission.isPresent()) {
-                            var admission = m4Admission.orElseThrow();
-                            var sources = opened.storage.nativeReadSources();
-                            var admittedSources = opened.admitNativeReadSources(owner, roots, m4, sources,
-                                    predecessor -> m4.provisionDurableDrainOnly(
-                                    admission.adapterSha256(),
-                                    admission.backendConfigurationSha256(),
-                                    admission.readContractSha256(),
-                                    admission.verifierSha256(),
-                                    admission.inputsSha256(),
-                                    admission.receiptSha256(),
-                                    admission.maximumSourceAccessLifetimeMillis(),
-                                    selected.map(prefix -> prefix.view().descriptor().descriptorSha256())
-                                            .orElseGet(sources::selectedViewSha256),
-                                    ownerEpoch, predecessor));
-                            opened.storage.installM4ReadOwner(
-                                    m4.control(), admittedSources.publication(), m4ReadOwnerLoop, bk.maxReadsInFlight(),
-                                    cellReadSlots, opened.bindingReadSlots, admittedSources.reads(),
-                                    (successor, publication) -> recoveryOwner.admitNativeReadSources(
-                                            owner, roots, m4, successor, predecessor -> {
-                                                publication.run();
-                                                return successor.selectedViewSha256();
-                                            }).reads());
-                            NereusKafkaReadScopeV2.persistRecovery(m4, scope.partition(), roots, opened.storage, selected);
-                        } else if (m4.readSelector().isPresent()) {
-                            throw new IllegalStateException(
-                                    "M4 selector changed before native BK read owner activation");
-                        } else {
-                            opened.storage.installHistoricalReads(opened.historicalReads(owner, roots));
-                        }
+                        installRecoveredReadOwner(opened, predecessorSelector, selected, recoveredObject);
                         if (!current.getAsBoolean()) {
                             opened.storage.fence();
                             throw new FencedLeaderEpochException("native assignment changed after BK recovery");
@@ -1584,6 +1569,51 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
     public synchronized void fence() {
         closed = true;
         owned.forEach(Opened::fence);
+        if (asyncObject != null && !asyncObjectReleased) asyncObject.beginDrain();
+    }
+
+    private void installRecoveredReadOwner(Opened opened, Optional<BindingReadSelector> predecessorSelector,
+            Optional<KafkaBookKeeperClosedHistoryRecoveryV1.SelectedPrefix> selected,
+            Optional<KafkaObjectMaterializedPrefixV1> recoveredObject) {
+        var owner = opened.nativeOwner;
+        var roots = opened.rootsAuthority;
+        var m4 = opened.m4Route;
+        if (m4Admission.isEmpty()) {
+            if (m4.readSelector().isPresent()) {
+                throw new IllegalStateException("M4 selector changed before native BK read owner activation");
+            }
+            opened.storage.installHistoricalReads(opened.historicalReads(owner, roots));
+            return;
+        }
+        var admission = m4Admission.orElseThrow();
+        var sources = opened.storage.nativeReadSources();
+        var preferredView = recoveredObject.map(KafkaObjectMaterializedPrefixV1::manifestSha256)
+                .or(() -> selected.map(prefix -> prefix.view().descriptor().descriptorSha256()))
+                .orElseGet(sources::selectedViewSha256);
+        recoveredObject.ifPresent(prefix -> {
+            var predecessor = predecessorSelector.orElseThrow();
+            var objectSources = new KafkaBookKeeperNativeObjectReadSourcesV1(
+                    sources, prefix, opened.source.spec().namespace(),
+                    predecessor.mode() == SelectorMode.PREFERRED_WITH_FALLBACK, asyncObject.fetchExecutor());
+            opened.storage.prepareRecoveredObjectReadSources(objectSources, predecessor);
+        });
+        var admitted = opened.admitNativeReadSources(owner, roots, m4, sources, predecessor -> {
+            if (recoveredObject.isPresent() && !predecessor.equals(predecessorSelector)) {
+                throw new IllegalStateException("selected Object manifest changed before Owner grant");
+            }
+            return m4.provisionDurableDrainOnly(admission.adapterSha256(),
+                    admission.backendConfigurationSha256(), admission.readContractSha256(), admission.verifierSha256(),
+                    admission.inputsSha256(), admission.receiptSha256(), admission.maximumSourceAccessLifetimeMillis(),
+                    preferredView, owner.ownerEpoch(), predecessor);
+        });
+        int readSlots = context.config().nereusKafkaStorageConfig().bookKeeper().orElseThrow().maxReadsInFlight();
+        opened.storage.installM4ReadOwner(m4.control(), admitted.publication(), m4ReadOwnerLoop, readSlots,
+                cellReadSlots, opened.bindingReadSlots, admitted.reads(), (successor, publication) ->
+                        opened.admitNativeReadSources(owner, roots, m4, successor, predecessor -> {
+                            publication.run();
+                            return successor.selectedViewSha256();
+                        }).reads());
+        NereusKafkaReadScopeV2.persistRecovery(m4, opened.nativeScope.partition(), roots, opened.storage, selected);
     }
 
     @Override
@@ -1599,6 +1629,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                 TimeUnit.MILLISECONDS)) {
             throw new IllegalStateException("native BK recovery operations have not drained");
         }
+        drainObjectReads();
         Exception failure = null;
         for (var item : List.copyOf(owned))
             try {
@@ -1608,6 +1639,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                 else failure.addSuppressed(closeFailure);
             }
         if (failure != null) throw failure;
+        closeObjectProvider();
         closeM4ReadOwnerLoop();
         if (backend != null && !backendReleased) {
             backend.close();
@@ -1617,6 +1649,27 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
             oxia.close();
             oxiaReleased = true;
         }
+    }
+
+    private void drainObjectReads() {
+        if (asyncObject != null && !asyncObjectReleased) asyncObject.drainFetches();
+    }
+
+    private void closeObjectProvider() {
+        if (asyncObject != null && !asyncObjectReleased) {
+            asyncObject.close();
+            asyncObjectReleased = true;
+        }
+    }
+
+    private Optional<KafkaObjectMaterializedPrefixV1> recoverObjectView(TopicBindingAggregateRecord aggregate,
+            OxiaKafkaBookKeeperM4ReadRouteV2 binding, int partition, Optional<BindingReadSelector> selector)
+            throws Exception {
+        if (!NereusBookKeeperCapability.usesAsyncObject(aggregate)) return Optional.empty();
+        if (asyncObject == null) throw new IllegalStateException("native async Object Binding has no admitted provider");
+        if (selector.isEmpty()) return Optional.empty();
+        return NereusKafkaObjectRecovery.recover(binding, partition, selector.orElseThrow(), asyncObject,
+                context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout());
     }
 
     private void closeM4ReadOwnerLoop() throws InterruptedException {
