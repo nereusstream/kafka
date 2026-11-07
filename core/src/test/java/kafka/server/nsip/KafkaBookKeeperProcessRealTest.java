@@ -46,6 +46,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -67,16 +68,20 @@ public class KafkaBookKeeperProcessRealTest {
         var common = KafkaBookKeeperOwnerRelocationRealTest.nativeConfig(work, bkUri, oxia);
         int[] ports = allocatePorts();
         String clusterId = Uuid.randomUuid().toString();
-        var controller = new NativeNode(work, common, 2, ports[2], ports[2], true);
-        var first = new NativeNode(work, common, 0, ports[0], ports[2], false);
-        var next = new NativeNode(work, common, 1, ports[1], ports[2], false);
+        String voters = "2@127.0.0.1:" + ports[2] + ",3@127.0.0.1:" + ports[3] + ",4@127.0.0.1:" + ports[4];
+        var controller = new NativeNode(work, common, 2, ports[2], voters, true);
+        var secondController = new NativeNode(work, common, 3, ports[3], voters, true);
+        var thirdController = new NativeNode(work, common, 4, ports[4], voters, true);
+        var controllers = Map.of(2, controller, 3, secondController, 4, thirdController);
+        var first = new NativeNode(work, common, 0, ports[0], voters, false);
+        var next = new NativeNode(work, common, 1, ports[1], voters, false);
         System.out.println("Native process logs: " + work);
-        try (controller; first; next) {
+        try (controller; secondController; thirdController; first; next) {
             controller.assertRejectsImplicitFormat(clusterId);
-            controller.format(clusterId);
+            for (var voter : controllers.values()) voter.format(clusterId);
             first.format(clusterId);
             next.format(clusterId);
-            controller.start();
+            for (var voter : controllers.values()) voter.start();
             first.start();
             Properties initialClient = client(ports[0]);
             try (Admin admin = Admin.create(initialClient)) {
@@ -89,16 +94,26 @@ public class KafkaBookKeeperProcessRealTest {
                 leaderAck.setProperty("enable.idempotence", "false");
                 leaderAck.setProperty("acks", "1");
                 assertEquals(1, append(leaderAck, "leader-ack"));
-                long floor = admin.describeMetadataQuorum().quorumInfo().get(30, TimeUnit.SECONDS).highWatermark();
+                var quorum = admin.describeMetadataQuorum().quorumInfo().get(30, TimeUnit.SECONDS);
+                long floor = quorum.highWatermark();
                 assertTrue(floor > 0);
-                TestUtils.waitForCondition(() -> controller.hasSnapshotAtOrAfter(floor),
-                        "Controller did not persist a snapshot containing the original topic");
-                controller.stop();
-                controller.assertRejectsDisabledRestart();
-                controller.start();
-                assertEquals(topicId, topicId(admin));
-                admin.createTopics(List.of(new NewTopic(CONTROLLER_RESTART_TOPIC, Map.of(0, List.of(0)))))
-                        .all().get(30, TimeUnit.SECONDS);
+                for (var voter : controllers.values()) {
+                    TestUtils.waitForCondition(() -> voter.hasSnapshotAtOrAfter(floor),
+                            "A Controller did not persist a snapshot containing the original topic");
+                }
+                var formerLeader = controllers.get(quorum.leaderId());
+                formerLeader.stop();
+                awaitControllerFailover(admin, quorum.leaderId());
+                var failoverTopicId = admin.createTopics(List.of(new NewTopic(CONTROLLER_RESTART_TOPIC, Map.of(0, List.of(0)))))
+                        .topicId(CONTROLLER_RESTART_TOPIC).get(30, TimeUnit.SECONDS);
+                long failoverFloor = admin.describeMetadataQuorum().quorumInfo().get(30, TimeUnit.SECONDS).highWatermark();
+                assertTrue(failoverFloor > floor);
+                formerLeader.assertRejectsDisabledRestart();
+                formerLeader.start();
+                TestUtils.waitForCondition(() -> formerLeader.hasSnapshotAtOrAfter(failoverFloor),
+                        "Restarted Controller did not catch up to the metadata written after failover");
+                assertEquals(topicId, topicId(admin, TOPIC));
+                assertEquals(failoverTopicId, topicId(admin, CONTROLLER_RESTART_TOPIC));
                 // This observer has an empty metadata log and cannot reconstruct the topic
                 // from a local image. Verify an actual transferred snapshot on disk.
                 next.start();
@@ -129,7 +144,7 @@ public class KafkaBookKeeperProcessRealTest {
                 assertEquals(List.of("before-process-restart", "leader-ack", "after-cold-relocation"),
                         KafkaBookKeeperOwnerRelocationRealTest.consume(relocated, 3));
                 try (Admin relocatedAdmin = Admin.create(relocated)) {
-                    assertEquals(topicId, topicId(relocatedAdmin));
+                    assertEquals(topicId, topicId(relocatedAdmin, TOPIC));
                 }
             }
         }
@@ -139,8 +154,11 @@ public class KafkaBookKeeperProcessRealTest {
         var loopback = InetAddress.getByName("127.0.0.1");
         try (var first = new ServerSocket(0, 1, loopback);
                 var next = new ServerSocket(0, 1, loopback);
-                var controller = new ServerSocket(0, 1, loopback)) {
-            return new int[]{first.getLocalPort(), next.getLocalPort(), controller.getLocalPort()};
+                var controller = new ServerSocket(0, 1, loopback);
+                var secondController = new ServerSocket(0, 1, loopback);
+                var thirdController = new ServerSocket(0, 1, loopback)) {
+            return new int[]{first.getLocalPort(), next.getLocalPort(), controller.getLocalPort(),
+                secondController.getLocalPort(), thirdController.getLocalPort()};
         }
     }
 
@@ -149,8 +167,19 @@ public class KafkaBookKeeperProcessRealTest {
                 .anyMatch(node -> node.id() == id), "Broker did not register: " + id);
     }
 
-    private static Uuid topicId(Admin admin) throws Exception {
-        return admin.describeTopics(List.of(TOPIC)).allTopicNames().get(30, TimeUnit.SECONDS).get(TOPIC).topicId();
+    private static void awaitControllerFailover(Admin admin, int previousLeader) throws Exception {
+        TestUtils.waitForCondition(() -> {
+            try {
+                int leader = admin.describeMetadataQuorum().quorumInfo().get(5, TimeUnit.SECONDS).leaderId();
+                return leader >= 0 && leader != previousLeader;
+            } catch (ExecutionException | TimeoutException unavailable) {
+                return false;
+            }
+        }, "Controller quorum did not elect a new Leader");
+    }
+
+    private static Uuid topicId(Admin admin, String topic) throws Exception {
+        return admin.describeTopics(List.of(topic)).allTopicNames().get(30, TimeUnit.SECONDS).get(topic).topicId();
     }
 
     private static void assertRejectedTopic(Admin admin, NewTopic topic, Errors expected) {
@@ -180,7 +209,7 @@ public class KafkaBookKeeperProcessRealTest {
         private final Path config;
         private Process process;
 
-        NativeNode(Path work, Map<String, Object> common, int id, int port, int controllerPort, boolean controller)
+        NativeNode(Path work, Map<String, Object> common, int id, int port, String voters, boolean controller)
                 throws Exception {
             directory = Files.createDirectory(work.resolve("node-" + id));
             config = directory.resolve("server.properties");
@@ -192,7 +221,7 @@ public class KafkaBookKeeperProcessRealTest {
             props.setProperty("controller.listener.names", "CONTROLLER");
             props.setProperty("inter.broker.listener.name", "PLAINTEXT");
             props.setProperty("listener.security.protocol.map", "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT");
-            props.setProperty("controller.quorum.voters", "2@127.0.0.1:" + controllerPort);
+            props.setProperty("controller.quorum.voters", voters);
             props.setProperty("log.dirs", directory.resolve("logs").toString());
             props.setProperty("nereus.kafka.storage.cache.dir", directory.resolve("cache").toString());
             if (controller) {
