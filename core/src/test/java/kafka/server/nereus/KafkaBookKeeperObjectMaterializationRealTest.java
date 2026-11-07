@@ -594,10 +594,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertEquals(selector.selectedViewSha256(), reopened.manifestSha256());
             assertEquals(verified.protections(), reopened.originalFallbackSources());
             if (fault.retireFallback) {
-                var preferred = retireWhileReadHeld(opened, probe, reads, produced, selector);
-                var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
-                assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
-                verifyColdSelector(preferred, cold.relocate(), client, expected, heldFetch);
+                retireWhileReadHeld(opened, probe, reads, produced, selector, client, cold);
                 return;
             }
             if (fault.enabled) {
@@ -616,13 +613,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                     return;
                 }
             }
-            long before = sealedRuns(opened);
-            int end = produced;
-            while (sealedRuns(opened) == before && end < produced + 32) {
-                KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + end, end);
-                end++;
-            }
-            assertTrue(sealedRuns(opened) > before, "BK did not roll its tail after Object selection");
+            int end = produceThroughRollover(opened, client, produced);
             assertEquals(selector.selectedViewSha256(),
                     opened.nativeM5BindingRoute().readSelector().orElseThrow().selectedViewSha256());
             var expected = IntStream.range(0, end).mapToObj(offset -> "input-" + offset).toList();
@@ -645,8 +636,21 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         }
     }
 
-    private static BindingReadSelector retireWhileReadHeld(NereusKafkaOwnedProviderRuntime.Opened owner,
-            FetchProbe probe, HeldObjectFetch reads, int produced, BindingReadSelector selected) throws Exception {
+    private static int produceThroughRollover(NereusKafkaOwnedProviderRuntime.Opened owner, Properties client, int produced)
+            throws Exception {
+        long before = sealedRuns(owner);
+        int end = produced;
+        while (sealedRuns(owner) == before && end < produced + 32) {
+            KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + end, end);
+            end++;
+        }
+        assertTrue(sealedRuns(owner) > before, "BK did not roll its tail after Object selection");
+        return end;
+    }
+
+    private static void retireWhileReadHeld(NereusKafkaOwnedProviderRuntime.Opened owner,
+            FetchProbe probe, HeldObjectFetch reads, int produced, BindingReadSelector selected,
+            Properties client, ColdTakeover cold) throws Exception {
         var route = owner.nativeM5BindingRoute();
         var raw = owner.storage().nativeReadSources();
         var control = Executors.newSingleThreadExecutor();
@@ -654,12 +658,17 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         try (var wire = fetch(probe.cluster(), probe.topicId())) {
             hold.entered().get(30, TimeUnit.SECONDS);
             var retirement = owner.storage().beginNativeObjectFallbackRetirement(selected.selectedViewSha256());
-            var retiring = retirement.retire(control).toCompletableFuture();
+            owner.storage().closeNativeObjectFallbackAdmission(retirement, control).toCompletableFuture().get(30, TimeUnit.SECONDS);
+            var retiring = owner.storage().finishNativeObjectFallbackRetirement(retirement, control).toCompletableFuture();
+            int end;
             try {
-                TestUtils.waitForCondition(() -> route.readSelector().orElseThrow().mode() == SelectorMode.PREFERRED_ONLY,
-                        30_000, "original fallback epoch was not durably closed");
-                assertFalse(retiring.isDone(), "a captured Object read did not retain its old fallback");
                 var closed = route.readSelector().orElseThrow();
+                assertEquals(SelectorMode.PREFERRED_ONLY, closed.mode());
+                end = produceThroughRollover(owner, client, produced);
+                var rolled = route.readSelector().orElseThrow();
+                assertEquals(closed.readAdmissionEpoch(), rolled.readAdmissionEpoch());
+                assertTrue(rolled.sourceGeneration() > closed.sourceGeneration(), "BK tail generation did not advance");
+                assertFalse(retiring.isDone(), "a captured Object read did not retain its old fallback through BK rollover");
                 var batch = closed.activeBatches().stream().filter(row ->
                         row.sharedLastFallbackCapableReadAdmissionEpoch() == selected.readAdmissionEpoch()).findFirst().orElseThrow();
                 for (var source : batch.sources()) {
@@ -672,8 +681,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             }
             assertPinnedFetch(wire, probe.topicId(), produced);
             var result = retiring.get(30, TimeUnit.SECONDS);
-            owner.storage().finishNativeObjectFallbackRetirement(retirement, result);
-            assertEquals(raw, owner.storage().nativeReadSources(), "read retirement dropped native BK recovery references");
+            var sealed = owner.storage().nativeReadSources().sealedRoots();
+            assertEquals(raw.sealedRoots(), sealed.subList(0, raw.sealedRoots().size()),
+                    "read retirement dropped native BK recovery references");
             for (var source : result.batch().sources()) {
                 var fact = route.readProtectionFact(source.sourceIdentitySha256(), source.protectionGeneration())
                         .toCompletableFuture().get(30, TimeUnit.SECONDS).orElseThrow();
@@ -684,7 +694,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertEquals(selected.selectedViewSha256(), result.selector().selectedViewSha256());
             assertEquals(selected.readAdmissionEpoch() + 1, result.selector().readAdmissionEpoch());
             assertEquals(result.selector(), route.readSelector().orElseThrow());
-            return result.selector();
+            var expected = IntStream.range(0, end).mapToObj(offset -> "input-" + offset).toList();
+            assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, end));
+            verifyColdSelector(result.selector(), cold.relocate(), client, expected, probe.held());
         } finally {
             hold.release().complete(null);
             control.shutdown();
