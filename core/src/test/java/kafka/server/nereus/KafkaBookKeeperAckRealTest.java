@@ -167,6 +167,62 @@ public class KafkaBookKeeperAckRealTest {
 
     @Test
     @Timeout(180)
+    public void unknownBookKeeperResponseFencesOldPublicationAndColdOwnerRecoversExactBatch(@TempDir Path inputs)
+            throws Exception {
+        var observer = new HoldDurability();
+        try (var cluster = nativeCluster(inputs, observer, 2)) {
+            cluster.format();
+            cluster.startup();
+            cluster.waitForReadyBrokers();
+            var client = new Properties();
+            client.setProperty("bootstrap.servers", cluster.bootstrapServers());
+            try (var admin = Admin.create(client)) {
+                admin.createTopics(List.of(new NewTopic(TOPIC, Map.of(0, List.of(0)))))
+                        .all().get(30, TimeUnit.SECONDS);
+                var old = observer.storage.get(30, TimeUnit.SECONDS);
+                assertAckAfterPublication(client, observer, old, "all", 0);
+                var cut = new Cut(1, new CompletableFuture<>(), new CompletableFuture<>(), true);
+                observer.armed.set(cut);
+                try (var wire = new NativeKafkaRequest(cluster, 0, produce((short) -1, "unknown-response"))) {
+                    assertEquals(2, cut.durable().get(20, TimeUnit.SECONDS).acknowledgedBookies());
+                    assertEquals(1, old.capture().root().frontiers().highWatermark());
+                    cut.release().complete(null);
+                    assertNativeStorageRejection((ProduceResponse) wire.receive(30_000));
+                } finally {
+                    observer.armed.set(null);
+                    cut.release().complete(null);
+                }
+                try (var wire = new NativeKafkaRequest(cluster, 0, produce((short) -1, "forbidden-successor"))) {
+                    assertNativeStorageRejection((ProduceResponse) wire.receive(30_000));
+                }
+                var after = old.capture().root().frontiers();
+                assertEquals(1, after.highWatermark());
+                assertEquals(1, after.readableEndOffset());
+                var partition = new TopicPartition(TOPIC, 0);
+                admin.alterPartitionReassignments(Map.of(partition,
+                                Optional.of(new NewPartitionReassignment(List.of(1)))))
+                        .all().get(30, TimeUnit.SECONDS);
+                assertEquals(1, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 0));
+                assertEquals(List.of("acks-all", "unknown-response"),
+                        KafkaBookKeeperOwnerRelocationRealTest.consume(client, 2));
+                assertWireAppend(cluster, 1, compressed("next-0", "next-1"), 2);
+                assertEquals(List.of("acks-all", "unknown-response", "next-0", "next-1"),
+                        KafkaBookKeeperOwnerRelocationRealTest.consume(client, 4));
+            }
+            cluster.fatalFaultHandler().maybeRethrowFirstException();
+            cluster.nonFatalFaultHandler().maybeRethrowFirstException();
+        }
+    }
+
+    private static void assertNativeStorageRejection(ProduceResponse response) {
+        var partition = response.data().responses().iterator().next().partitionResponses().get(0);
+        var error = Errors.forCode(partition.errorCode());
+        assertTrue(error == Errors.KAFKA_STORAGE_ERROR || error == Errors.NOT_LEADER_OR_FOLLOWER,
+                "Produce after an unresolved append returned " + error);
+    }
+
+    @Test
+    @Timeout(180)
     public void nativeFetchPreservesCompleteCompressedBatchesAcrossViewChanges(@TempDir Path inputs) throws Exception {
         try (var cluster = nativeCluster(inputs, new HoldDurability(), 1)) {
             cluster.format();
@@ -184,15 +240,15 @@ public class KafkaBookKeeperAckRealTest {
                 if (local.isEmpty() || local.get().log().isEmpty()) return false;
                 return ((NereusUnifiedLog) local.get().log().get()).nereusWritable(local.get().getLeaderEpoch());
             }, "Native Owner did not activate");
-            assertWireAppend(cluster, compressed("first-0", "first-1"), 0);
-            assertWireAppend(cluster, compressed("second-0", "second-1"), 2);
-            assertWireAppend(cluster, compressed("third-0", "third-1"), 4);
+            assertWireAppend(cluster, 0, compressed("first-0", "first-1"), 0);
+            assertWireAppend(cluster, 0, compressed("second-0", "second-1"), 2);
+            assertWireAppend(cluster, 0, compressed("third-0", "third-1"), 4);
 
             // An interior offset and a one-byte budget still return the entire first batch.
             assertWireBatch(cluster, topicId, 1, 0, 6, List.of("first-0", "first-1"));
             assertWireBatch(cluster, topicId, 2, 2, 6, List.of("second-0", "second-1"));
             // Publishing a new root invalidates the position obtained for offset 4.
-            assertWireAppend(cluster, compressed("fourth-0", "fourth-1"), 6);
+            assertWireAppend(cluster, 0, compressed("fourth-0", "fourth-1"), 6);
             assertWireBatch(cluster, topicId, 4, 4, 8, List.of("third-0", "third-1"));
             assertWireBatch(cluster, topicId, 6, 6, 8, List.of("fourth-0", "fourth-1"));
             cluster.fatalFaultHandler().maybeRethrowFirstException();
@@ -206,9 +262,9 @@ public class KafkaBookKeeperAckRealTest {
                 new SimpleRecord(second.getBytes(StandardCharsets.UTF_8)));
     }
 
-    private static void assertWireAppend(KafkaClusterTestKit cluster, MemoryRecords records, long expectedOffset)
+    private static void assertWireAppend(KafkaClusterTestKit cluster, int broker, MemoryRecords records, long expectedOffset)
             throws Exception {
-        try (var wire = new NativeKafkaRequest(cluster, 0, produce((short) -1, records))) {
+        try (var wire = new NativeKafkaRequest(cluster, broker, produce((short) -1, records))) {
             var response = (ProduceResponse) wire.receive(30_000);
             var result = response.data().responses().iterator().next().partitionResponses().get(0);
             assertEquals(Errors.NONE, Errors.forCode(result.errorCode()));
@@ -309,7 +365,11 @@ public class KafkaBookKeeperAckRealTest {
                 (short) 9);
     }
 
-    private record Cut(long offset, CompletableFuture<AppendQuorumProofV1> durable, CompletableFuture<Void> release) {
+    private record Cut(long offset, CompletableFuture<AppendQuorumProofV1> durable, CompletableFuture<Void> release,
+            boolean unknown) {
+        private Cut(long offset, CompletableFuture<AppendQuorumProofV1> durable, CompletableFuture<Void> release) {
+            this(offset, durable, release, false);
+        }
     }
 
     private static final class HoldDurability implements NereusKafkaOwnedProviderRuntime.NativeRunResponseObserver {
@@ -359,7 +419,8 @@ public class KafkaBookKeeperAckRealTest {
                 } else {
                     cut.durable().complete(result.exactProof().orElseThrow());
                 }
-            }).thenCompose(result -> cut.release().thenApply(ignored -> result));
+            }).thenCompose(result -> cut.release().thenApply(ignored ->
+                    cut.unknown() ? ProviderMutationResultV1.outcomeUnknown() : result));
         }
     }
 }

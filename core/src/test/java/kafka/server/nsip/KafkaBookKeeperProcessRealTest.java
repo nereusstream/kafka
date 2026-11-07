@@ -157,6 +157,7 @@ public class KafkaBookKeeperProcessRealTest {
                 try (Admin relocatedAdmin = Admin.create(relocated)) {
                     assertEquals(topicId, topicId(relocatedAdmin, TOPIC));
                 }
+                first.assertRejectsForeignProviderScope();
             }
         }
     }
@@ -165,12 +166,15 @@ public class KafkaBookKeeperProcessRealTest {
         String evidence = System.getProperty("nereus.nsip.processEvidenceDir");
         if (evidence == null) return;
         Path destination = Files.createDirectory(Path.of(evidence));
+        var capability = work.resolve("capability.properties");
+        if (Files.isRegularFile(capability)) Files.copy(capability, destination.resolve(capability.getFileName()));
         for (int id = 0; id < 5; id++) {
             Path source = work.resolve("node-" + id);
             if (!Files.isDirectory(source)) continue;
             Path node = Files.createDirectory(destination.resolve(source.getFileName()));
-            for (String name : List.of("server.log", "format.log", "server.properties",
-                    "implicit-format.log", "disabled-restart.log", "disabled.properties", "shutdown-threads.log")) {
+            for (String name : List.of("server.log", "launcher.log", "controller.log", "format.log", "server.properties",
+                    "implicit-format.log", "disabled-restart.log", "disabled.properties", "shutdown-threads.log",
+                    "foreign-scope.log", "foreign-scope.properties")) {
                 var file = source.resolve(name);
                 if (Files.isRegularFile(file)) Files.copy(file, node.resolve(name));
             }
@@ -288,18 +292,31 @@ public class KafkaBookKeeperProcessRealTest {
         }
 
         void assertRejectsDisabledRestart() throws Exception {
+            Path disabled = withProperty("disabled.properties", "nereus.kafka.storage.enabled", "false");
+            String log = "disabled-restart.log";
+            assertExit(1, log, "kafka.server.nereus.NereusKafka", disabled.toString());
+            assertTrue(Files.readString(directory.resolve(log)).contains("Expected persisted nereus.storage.version=0"));
+        }
+
+        void assertRejectsForeignProviderScope() throws Exception {
+            Path foreign = withProperty("foreign-scope.properties", "nereus.kafka.storage.bookkeeper.provider.scope.sha256",
+                    "0000000000000000000000000000000000000000000000000000000000000002");
+            String log = "foreign-scope.log";
+            assertExit(1, log, "kafka.server.nereus.NereusKafka", foreign.toString());
+            assertTrue(Files.readString(directory.resolve(log)).contains("native BK scope or quorum differs from the admitted capability"));
+        }
+
+        private Path withProperty(String file, String key, String value) throws Exception {
             var props = new Properties();
             try (var input = Files.newInputStream(config)) {
                 props.load(input);
             }
-            props.setProperty("nereus.kafka.storage.enabled", "false");
-            Path disabled = directory.resolve("disabled.properties");
-            try (var output = Files.newOutputStream(disabled)) {
+            props.setProperty(key, value);
+            Path alternative = directory.resolve(file);
+            try (var output = Files.newOutputStream(alternative)) {
                 props.store(output, null);
             }
-            String log = "disabled-restart.log";
-            assertExit(1, log, "kafka.server.nereus.NereusKafka", disabled.toString());
-            assertTrue(Files.readString(directory.resolve(log)).contains("Expected persisted nereus.storage.version=0"));
+            return alternative;
         }
 
         private void assertExit(int exit, String log, String entryPoint, String... args) throws Exception {
@@ -315,7 +332,7 @@ public class KafkaBookKeeperProcessRealTest {
         }
 
         void start() throws Exception {
-            process = launch("server.log", "kafka.server.nereus.NereusKafka", config.toString());
+            process = launch("launcher.log", "kafka.server.nereus.NereusKafka", config.toString());
         }
 
         boolean hasSnapshotAtOrAfter(long floor) throws Exception {
