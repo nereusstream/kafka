@@ -90,10 +90,12 @@ object Kafka extends Logging {
   private[kafka] def run(
     args: Array[String],
     brokerStorageRuntimeFactory: BrokerStorageRuntimeFactory,
-    controllerStorageRuntimeFactory: ControllerStorageRuntimeFactory
+    controllerStorageRuntimeFactory: ControllerStorageRuntimeFactory,
+    afterShutdown: () => Unit = () => ()
   ): Unit = {
     Objects.requireNonNull(brokerStorageRuntimeFactory, "brokerStorageRuntimeFactory")
     Objects.requireNonNull(controllerStorageRuntimeFactory, "controllerStorageRuntimeFactory")
+    var shutdownHookRegistered = false
     try {
       val serverProps = getPropsFromArgs(args)
       val server = buildServer(
@@ -118,8 +120,11 @@ object Kafka extends Logging {
             fatal("Halting Kafka.")
             // Calling exit() can lead to deadlock as exit() can be called multiple times. Force exit.
             Exit.halt(1)
+        } finally {
+          afterShutdown()
         }
       })
+      shutdownHookRegistered = true
 
       try server.startup()
       catch {
@@ -134,6 +139,7 @@ object Kafka extends Logging {
     catch {
       case e: Throwable =>
         fatal("Exiting Kafka due to fatal exception", e)
+        if (!shutdownHookRegistered) afterShutdown()
         Exit.exit(1)
     }
     Exit.exit(0)

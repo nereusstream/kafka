@@ -21,16 +21,22 @@ import kafka.Kafka
 import kafka.server.storage.BrokerStorageRuntimeFactory
 import kafka.server.storage.ControllerStorageRuntimeFactory
 
+import org.apache.logging.log4j.LogManager
+
 /**
  * Explicit native-storage process entry point. It reuses the stock Kafka lifecycle and statically injects the Nereus
  * production runtime without reflection, a service loader, or a process-global registry.
  */
 object NereusKafka {
   def main(args: Array[String]): Unit = {
+    // BookKeeper can initialize Slog loggers while closing handles. The Log4j JVM
+    // hook must not stop its context while the broker's storage shutdown still runs.
+    System.setProperty("log4j.shutdownHookEnabled", "false")
     Kafka.run(
       args,
       productionBrokerFactory,
-      productionControllerFactory)
+      productionControllerFactory,
+      afterShutdown = () => LogManager.shutdown())
   }
 
   private[nereus] def productionBrokerFactory: BrokerStorageRuntimeFactory =

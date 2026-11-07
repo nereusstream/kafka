@@ -121,6 +121,9 @@ public class KafkaBookKeeperProcessRealTest {
                                 .partitions().get(0).leader().id() == 1,
                         "Controller restart topic did not leave the original Broker before controlled shutdown");
                 first.stop();
+                assertTrue(Files.readString(first.directory.resolve("server.log"))
+                                .contains("[BrokerServer id=0] shut down completed"),
+                        "Original Broker did not report completed storage shutdown");
                 Properties relocated = client(ports[1]);
                 assertEquals(2, append(relocated, "after-cold-relocation"));
                 assertEquals(List.of("before-process-restart", "leader-ack", "after-cold-relocation"),
