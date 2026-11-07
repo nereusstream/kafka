@@ -52,6 +52,7 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
     private final ExecutorService control;
     private final ScheduledFuture<?> scheduled;
     private final Map<NereusKafkaOwnedProviderRuntime.Opened, Job> owners = new LinkedHashMap<>();
+    private final Map<NereusKafkaOwnedProviderRuntime.Opened, NereusKafkaObjectRetirement> retirements = new LinkedHashMap<>();
     private CompletableFuture<Void> active = CompletableFuture.completedFuture(null);
     private boolean draining;
 
@@ -75,6 +76,7 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
 
     synchronized void forget(NereusKafkaOwnedProviderRuntime.Opened owner) {
         owners.remove(owner);
+        retirements.remove(owner);
     }
 
     private synchronized void tick() {
@@ -94,12 +96,56 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
         if (!owner.asyncMaterializationReady()) return CompletableFuture.completedFuture(null);
         provider.reconcileOriginalReads();
         if (job != null) return finish(owner, job);
+        if (advanceRetirement(owner)) return CompletableFuture.completedFuture(null);
         return candidate(owner).map(candidate -> owner.captureM5Inputs(candidate.readBudget(), candidate.bounds(),
                 candidate.cell(), candidate.allowance(), control).thenCompose(captured -> {
                     var original = new Job(captured);
                     remember(owner, original);
                     return finish(owner, original);
                 })).orElseGet(() -> CompletableFuture.completedFuture(null));
+    }
+
+    private boolean advanceRetirement(NereusKafkaOwnedProviderRuntime.Opened owner) {
+        var policy = config.bookKeeper().orElseThrow().ledgerGc();
+        if (!policy.enabled() || policy.dryRun()) return false;
+        var route = owner.nativeM5BindingRoute();
+        var selector = route.readSelector().orElseThrow();
+        var timeout = config.lifecycle().recoveryTimeout();
+        var current = retirement(owner, selector);
+        if (current == null && selector.mode() == SelectorMode.PREFERRED_WITH_FALLBACK) {
+            try {
+                if (!owner.nativeM5GcAdmissionOpen().toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS)) return false;
+                var raw = owner.storage().nativeReadSources();
+                var selected = NereusKafkaObjectRecovery.recover(route, raw.activeRoot().partitionId(), selector, provider, timeout);
+                if (selected.isEmpty()) return false;
+                var prefix = selected.orElseThrow().prefix();
+                if (!prefix.rawFallbackEquivalent() || prefix.originalFallbackSources().stream().anyMatch(source ->
+                        source.firstFallbackCapableReadAdmissionEpoch() != selector.readAdmissionEpoch())) return false;
+                current = new NereusKafkaObjectRetirement(selector, selected.orElseThrow());
+                if (!rememberRetirement(owner, current)) return false;
+            } catch (Exception failure) {
+                throw new java.util.concurrent.CompletionException(failure);
+            }
+        }
+        if (current == null) return false;
+        current.advance(owner, selector, provider, config.retentionCompaction().materializationSourceRetirementGrace(), timeout, control);
+        return true;
+    }
+
+    private synchronized NereusKafkaObjectRetirement retirement(NereusKafkaOwnedProviderRuntime.Opened owner,
+            com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector selector) {
+        var current = retirements.get(owner);
+        if (current != null && !current.sameSelection(selector)) {
+            retirements.remove(owner);
+            return null;
+        }
+        return current;
+    }
+
+    private synchronized boolean rememberRetirement(NereusKafkaOwnedProviderRuntime.Opened owner, NereusKafkaObjectRetirement retirement) {
+        if (!owners.containsKey(owner) || draining) return false;
+        retirements.put(owner, retirement);
+        return true;
     }
 
     private CompletionStage<Void> finish(NereusKafkaOwnedProviderRuntime.Opened owner, Job job) {
@@ -150,6 +196,12 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
         }
         long timeout = config.rollout().shutdownDrainTimeout().toMillis();
         accepted.get(timeout, TimeUnit.MILLISECONDS);
+        final CompletableFuture<?>[] retiring;
+        synchronized (this) {
+            retiring = retirements.values().stream().map(value -> value.drain().toCompletableFuture())
+                    .toArray(CompletableFuture[]::new);
+        }
+        CompletableFuture.allOf(retiring).get(timeout, TimeUnit.MILLISECONDS);
         control.shutdown();
         if (!control.awaitTermination(timeout, TimeUnit.MILLISECONDS)) {
             throw new IllegalStateException("native Kafka Object materialization executor did not drain");

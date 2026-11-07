@@ -1655,6 +1655,9 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
     @Override
     public void close() throws Exception {
         fence();
+        // Accepted Object retirement can still close a source-scan client on openings after provider drain.
+        drainObjectReads();
+        if (objectMaterializer != null) objectMaterializer.close();
         openings.shutdown();
         if (!openings.awaitTermination(
                 context.config()
@@ -1665,7 +1668,6 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                 TimeUnit.MILLISECONDS)) {
             throw new IllegalStateException("native BK recovery operations have not drained");
         }
-        drainObjectReads();
         Exception failure = null;
         for (var item : List.copyOf(owned))
             try {
@@ -1693,7 +1695,6 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
 
     private void closeObjectProvider() throws Exception {
         if (asyncObject != null && !asyncObjectReleased) {
-            if (objectMaterializer != null) objectMaterializer.close();
             asyncObject.close();
             asyncObjectReleased = true;
         }
