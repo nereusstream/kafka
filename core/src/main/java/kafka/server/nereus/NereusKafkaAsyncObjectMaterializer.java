@@ -26,6 +26,7 @@ import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.AdmissionState;
+import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.SelectorMode;
 
 import org.slf4j.Logger;
@@ -113,39 +114,44 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
         var timeout = config.lifecycle().recoveryTimeout();
         var current = retirement(owner, selector);
         if (current == null && selector.admissionState() == AdmissionState.ADMITTING) {
-            try {
-                var raw = owner.storage().nativeReadSources();
-                if (selector.selectedViewSha256().equals(raw.selectedViewSha256())
-                        || !owner.nativeM5GcAdmissionOpen().toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS)) return false;
-                var selected = NereusKafkaObjectRecovery.recover(route, raw.activeRoot().partitionId(), selector, provider, timeout);
-                if (selected.isEmpty()) return false;
-                var original = selected.orElseThrow();
-                var prefix = original.prefix();
-                if (!prefix.rawFallbackEquivalent()) return false;
-                if (selector.mode() == SelectorMode.PREFERRED_ONLY) {
-                    var scope = NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata
-                            .recoverObjectScope(owner, Optional.of(selector), selected, true, timeout);
-                    if (scope.isEmpty()) return false;
-                    current = NereusKafkaObjectRetirement.resumePersisted(selector, scope.orElseThrow());
-                } else if (selector.mode() == SelectorMode.PREFERRED_WITH_FALLBACK
-                        && prefix.originalFallbackSources().stream().allMatch(source ->
-                                source.firstFallbackCapableReadAdmissionEpoch() == selector.readAdmissionEpoch())) {
-                    current = new NereusKafkaObjectRetirement(selector, original);
-                } else {
-                    return false;
-                }
-                if (!rememberRetirement(owner, current)) return false;
-            } catch (Exception failure) {
-                throw new java.util.concurrent.CompletionException(failure);
-            }
+            current = prepareRetirement(owner, selector, timeout);
+            if (current != null && !rememberRetirement(owner, current)) return false;
         }
         if (current == null) return false;
         current.advance(owner, selector, provider, config.retentionCompaction().materializationSourceRetirementGrace(), timeout, control);
         return true;
     }
 
+    private NereusKafkaObjectRetirement prepareRetirement(NereusKafkaOwnedProviderRuntime.Opened owner,
+            BindingReadSelector selector, Duration timeout) {
+        try {
+            var raw = owner.storage().nativeReadSources();
+            if (selector.selectedViewSha256().equals(raw.selectedViewSha256())
+                    || !owner.nativeM5GcAdmissionOpen().toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS)) return null;
+            var selected = NereusKafkaObjectRecovery.recover(owner.nativeM5BindingRoute(), raw.activeRoot().partitionId(),
+                    selector, provider, timeout);
+            if (selected.isEmpty()) return null;
+            var original = selected.orElseThrow();
+            var prefix = original.prefix();
+            if (!prefix.rawFallbackEquivalent()) return null;
+            if (selector.mode() == SelectorMode.PREFERRED_ONLY) {
+                return NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata
+                        .recoverObjectScope(owner, Optional.of(selector), selected, true, timeout)
+                        .map(scope -> NereusKafkaObjectRetirement.resumePersisted(selector, scope)).orElse(null);
+            }
+            if (selector.mode() == SelectorMode.PREFERRED_WITH_FALLBACK
+                    && prefix.originalFallbackSources().stream().allMatch(source ->
+                            source.firstFallbackCapableReadAdmissionEpoch() == selector.readAdmissionEpoch())) {
+                return new NereusKafkaObjectRetirement(selector, original);
+            }
+            return null;
+        } catch (Exception failure) {
+            throw new java.util.concurrent.CompletionException(failure);
+        }
+    }
+
     private synchronized NereusKafkaObjectRetirement retirement(NereusKafkaOwnedProviderRuntime.Opened owner,
-            com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector selector) {
+            BindingReadSelector selector) {
         var current = retirements.get(owner);
         if (current != null && !current.sameSelection(selector)) {
             retirements.remove(owner);
