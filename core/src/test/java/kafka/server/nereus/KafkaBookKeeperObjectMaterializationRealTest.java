@@ -116,14 +116,14 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"known", "cold", "hot", "automatic", "stale-registration", "retirement",
-        "background-retirement", "cold-retirement", "faults", "semantic"})
+        "background-retirement", "cold-retirement", "faults", "put-unknown", "semantic"})
     @Timeout(240)
     public void storesAndVerifiesTheRealNativeSealedPrefix(String outcome, @TempDir Path work) throws Exception {
         writeM6Capability(work);
         var nativeConfig = KafkaBookKeeperOwnerRelocationRealTest.nativeConfig(work,
                 System.getProperty("nereus.nsip.bkUri"), System.getProperty("nereus.nsip.oxia"));
         var fault = new PublicationFault(outcome);
-        withObjectFixture(work, nativeConfig, fault.readFaults, fixture -> runColdCluster(work, fixture, fault));
+        withObjectFixture(work, nativeConfig, fault.readFaults || fault.unknownPut, fixture -> runColdCluster(work, fixture, fault));
     }
 
     private static void runColdCluster(Path work, Fixture fixture, PublicationFault fault) throws Exception {
@@ -282,6 +282,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean backgroundRetirement;
         private final boolean coldRetirement;
         private final boolean readFaults;
+        private final boolean unknownPut;
         private final boolean semantic;
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
         private final CompletableFuture<M5PendingOutputInventoryV2> pendingApplied = new CompletableFuture<>();
@@ -300,6 +301,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             automatic = outcome.equals("automatic") || backgroundRetirement || staleRegistration;
             retireFallback = outcome.equals("retirement");
             readFaults = outcome.equals("faults");
+            unknownPut = outcome.equals("put-unknown");
             semantic = outcome.equals("semantic");
         }
 
@@ -645,6 +647,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     record Fixture(Map<String, Object> settings, NereusKafkaObjectProvider provider,
             M5CellProviderProfileV2 profile, String bucket, Runnable verifyNoOutputs,
             Consumer<M5PendingOutputInventoryV2> verifyNoOriginalOutputs, Consumer<GenerationObject> removeVersion,
+            Consumer<GenerationObject> verifyOnlyVersion,
             KafkaConfig config, AsyncOxiaClient control, OxiaPhysicalMetadataNamespaceV2 namespace) { }
 
     @FunctionalInterface
@@ -710,8 +713,15 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 Consumer<GenerationObject> removeVersion = object -> minio.deleteObject(request -> request.bucket(bucket)
                         .key(object.identity().key()).versionId(new String(object.immutableProviderVersionToken()
                                 .orElseThrow().toByteArray(), StandardCharsets.UTF_8)));
+                Consumer<GenerationObject> verifyOnlyVersion = object -> {
+                    var key = object.identity().key();
+                    var versions = minio.listObjectVersions(request -> request.bucket(bucket).prefix(key))
+                            .versions().stream().filter(version -> version.key().equals(key)).map(version -> version.versionId()).toList();
+                    assertEquals(List.of(new String(object.immutableProviderVersionToken().orElseThrow().toByteArray(), StandardCharsets.UTF_8)),
+                            versions, "a retried conditional PUT created another immutable version");
+                };
                 action.run(new Fixture(Map.copyOf(inputs), provider, profile, bucket, verifyNoOutputs, verifyNoOriginalOutputs,
-                        removeVersion, objectConfig, control, namespace));
+                        removeVersion, verifyOnlyVersion, objectConfig, control, namespace));
             }
         }
     }
@@ -738,8 +748,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         assertEquals(registered.worker().worker(), resumed.worker().worker());
         assertEquals(registered.pending(), resumed.pending());
         verifyExhaustion(opened, captured, registered, provider, fixture.verifyNoOutputs());
-        var verified = captured.storeObjectMaterialization(registered, provider, Duration.ofSeconds(10))
-                .toCompletableFuture().get(30, TimeUnit.SECONDS);
+        var verified = probe.fault().unknownPut
+                ? LostPut.store(captured, registered, fixture)
+                : captured.storeObjectMaterialization(registered, provider, Duration.ofSeconds(10))
+                        .toCompletableFuture().get(30, TimeUnit.SECONDS);
         assertEquals(probe.fault().semantic ? PayloadKind.KAFKA_SEMANTIC_COMPACTED_V1 : PayloadKind.KAFKA_BATCH_PRESERVING_V1,
                 verified.generation().generation().payloadKind());
         assertEquals(probe.fault().semantic ? 1 : captured.extents().size(), verified.generation().generation().payloadObjects().size());
@@ -763,6 +775,37 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         if (!probe.fault().semantic) verifyPrefixRead(captured, prepared, verified, provider);
         assertEquals(captured.predecessorSelector(), opened.nativeM5BindingRoute().readSelector().orElseThrow());
         publishAndRead(opened, captured, verified, fixture, client, produced, probe, cold);
+    }
+
+    private static final class LostPut {
+        static NereusKafkaObjectMaterialization.Verified store(NereusKafkaNativeInputV2.Captured input,
+                NereusKafkaObjectMaterialization.Registered original, Fixture fixture) throws Exception {
+            var slot = original.pending().outputs().get(0);
+            var quota = fixture.provider().physicalQuota().quota();
+            var scope = quota.snapshot().toCompletableFuture().get(30, TimeUnit.SECONDS).head().scope();
+            var birthKey = M5ObjectBirthCreditV3.key(scope, original.worker().worker(), slot);
+            try (var relay = KafkaObjectFaultRelay.lostPut(fixture.bucket(), slot.objectKey())) {
+                relay.arm("put-response-lost");
+                var storing = input.storeObjectMaterialization(original, fixture.provider(), Duration.ofSeconds(10)).toCompletableFuture();
+                var appliedVersion = relay.awaitAppliedPut();
+                var armed = quota.readBirth(birthKey).toCompletableFuture().get(30, TimeUnit.SECONDS).orElseThrow();
+                assertEquals(M5ObjectBirthCreditV3.State.WRITE_ARMED, armed.state());
+                assertTrue(armed.resource().isEmpty(), "the held original PUT was assigned without exact proof");
+                assertFalse(storing.isDone(), "the Task settled while the original PUT response was still held");
+                relay.losePutResponses();
+                var verified = storing.get(30, TimeUnit.SECONDS);
+                var output = verified.generation().generation().payloadObjects().stream()
+                        .filter(object -> object.identity().key().equals(slot.objectKey())).findFirst().orElseThrow();
+                var token = new String(output.immutableProviderVersionToken().orElseThrow().toByteArray(), StandardCharsets.UTF_8);
+                assertEquals(appliedVersion, token);
+                fixture.verifyOnlyVersion().accept(output);
+                var assigned = quota.readBirth(birthKey).toCompletableFuture().get(30, TimeUnit.SECONDS).orElseThrow();
+                assertEquals(M5ObjectBirthCreditV3.State.ASSIGNED, assigned.state());
+                assertEquals(output.immutableProviderVersionToken().orElseThrow(),
+                        assigned.resource().orElseThrow().immutableIdentity().bytes());
+                return verified;
+            }
+        }
     }
 
     private static void verifyAutomatic(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture,

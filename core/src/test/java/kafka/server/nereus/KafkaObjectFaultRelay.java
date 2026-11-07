@@ -26,6 +26,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -50,6 +51,10 @@ final class KafkaObjectFaultRelay implements AutoCloseable {
         return new KafkaObjectFaultRelay(bucket, "", "*");
     }
 
+    static KafkaObjectFaultRelay lostPut(String bucket, String key) {
+        return new KafkaObjectFaultRelay(bucket, key, "*");
+    }
+
     void arm(String mode) throws Exception {
         byte[] body = Json.encodeAsBytes(Map.of("path", path, "version", version, "mode", mode));
         send(request().POST(HttpRequest.BodyPublishers.ofByteArray(body)).build());
@@ -61,6 +66,21 @@ final class KafkaObjectFaultRelay implements AutoCloseable {
             var state = Json.parseBytesAs(response, Map.class);
             return ((Number) state.get("hits")).intValue() > 0;
         }, 30_000, "the exact Object version was not requested through the fault relay");
+    }
+
+    String awaitAppliedPut() throws Exception {
+        var originalVersion = new AtomicReference<String>();
+        TestUtils.waitForCondition(() -> {
+            var state = Json.parseBytesAs(send(request().GET().build()), Map.class);
+            if (!(state.get("appliedVersion") instanceof String version) || version.isEmpty()) return false;
+            originalVersion.set(version);
+            return true;
+        }, 30_000, "MinIO did not accept the exact PUT before its response was lost");
+        return originalVersion.get();
+    }
+
+    void losePutResponses() throws Exception {
+        send(request().method("PATCH", HttpRequest.BodyPublishers.noBody()).build());
     }
 
     private HttpRequest.Builder request() {
