@@ -132,14 +132,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                     return new NereusBrokerStorageRuntime(context, new NereusKafkaOwnedProviderRuntime(
                             context, observer(ready, heldFetch, ready == first ? fault : new PublicationFault("known"))));
                 });
-        KafkaBookKeeperM5PolicyRealScenario.configure(builder, work, fixture.settings(), true,
-                fault.retireFallback || fault.backgroundRetirement ? "OBJECT_GC_ENABLED" : "OBJECT_BYTES_DISABLED");
-        builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.bytes.per.ledger", "1048576");
-        builder.setConfigProp("message.max.bytes", "4096");
-        if (fault.automatic) builder.setConfigProp("nereus.kafka.storage.retention.check.interval.ms", "1000");
-        if (fault.backgroundRetirement) {
-            builder.setConfigProp("nereus.kafka.storage.materialization.source.retirement.grace.ms", "5000");
-        }
+        configureMaterialization(builder, work, fixture, fault);
         try (var cluster = builder.build()) {
             cluster.format();
             cluster.startup();
@@ -152,13 +145,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 topicId = admin.createTopics(List.of(topic)).topicId(TOPIC).get(30, TimeUnit.SECONDS);
             }
             var opened = first.get(30, TimeUnit.SECONDS);
-            int produced = fault.semantic ? KafkaObjectCompactionRealScenario.seed(cluster, client) : 0;
-            while ((sealedRuns(opened) < 2 || fault.semantic && opened.storage().nativeReadSources().activeRoot().kafkaStartOffset()
-                    < KafkaObjectCompactionRealScenario.SEALED_TRANSACTION_END) && produced < 32) {
-                KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + produced, produced);
-                produced++;
-            }
-            assertTrue(sealedRuns(opened) >= 2, "native Produce did not seal two real BK sources");
+            int produced = seedSealedSources(cluster, opened, client, fault.semantic);
             assertAppendWhileFetchHeld(cluster, client, topicId, heldFetch, produced);
             produced++;
             ColdTakeover takeover = () -> relocate(cluster, client, cold);
@@ -170,6 +157,31 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             cluster.fatalFaultHandler().maybeRethrowFirstException();
             cluster.nonFatalFaultHandler().maybeRethrowFirstException();
         }
+    }
+
+    private static void configureMaterialization(KafkaClusterTestKit.Builder builder, Path work, Fixture fixture,
+            PublicationFault fault) throws Exception {
+        KafkaBookKeeperM5PolicyRealScenario.configure(builder, work, fixture.settings(), true,
+                fault.retireFallback || fault.backgroundRetirement ? "OBJECT_GC_ENABLED" : "OBJECT_BYTES_DISABLED");
+        builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.bytes.per.ledger", "1048576");
+        builder.setConfigProp("message.max.bytes", "4096");
+        if (fault.automatic) builder.setConfigProp("nereus.kafka.storage.retention.check.interval.ms", "1000");
+        if (fault.backgroundRetirement) {
+            builder.setConfigProp("nereus.kafka.storage.materialization.source.retirement.grace.ms", "5000");
+        }
+    }
+
+    private static int seedSealedSources(KafkaClusterTestKit cluster, NereusKafkaOwnedProviderRuntime.Opened owner,
+            Properties client, boolean semantic) throws Exception {
+        int produced = semantic ? KafkaObjectCompactionRealScenario.seed(cluster, client) : 0;
+        int required = semantic ? KafkaObjectCompactionRealScenario.SEALED_TRANSACTION_END : 0;
+        while ((sealedRuns(owner) < 2 || owner.storage().nativeReadSources().activeRoot().kafkaStartOffset() < required)
+                && produced < 32) {
+            KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + produced, produced);
+            produced++;
+        }
+        assertTrue(sealedRuns(owner) >= 2, "native Produce did not seal two real BK sources");
+        return produced;
     }
 
     private static NewTopic nativeTopic(boolean semantic) {
@@ -460,6 +472,15 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             }
         }
 
+        private boolean scheduledDeletionSettled(NereusKafkaOwnedProviderRuntime.Opened owner) {
+            try {
+                verifyReleasedSources(owner, false);
+                return true;
+            } catch (Exception failure) {
+                throw new java.util.concurrent.CompletionException(failure);
+            }
+        }
+
         private void beginColdRecoveryObservation() {
             releasedLedgerReads.set(0);
             retainedCheckpointReads.set(0);
@@ -712,14 +733,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         long carrier = owner.storage().nativeReadSources().activeRoot().ledgerIdentity().ledgerId();
         int end = produceThroughRollover(owner, client, produced);
         fetch.observeRetainedCheckpoint(carrier, raw.stream().map(root -> root.ledgerIdentity().ledgerId()).toList());
-        TestUtils.waitForCondition(() -> {
-            try {
-                fetch.verifyReleasedSources(owner, false);
-                return true;
-            } catch (Exception failure) {
-                throw new java.util.concurrent.CompletionException(failure);
-            }
-        }, 45_000, "background retirement did not settle exact native BK deletion and quota");
+        TestUtils.waitForCondition(() -> fetch.scheduledDeletionSettled(owner),
+                45_000, "background retirement did not settle exact native BK deletion and quota");
         var selected = owner.nativeM5BindingRoute().readSelector().orElseThrow();
         assertEquals(original.selectedViewSha256(), selected.selectedViewSha256());
         var expected = IntStream.range(0, end).mapToObj(offset -> "input-" + offset).toList();
