@@ -86,6 +86,10 @@ public final class NereusTopicProfileResolverV1 {
             throw new InvalidConfigurationException(
                 "Unknown " + PROFILE_CONFIG + " value: " + value);
         }
+        if (!policy.admitsProfile(profile)) {
+            throw new InvalidConfigurationException(
+                PROFILE_CONFIG + " is not admitted by this Kafka deployment: " + profile);
+        }
         return new Resolution(profile, ProfileOriginV1.TOPIC_EXPLICIT);
     }
 

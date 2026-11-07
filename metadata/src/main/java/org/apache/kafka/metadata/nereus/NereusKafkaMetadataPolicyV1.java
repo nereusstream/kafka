@@ -27,6 +27,7 @@ import com.nereusstream.domain.identity.KafkaCellId;
 import com.nereusstream.domain.protocol.KafkaProtocolCellIdentity;
 
 import java.util.Objects;
+import java.util.Set;
 
 /** Immutable deployment policy input for the K1 metadata authority. */
 public final class NereusKafkaMetadataPolicyV1 {
@@ -35,6 +36,7 @@ public final class NereusKafkaMetadataPolicyV1 {
     private final KafkaProtocolCellIdentity cellIdentity;
     private final PolicyCatalogDigest policyCatalogDigest;
     private final StorageProfileV1 userTopicDefaultProfile;
+    private final Set<StorageProfileV1> admittedProfiles;
     private final int internalTopicPolicyVersion;
     private final boolean remoteLogStorageSystemEnabled;
 
@@ -43,6 +45,7 @@ public final class NereusKafkaMetadataPolicyV1 {
         Uuid kafkaCellId,
         byte[] policyCatalogDigest,
         StorageProfileV1 userTopicDefaultProfile,
+        Set<StorageProfileV1> admittedProfiles,
         int internalTopicPolicyVersion,
         boolean remoteLogStorageSystemEnabled
     ) {
@@ -57,6 +60,11 @@ public final class NereusKafkaMetadataPolicyV1 {
         this.policyCatalogDigest = new PolicyCatalogDigest(digest);
         this.userTopicDefaultProfile = Objects.requireNonNull(
             userTopicDefaultProfile, "user topic default profile");
+        this.admittedProfiles = Set.copyOf(admittedProfiles);
+        if (!this.admittedProfiles.contains(userTopicDefaultProfile)
+            || !this.admittedProfiles.contains(StorageProfileV1.BOOKKEEPER_WAL_ONLY)) {
+            throw new IllegalArgumentException("deployment must admit its default and Kafka internal topic profiles");
+        }
         if (internalTopicPolicyVersion != INTERNAL_TOPIC_POLICY_VERSION) {
             throw new IllegalArgumentException(
                 "unsupported internal topic policy version: " + internalTopicPolicyVersion);
@@ -75,6 +83,10 @@ public final class NereusKafkaMetadataPolicyV1 {
 
     public StorageProfileV1 userTopicDefaultProfile() {
         return userTopicDefaultProfile;
+    }
+
+    public boolean admitsProfile(StorageProfileV1 profile) {
+        return admittedProfiles.contains(profile);
     }
 
     public int internalTopicPolicyVersion() {

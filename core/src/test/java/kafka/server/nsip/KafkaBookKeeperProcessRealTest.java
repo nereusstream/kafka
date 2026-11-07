@@ -18,6 +18,7 @@
 package kafka.server.nsip;
 
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.CreateTopicsOptions;
 import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -112,7 +113,8 @@ public class KafkaBookKeeperProcessRealTest {
                 var formerLeader = controllers.get(quorum.leaderId());
                 formerLeader.stop();
                 awaitControllerFailover(admin, quorum.leaderId());
-                var failoverTopicId = admin.createTopics(List.of(new NewTopic(CONTROLLER_RESTART_TOPIC, Map.of(0, List.of(0)))))
+                var failoverTopicId = admin.createTopics(List.of(new NewTopic(CONTROLLER_RESTART_TOPIC, Map.of(0, List.of(0)))
+                                .configs(Map.of("nereus.storage.profile", "BOOKKEEPER_WAL_ONLY"))))
                         .topicId(CONTROLLER_RESTART_TOPIC).get(30, TimeUnit.SECONDS);
                 var failoverQuorum = admin.describeMetadataQuorum().quorumInfo().get(30, TimeUnit.SECONDS);
                 long failoverFloor = failoverQuorum.highWatermark();
@@ -138,6 +140,7 @@ public class KafkaBookKeeperProcessRealTest {
                         .configs(Map.of("min.insync.replicas", "2")), Errors.INVALID_CONFIG);
                 assertRejectedTopic(admin, new NewTopic("__share_group_state", Map.of(0, List.of(0))),
                         Errors.INVALID_CONFIG);
+                assertRejectsUnadmittedProfiles(admin);
                 admin.alterPartitionReassignments(Map.of(new TopicPartition(TOPIC, 0), assignment,
                                 new TopicPartition(CONTROLLER_RESTART_TOPIC, 0), assignment))
                         .all().get(30, TimeUnit.SECONDS);
@@ -217,6 +220,21 @@ public class KafkaBookKeeperProcessRealTest {
         var failure = assertThrows(ExecutionException.class,
                 () -> admin.createTopics(List.of(topic)).all().get(30, TimeUnit.SECONDS));
         assertEquals(expected, Errors.forException(failure.getCause()));
+    }
+
+    private static void assertRejectsUnadmittedProfiles(Admin admin) {
+        for (String profile : List.of("BOOKKEEPER_WAL_ASYNC_OBJECT", "OBJECT_WAL")) {
+            String name = "unadmitted-" + profile;
+            var topic = new NewTopic(name, Map.of(0, List.of(0)))
+                    .configs(Map.of("nereus.storage.profile", profile));
+            var invalid = assertThrows(ExecutionException.class,
+                    () -> admin.createTopics(List.of(topic), new CreateTopicsOptions().validateOnly(true))
+                            .all().get(30, TimeUnit.SECONDS));
+            assertEquals(Errors.INVALID_CONFIG, Errors.forException(invalid.getCause()));
+            assertRejectedTopic(admin, topic, Errors.INVALID_CONFIG);
+            var absent = assertThrows(ExecutionException.class, () -> topicId(admin, name));
+            assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, Errors.forException(absent.getCause()));
+        }
     }
 
     private static Properties client(int port) {

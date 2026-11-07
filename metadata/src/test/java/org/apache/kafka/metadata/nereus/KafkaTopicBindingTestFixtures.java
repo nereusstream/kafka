@@ -78,6 +78,7 @@ public final class KafkaTopicBindingTestFixtures {
             Sha256Digest.hash(CanonicalBytes.copyOf(
                 "policy-v1".getBytes(StandardCharsets.US_ASCII))).bytes().toByteArray(),
             StorageProfileV1.BOOKKEEPER_WAL_ONLY,
+            java.util.EnumSet.allOf(StorageProfileV1.class),
             NereusKafkaMetadataPolicyV1.INTERNAL_TOPIC_POLICY_VERSION,
             remoteLogStorageSystemEnabled);
     }

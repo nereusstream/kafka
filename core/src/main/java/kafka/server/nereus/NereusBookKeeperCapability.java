@@ -23,6 +23,7 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.metadata.TopicBindingAggregateRecord;
 import org.apache.kafka.server.config.NereusKafkaConfigs;
 
+import com.nereusstream.domain.aggregate.StorageProfileV1;
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.storage.api.bookkeeper.BookKeeperCapabilitySnapshotV1;
@@ -46,6 +47,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.Properties;
+import java.util.Set;
 
 /** Reads the deployment capability input and checks it against the actual loaded client and native policy. */
 final class NereusBookKeeperCapability {
@@ -97,8 +99,11 @@ final class NereusBookKeeperCapability {
     }
 
     static void validateAggregate(KafkaConfig config, TopicBindingAggregateRecord aggregate) throws Exception {
-        org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1.fromRecord(aggregate, (short) 0);
+        var binding = org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1.fromRecord(aggregate, (short) 0);
         var policy = metadataPolicy(config);
+        if (!policy.admitsProfile(binding.storageProfile())) {
+            throw new IllegalArgumentException("native BK activation profile is not admitted: " + binding.storageProfile());
+        }
         if (!Uuid.fromString(config.nereusKafkaStorageConfig()
                                 .bookKeeper()
                                 .orElseThrow()
@@ -137,7 +142,8 @@ final class NereusBookKeeperCapability {
                 Uuid.fromString(
                         config.nereusKafkaStorageConfig().core().cluster().orElseThrow()),
                 sha(props, "policyCatalogDigest").bytes().toByteArray(),
-                com.nereusstream.domain.aggregate.StorageProfileV1.BOOKKEEPER_WAL_ONLY,
+                StorageProfileV1.BOOKKEEPER_WAL_ONLY,
+                Set.of(StorageProfileV1.BOOKKEEPER_WAL_ONLY),
                 1,
                 false);
     }
