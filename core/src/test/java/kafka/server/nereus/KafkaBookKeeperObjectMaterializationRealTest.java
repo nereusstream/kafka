@@ -307,6 +307,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertEquals(M5MaterializationCodecV1.manifestSha256(verified.generation().manifestView()),
                     selector.selectedViewSha256());
             assertTrue(selector.fallbackSetSha256().isPresent());
+            var reopened = NereusKafkaObjectRecovery.recover(opened.nativeM5BindingRoute(), 0, selector,
+                    provider, Duration.ofSeconds(10)).orElseThrow();
+            assertEquals(selector.selectedViewSha256(), reopened.manifestSha256());
+            assertEquals(verified.protections(), reopened.originalFallbackSources());
             long before = sealedRuns(opened);
             int end = produced;
             while (sealedRuns(opened) == before && end < produced + 32) {
