@@ -17,6 +17,7 @@
 package kafka.server.nereus;
 
 import kafka.server.nereus.KafkaBookKeeperObjectMaterializationRealTest.Fixture;
+import kafka.server.nereus.KafkaBookKeeperObjectMaterializationRealTest.ScheduledLimits;
 import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
 import kafka.server.nsip.KafkaBookKeeperProcessRealTest;
 import kafka.server.nsip.KafkaBookKeeperProcessRealTest.NativeNode;
@@ -35,10 +36,7 @@ import org.apache.kafka.test.TestUtils;
 
 import com.nereusstream.domain.aggregate.ProfileOriginV1;
 import com.nereusstream.domain.aggregate.StorageProfileV1;
-import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionAdmissionV1;
-import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
-import com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector;
 
 import org.junit.jupiter.api.Test;
@@ -56,7 +54,6 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 
-import static kafka.server.nereus.KafkaBookKeeperNativeInputRealScenario.BOUNDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -144,15 +141,7 @@ public class KafkaAsyncObjectProcessRealTest {
 
     private static void admitMaterialization(OxiaKafkaBookKeeperM4ReadRouteV2 route, Fixture fixture) throws Exception {
         assertTrue(fixture.provider().physicalQuota().quota().expand(64L << 20).toCompletableFuture().get(30, TimeUnit.SECONDS));
-        var cell = fixture.profile().protocolCellSha256();
-        var materialization = new M5MaterializationAdmissionV1(route.materializationMetadata(cell), cell);
-        assertEquals(M5MaterializationAdmissionV1.Outcome.APPLIED_EXACT,
-                materialization.install(new M5MaterializationAdmissionV1.Caps(1, 4L << 20, 4L << 20, 32, 32, 16, 48)));
-        var limits = new Caps(BOUNDS.payloadBytes(), BOUNDS.batches(), BOUNDS.records(), BOUNDS.records(),
-                BOUNDS.decodedBytes(), BOUNDS.decodedBytes(), BOUNDS.decodedBytes(), BOUNDS.records(), BOUNDS.records());
-        var preparation = new KafkaCompactionAdmissionV1(route.compactionAdmissionMetadata(cell), cell);
-        assertEquals(KafkaCompactionAdmissionV1.Outcome.APPLIED_EXACT,
-                preparation.install(KafkaBookKeeperSelectedInputRealScenario.caps(limits, 1)));
+        ScheduledLimits.install(route, fixture.profile().protocolCellSha256());
     }
 
     private static BindingReadSelector awaitSelection(OxiaKafkaBookKeeperM4ReadRouteV2 route) throws Exception {

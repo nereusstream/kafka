@@ -37,11 +37,13 @@ import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.test.TestUtils;
 
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
+import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionAdmissionV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
 import com.nereusstream.kafka.bookkeeper.recovery.KafkaBookKeeperClosedHistoryRecoveryV1.ReadPhase;
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaQuotaTargetDeleteStoreV2;
 import com.nereusstream.storage.api.bookkeeper.RunLedgerHandleV1;
 import com.nereusstream.storage.api.kafka.KafkaRunRootRecordV2;
@@ -749,15 +751,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         var provider = fixture.provider();
         assertTrue(provider.physicalQuota().quota().expand(64L << 20).toCompletableFuture().get(30, TimeUnit.SECONDS));
         var cell = fixture.profile().protocolCellSha256();
-        var metadata = owner.nativeM5BindingRoute().materializationMetadata(cell);
-        var admission = new M5MaterializationAdmissionV1(metadata, cell);
-        assertEquals(M5MaterializationAdmissionV1.Outcome.APPLIED_EXACT,
-                admission.install(new M5MaterializationAdmissionV1.Caps(1, 4L << 20, 4L << 20, 32, 32, 16, 48)));
-        var limits = new Caps(BOUNDS.payloadBytes(), BOUNDS.batches(), BOUNDS.records(), BOUNDS.records(),
-                BOUNDS.decodedBytes(), BOUNDS.decodedBytes(), BOUNDS.decodedBytes(), BOUNDS.records(), BOUNDS.records());
-        var preparation = owner.nativeM5CompactionAdmission();
-        assertEquals(com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionAdmissionV1.Outcome.APPLIED_EXACT,
-                preparation.install(KafkaBookKeeperSelectedInputRealScenario.caps(limits, 1)));
+        var limits = ScheduledLimits.install(owner.nativeM5BindingRoute(), cell);
         var original = fault.pendingApplied.get(30, TimeUnit.SECONDS);
         try {
             fault.pendingReadDenied.get(30, TimeUnit.SECONDS);
@@ -767,8 +761,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             fault.pendingBlocked = null;
         }
         TestUtils.waitForCondition(() -> owner.nativeM5BindingRoute().readSelector().orElseThrow().fallbackSetSha256().isPresent()
-                        && admission.read().orElseThrow().reservations().isEmpty()
-                        && preparation.read().orElseThrow().reservations().isEmpty(),
+                        && limits.settled(),
                 45_000, "native Broker background task did not select and settle its Object generation");
         var selector = owner.nativeM5BindingRoute().readSelector().orElseThrow();
         var selected = NereusKafkaObjectRecovery.recover(owner.nativeM5BindingRoute(), 0, selector, provider,
@@ -787,6 +780,24 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
         assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
         verifyColdSelector(selector, takeover.relocate(), client, expected, fetch);
+    }
+
+    record ScheduledLimits(M5MaterializationAdmissionV1 outputs, KafkaCompactionAdmissionV1 inputs) {
+        static ScheduledLimits install(OxiaKafkaBookKeeperM4ReadRouteV2 route, Sha256Digest cell) {
+            var outputs = new M5MaterializationAdmissionV1(route.materializationMetadata(cell), cell);
+            assertEquals(M5MaterializationAdmissionV1.Outcome.APPLIED_EXACT,
+                    outputs.install(new M5MaterializationAdmissionV1.Caps(1, 4L << 20, 4L << 20, 32, 32, 16, 48)));
+            var limits = new Caps(BOUNDS.payloadBytes(), BOUNDS.batches(), BOUNDS.records(), BOUNDS.records(),
+                    BOUNDS.decodedBytes(), BOUNDS.decodedBytes(), BOUNDS.decodedBytes(), BOUNDS.records(), BOUNDS.records());
+            var inputs = new KafkaCompactionAdmissionV1(route.compactionAdmissionMetadata(cell), cell);
+            assertEquals(KafkaCompactionAdmissionV1.Outcome.APPLIED_EXACT,
+                    inputs.install(KafkaBookKeeperSelectedInputRealScenario.caps(limits, 1)));
+            return new ScheduledLimits(outputs, inputs);
+        }
+
+        boolean settled() {
+            return outputs.read().orElseThrow().reservations().isEmpty() && inputs.read().orElseThrow().reservations().isEmpty();
+        }
     }
 
     private static void verifyScheduledRetirement(NereusKafkaOwnedProviderRuntime.Opened owner, BindingReadSelector original,
