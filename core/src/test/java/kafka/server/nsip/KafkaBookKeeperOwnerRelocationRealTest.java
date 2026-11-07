@@ -271,6 +271,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                                         .get(30, TimeUnit.SECONDS)
                                         .offset());
                         assertEquals(List.of("before"), consume(client, 1));
+                        assertEquals(List.of("before", "transaction"), consume(client, 2, "read_uncommitted"));
                         commitGroupOffset(client, 1);
                         int first = leader(admin);
                         assertEquals(0, first);
@@ -297,6 +298,12 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                                 .get();
                         var pendingLog = log(cluster, pending);
                         assertFalse(pendingLog.nereusWritable(pendingPartition.getLeaderEpoch()));
+                        var duringRecovery = (ProduceResponse) request(cluster, pending, lost, true);
+                        var recoveryError = Errors.forCode(duringRecovery.data()
+                                .responses().iterator().next().partitionResponses().get(0).errorCode());
+                        assertTrue(recoveryError == Errors.NOT_LEADER_OR_FOLLOWER
+                                        || recoveryError == Errors.KAFKA_STORAGE_ERROR,
+                                "Pending Owner returned " + recoveryError);
                         admin.alterPartitionReassignments(Map.of(
                                         new TopicPartition("native-cold", 0),
                                                 java.util.Optional.of(
@@ -320,13 +327,11 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                         delayedMetadata.resumeResponses();
                         awaitCondition(() -> !pendingPartition.isLeader(), "superseded recovery retained leadership");
                         assertFalse(pendingLog.nereusWritable(1));
-                        var retry = (ProduceResponse) request(cluster, second, lost, true);
-                        var retryPartition = retry.data()
-                                .responses()
-                                .iterator()
-                                .next()
-                                .partitionResponses()
-                                .get(0);
+                        var original = ((MemoryRecords) lost.data().topicData().iterator().next()
+                                .partitionData().get(0).records()).batches().iterator().next();
+                        var retryRequest = produce(original.producerId(), original.producerEpoch(), "different-payload");
+                        var retry = (ProduceResponse) request(cluster, second, retryRequest, true);
+                        var retryPartition = retry.data().responses().iterator().next().partitionResponses().get(0);
                         assertEquals(Errors.NONE.code(), retryPartition.errorCode());
                         assertEquals(2, retryPartition.baseOffset());
                         assertEquals(3, log(cluster, second).logEndOffset());
@@ -473,6 +478,12 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                     expected.add("after-checkpoint");
                     assertEquals(expected, consume(client, 41));
                     assertEquals(40, readGroupOffset(client));
+                    var uncommitted = new java.util.ArrayList<>(expected.subList(0, 40));
+                    for (int offset = 41; offset < 55; offset++) {
+                        uncommitted.add("aborted-" + offset);
+                    }
+                    uncommitted.add("after-checkpoint");
+                    assertEquals(uncommitted, consume(client, uncommitted.size(), "read_uncommitted"));
                 }
                 cluster.fatalFaultHandler().maybeRethrowFirstException();
                 cluster.nonFatalFaultHandler().maybeRethrowFirstException();
@@ -631,13 +642,19 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                         .build((short) 4),
                 true);
         assertEquals(Errors.NONE.code(), initialized.data().errorCode());
+        var request = produce(initialized.data().producerId(), initialized.data().producerEpoch(), "lost-response");
+        request(cluster, broker, request, false);
+        return request;
+    }
+
+    private static ProduceRequest produce(long producerId, short producerEpoch, String value) {
         var raw = MemoryRecords.withIdempotentRecords(
                 Compression.NONE,
-                initialized.data().producerId(),
-                initialized.data().producerEpoch(),
+                producerId,
+                producerEpoch,
                 0,
                 new SimpleRecord(
-                        "key".getBytes(StandardCharsets.UTF_8), "lost-response".getBytes(StandardCharsets.UTF_8)));
+                        "key".getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8)));
         var topic = new ProduceRequestData.TopicProduceData()
                 .setName("native-cold")
                 .setPartitionData(List.of(new ProduceRequestData.PartitionProduceData()
@@ -645,10 +662,8 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                         .setRecords(raw)));
         var topics = new ProduceRequestData.TopicProduceDataCollection();
         topics.add(topic);
-        var request = new ProduceRequest(
+        return new ProduceRequest(
                 new ProduceRequestData().setAcks((short) -1).setTimeoutMs(10000).setTopicData(topics), (short) 9);
-        request(cluster, broker, request, false);
-        return request;
     }
 
     private static AbstractResponse request(
@@ -817,11 +832,15 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
     }
 
     public static List<String> consume(Properties client, int count) {
+        return consume(client, count, "read_committed");
+    }
+
+    private static List<String> consume(Properties client, int count, String isolation) {
         Properties config = new Properties();
         config.putAll(client);
         config.put("key.deserializer", StringDeserializer.class.getName());
         config.put("value.deserializer", StringDeserializer.class.getName());
-        config.put("isolation.level", "read_committed");
+        config.put("isolation.level", isolation);
         config.put("enable.auto.commit", "false");
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(config)) {
             consumer.assign(List.of(new TopicPartition("native-cold", 0)));

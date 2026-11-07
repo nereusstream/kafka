@@ -24,6 +24,7 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.snapshot.SnapshotPath;
 import org.apache.kafka.snapshot.Snapshots;
@@ -43,9 +44,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -81,6 +84,11 @@ public class KafkaBookKeeperProcessRealTest {
                 Uuid topicId = admin.createTopics(List.of(new NewTopic(TOPIC, Map.of(0, List.of(0)))))
                         .topicId(TOPIC).get(30, TimeUnit.SECONDS);
                 assertEquals(0, append(initialClient, "before-process-restart"));
+                var leaderAck = new Properties();
+                leaderAck.putAll(initialClient);
+                leaderAck.setProperty("enable.idempotence", "false");
+                leaderAck.setProperty("acks", "1");
+                assertEquals(1, append(leaderAck, "leader-ack"));
                 long floor = admin.describeMetadataQuorum().quorumInfo().get(30, TimeUnit.SECONDS).highWatermark();
                 assertTrue(floor > 0);
                 TestUtils.waitForCondition(() -> controller.hasSnapshotAtOrAfter(floor),
@@ -98,6 +106,12 @@ public class KafkaBookKeeperProcessRealTest {
                 TestUtils.waitForCondition(() -> next.hasSnapshotAtOrAfter(floor),
                         "Cold Broker did not install a KRaft snapshot from the Controller");
                 var assignment = Optional.of(new NewPartitionReassignment(List.of(1)));
+                assertRejectedTopic(admin, new NewTopic("rf-two", 1, (short) 2),
+                        Errors.INVALID_REPLICATION_FACTOR);
+                assertRejectedTopic(admin, new NewTopic("min-isr-two", Map.of(0, List.of(0)))
+                        .configs(Map.of("min.insync.replicas", "2")), Errors.INVALID_CONFIG);
+                assertRejectedTopic(admin, new NewTopic("__share_group_state", Map.of(0, List.of(0))),
+                        Errors.INVALID_CONFIG);
                 admin.alterPartitionReassignments(Map.of(new TopicPartition(TOPIC, 0), assignment,
                                 new TopicPartition(CONTROLLER_RESTART_TOPIC, 0), assignment))
                         .all().get(30, TimeUnit.SECONDS);
@@ -108,9 +122,9 @@ public class KafkaBookKeeperProcessRealTest {
                         "Controller restart topic did not leave the original Broker before controlled shutdown");
                 first.stop();
                 Properties relocated = client(ports[1]);
-                assertEquals(1, append(relocated, "after-cold-relocation"));
-                assertEquals(List.of("before-process-restart", "after-cold-relocation"),
-                        KafkaBookKeeperOwnerRelocationRealTest.consume(relocated, 2));
+                assertEquals(2, append(relocated, "after-cold-relocation"));
+                assertEquals(List.of("before-process-restart", "leader-ack", "after-cold-relocation"),
+                        KafkaBookKeeperOwnerRelocationRealTest.consume(relocated, 3));
                 try (Admin relocatedAdmin = Admin.create(relocated)) {
                     assertEquals(topicId, topicId(relocatedAdmin));
                 }
@@ -134,6 +148,12 @@ public class KafkaBookKeeperProcessRealTest {
 
     private static Uuid topicId(Admin admin) throws Exception {
         return admin.describeTopics(List.of(TOPIC)).allTopicNames().get(30, TimeUnit.SECONDS).get(TOPIC).topicId();
+    }
+
+    private static void assertRejectedTopic(Admin admin, NewTopic topic, Errors expected) {
+        var failure = assertThrows(ExecutionException.class,
+                () -> admin.createTopics(List.of(topic)).all().get(30, TimeUnit.SECONDS));
+        assertEquals(expected, Errors.forException(failure.getCause()));
     }
 
     private static Properties client(int port) {
