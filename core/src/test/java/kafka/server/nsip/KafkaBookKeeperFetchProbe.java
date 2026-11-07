@@ -95,11 +95,7 @@ final class KafkaBookKeeperFetchProbe {
             TopicPartition partition,
             KafkaProducer<String, String> producer,
             List<String> expected) throws Exception {
-        var fetch = FetchRequest.Builder.forConsumer(FETCH_VERSION, MAX_WAIT_MS, 1,
-                        Map.of(partition, new FetchRequest.PartitionData(
-                                topicId, 0, FetchRequest.INVALID_LOG_START_OFFSET, 1 << 20, Optional.empty())))
-                .isolationLevel(IsolationLevel.READ_COMMITTED)
-                .build(FETCH_VERSION);
+        var fetch = fetchRequest(topicId, partition, 0, MAX_WAIT_MS, 1);
         long start = System.nanoTime();
         try (var wire = new NativeKafkaRequest(cluster, broker, fetch)) {
             var initial = firstRead.get(5, TimeUnit.SECONDS);
@@ -137,5 +133,39 @@ final class KafkaBookKeeperFetchProbe {
             assertEquals(expected, actual);
             assertEquals(java.util.stream.LongStream.range(0, expected.size()).boxed().toList(), offsets);
         }
+    }
+
+    static void verifyAbortedWireResponse(
+            KafkaClusterTestKit cluster, int broker, Uuid topicId, TopicPartition partition,
+            long firstAbortedOffset, long markerOffset) throws Exception {
+        var fetch = fetchRequest(topicId, partition, firstAbortedOffset, 0, 0);
+        try (var wire = new NativeKafkaRequest(cluster, broker, fetch)) {
+            var response = (FetchResponse) wire.receive(30_000);
+            var result = response.responseData(Map.of(topicId, partition.topic()), FETCH_VERSION).get(partition);
+            assertEquals(Errors.NONE.code(), result.errorCode());
+            assertEquals(markerOffset + 1, result.highWatermark());
+            assertEquals(result.highWatermark(), result.lastStableOffset());
+            assertEquals(1, result.abortedTransactions().size());
+            var aborted = result.abortedTransactions().get(0);
+            assertEquals(firstAbortedOffset, aborted.firstOffset());
+            long nextOffset = firstAbortedOffset;
+            for (var batch : FetchResponse.recordsOrFail(result).batches()) {
+                assertEquals(nextOffset, batch.baseOffset());
+                assertEquals(aborted.producerId(), batch.producerId());
+                assertTrue(batch.isTransactional());
+                assertEquals(batch.baseOffset() == markerOffset, batch.isControlBatch());
+                nextOffset = batch.lastOffset() + 1;
+            }
+            assertEquals(markerOffset + 1, nextOffset);
+        }
+    }
+
+    private static FetchRequest fetchRequest(
+            Uuid topicId, TopicPartition partition, long offset, int maxWait, int minBytes) {
+        return FetchRequest.Builder.forConsumer(FETCH_VERSION, maxWait, minBytes,
+                        Map.of(partition, new FetchRequest.PartitionData(topicId, offset,
+                                FetchRequest.INVALID_LOG_START_OFFSET, 1 << 20, Optional.empty())))
+                .isolationLevel(IsolationLevel.READ_COMMITTED)
+                .build(FETCH_VERSION);
     }
 }

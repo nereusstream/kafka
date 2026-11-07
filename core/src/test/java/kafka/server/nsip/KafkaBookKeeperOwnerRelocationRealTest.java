@@ -438,6 +438,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                     assertEquals(40, log(cluster, 0).highWatermark());
                     assertEquals(0, log(cluster, 0).lastStableOffset());
                     TopicPartition topicPartition = new TopicPartition("native-cold", 0);
+                    KafkaBookKeeperEpochProbe.assertEndOffset(cluster, 0, topicPartition, 256, 255, 40);
                     producer.sendOffsetsToTransaction(Map.of(topicPartition, new OffsetAndMetadata(40)), group.groupMetadata());
                     storageFactory.fetchProbe().commitAndVerifyFetch(cluster, 0, topicId, topicPartition, producer, expected);
                     assertEquals(expected, consume(client, 40));
@@ -463,7 +464,12 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                     awaitCondition(
                             () -> log(cluster, next).highWatermark() == 55, "second cold Owner did not recover tail");
                     assertEquals(41, log(cluster, next).lastStableOffset());
+                    KafkaBookKeeperEpochProbe.assertEndOffset(cluster, next, topicPartition, 257, 255, 40);
+                    KafkaBookKeeperEpochProbe.assertEndOffset(cluster, next, topicPartition, 257, 256, 55);
+                    KafkaBookKeeperEpochProbe.assertFenced(cluster, next, topicPartition, 256);
                     producer.abortTransaction();
+                    awaitCondition(() -> log(cluster, next).lastStableOffset() == 56, "ABORT did not advance LSO");
+                    KafkaBookKeeperFetchProbe.verifyAbortedWireResponse(cluster, next, topicId, topicPartition, 41, 55);
                     producer.beginTransaction();
                     assertEquals(
                             56,
