@@ -240,7 +240,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         synchronized (guard) {
             var exact = requireStorage(epoch);
             var lengths = new ArrayList<Integer>();
-            boolean duplicate = true;
+            boolean duplicate = origin == AppendOrigin.CLIENT;
             for (var batch : records.batches()) {
                 batch.ensureValid();
                 if (batch.magic() != RecordBatch.MAGIC_VALUE_V2) {
@@ -248,8 +248,9 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                             "shared BK requires magic-v2");
                 }
                 lengths.add(config().maxMessageSize());
-                duplicate &= batch.hasProducerId()
+                duplicate = duplicate && batch.hasProducerId()
                         && !batch.isControlBatch()
+                        && batch.baseSequence() >= 0
                         && producers.activeProducers().containsKey(batch.producerId())
                         && exact.capture()
                                 .committedProducerState()

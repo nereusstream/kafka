@@ -418,7 +418,8 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                 properties.put("enable.idempotence", "true");
                 properties.put("acks", "all");
                 properties.put("transactional.id", "native-checkpoint-transaction");
-                try (KafkaProducer<String, String> producer = new KafkaProducer<>(properties)) {
+                try (KafkaProducer<String, String> producer = new KafkaProducer<>(properties);
+                        var group = new KafkaConsumer<String, String>(groupProperties(client))) {
                     producer.initTransactions();
                     producer.beginTransaction();
                     var expected = new java.util.ArrayList<String>();
@@ -440,9 +441,11 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                             "Owner epoch 257 did not activate from checkpoint and tail");
                     assertEquals(40, log(cluster, 0).highWatermark());
                     assertEquals(0, log(cluster, 0).lastStableOffset());
+                    TopicPartition topicPartition = new TopicPartition("native-cold", 0);
+                    producer.sendOffsetsToTransaction(Map.of(topicPartition, new OffsetAndMetadata(40)), group.groupMetadata());
                     producer.commitTransaction();
                     assertEquals(expected, consume(client, 40));
-                    commitGroupOffset(client, 40);
+                    assertEquals(40, readGroupOffset(client));
                     producer.beginTransaction();
                     for (int offset = 41; offset < 55; offset++) {
                         assertEquals(
@@ -453,6 +456,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                     }
                     assertEquals(55, log(cluster, 0).highWatermark());
                     assertEquals(41, log(cluster, 0).lastStableOffset());
+                    producer.sendOffsetsToTransaction(Map.of(topicPartition, new OffsetAndMetadata(55)), group.groupMetadata());
                     cluster.brokers().get(0).shutdown();
                     assertEquals(2, storageFactory.attempts());
                     assertEquals(1, storageFactory.completedNativeCloses());

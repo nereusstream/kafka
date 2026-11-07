@@ -32,6 +32,7 @@ import org.apache.kafka.metadata.properties.MetaPropertiesEnsemble.VerificationF
 import org.apache.kafka.metadata.properties.{MetaProperties, MetaPropertiesEnsemble}
 import org.apache.kafka.raft.QuorumConfig
 import org.apache.kafka.server.{ProcessRole, ServerSocketFactory}
+import org.apache.kafka.server.common.NereusStorageVersion
 import org.apache.kafka.server.config.ServerTopicConfigSynonyms
 import org.apache.kafka.storage.internals.log.{LogConfig, UnifiedLog}
 import org.slf4j.Logger
@@ -60,6 +61,13 @@ class KafkaRaftServer(
 
   private val (metaPropsEnsemble, bootstrapMetadata) =
     KafkaRaftServer.initializeLogDirs(config, this.logger.underlying, this.logIdent)
+
+  private val nereusBootstrapLevel = bootstrapMetadata.featureLevel(NereusStorageVersion.FEATURE_NAME)
+  private val expectedNereusBootstrapLevel = if (config.nereusKafkaStorageConfig.enabled())
+    NereusStorageVersion.NSV_2.featureLevel() else NereusStorageVersion.DISABLED_LEVEL
+  require(nereusBootstrapLevel == expectedNereusBootstrapLevel,
+    s"Expected persisted ${NereusStorageVersion.FEATURE_NAME}=$expectedNereusBootstrapLevel, " +
+      s"but the formatted metadata directory has level $nereusBootstrapLevel")
 
   private val metrics = Server.initializeMetrics(
     config,

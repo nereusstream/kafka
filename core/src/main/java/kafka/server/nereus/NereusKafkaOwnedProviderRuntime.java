@@ -22,6 +22,7 @@ import kafka.server.storage.BrokerStorageRuntimeContext;
 
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.errors.FencedLeaderEpochException;
+import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.common.metadata.TopicBindingAggregateRecord;
 
 import com.nereusstream.domain.bytes.CanonicalBytes;
@@ -416,7 +417,8 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                                 current,
                                 openings,
                                 unselectedFence(recoveryOwner, owner),
-                                recoveryOwner.historyReads(owner), selected));
+                                recoveryOwner.historyReads(owner), selected,
+                                Topic.GROUP_METADATA_TOPIC_NAME.equals(identity.topic())));
                         opened.requireRecoveredBirthSelection();
                         await(namespace.requireCurrent());
                         if (m4Admission.isPresent()) {
