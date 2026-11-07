@@ -21,6 +21,7 @@ import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMemberInventoryV2.Member;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaQuotaTargetDeleteStoreV2;
 import com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1;
 import com.nereusstream.storage.api.lifecycle.PhysicalResourceIdV2;
@@ -34,9 +35,12 @@ import com.nereusstream.storage.object.materialization.M5MaterializationAdmissio
 import com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PublicationOutcome;
+import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector;
+import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.SelectorMode;
 
 import java.nio.ByteBuffer;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -56,6 +60,9 @@ final class NereusKafkaObjectPublication {
 
     private record Attempt(PublicationOutcome outcome, Exception failure) { }
 
+    private record WriterTickets(M5TargetDeleteMultiWriterGuardV2 guard,
+            Map<PhysicalResourceIdV2, Context> contexts, Sha256Digest terminalRoot) { }
+
     static CompletionStage<Void> publish(NereusKafkaObjectMaterialization.Verified verified,
             NereusKafkaObjectProvider provider, KafkaBookKeeperPartitionV1 storage,
             OxiaQuotaTargetDeleteStoreV2 bookKeeper, Map<Sha256Digest, List<PhysicalResourceIdV2>> membership,
@@ -67,24 +74,85 @@ final class NereusKafkaObjectPublication {
         if (!prefix.originalFallbackSources().equals(verified.protections())) {
             throw new IllegalArgumentException("Kafka Object publication lost its exact original fallback set");
         }
-        var participants = participants(verified, provider, storage, bookKeeper, membership);
-        var root = publicationRoot(prefix, participants);
+        var raw = storage.nativeReadSources();
+        var sources = new ArrayList<PhysicalResourceIdV2>();
+        for (var extent : plan.sourceCut().sources()) {
+            var resources = membership.get(extent.sourceIdentitySha256());
+            if (resources == null || resources.size() != 1
+                    || !(resources.get(0) instanceof PhysicalResourceIdV2.BookKeeperLedger ledger)
+                    || !extent.ledgerIdentitySha256().equals(Optional.of(ledger.sha256()))) {
+                throw new IllegalStateException("Kafka Object publication has another original BK source membership");
+            }
+            sources.add(ledger);
+        }
+        var versions = verified.stored().credits().stream().map(credit -> credit.resource().orElseThrow()).toList();
+        var participants = participants(prefix, provider, raw, bookKeeper, sources, versions);
+        var tickets = tickets(prefix, participants, task.worker().worker().nativeWorkerIdentitySha256());
         var binding = plan.sourceCut().identity().binding();
-        var worker = task.worker().worker();
-        var routes = new ExactRoutes(participants.entrySet().stream().collect(Collectors.toUnmodifiableMap(
-                entry -> entry.getKey().authorityKey(), entry -> entry.getValue().route())));
-        var contexts = participants.entrySet().stream().collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
-                entry -> new Context(ProofBoundWriterClassV1.MANIFEST_SELECTOR_GENERATION_REPRESENTATION_V1,
-                        entry.getValue().capability(), worker.nativeWorkerIdentitySha256(), root)));
         var coordinator = new M5MaterializationCoordinatorV1(task.metadata(), task.partition(), binding);
-        var guard = new M5TargetDeleteMultiWriterGuardV2(new M5TargetDeleteAuthorityCoordinatorV1(routes));
-        var publication = guard.executeWithContexts(contexts, () -> CompletableFuture.supplyAsync(() ->
+        var publication = tickets.guard().executeWithContexts(tickets.contexts(), () -> CompletableFuture.supplyAsync(() ->
                 publishExact(verified, provider, storage, prefix, participants, coordinator,
-                        requireCurrent, providerReads, timeout, root), control));
+                        requireCurrent, providerReads, timeout, tickets.terminalRoot()), control));
         return publication.thenApplyAsync(result -> {
             finishPublication(task, profile.protocolCellSha256(), result);
             return null;
         }, control);
+    }
+
+    /** The closed former Owner and the exact selected manifest permit audit and ticket cleanup without another CAS. */
+    static void reconcileSelected(NereusKafkaObjectRecovery.Selected selected, BindingReadSelector selector,
+            NereusKafkaObjectProvider provider, KafkaBookKeeperPartitionV1.NativeReadSources raw,
+            OxiaQuotaTargetDeleteStoreV2 bookKeeper, PhysicalResourceIdV2.Namespace bookKeeperNamespace,
+            OxiaKafkaBookKeeperM4ReadRouteV2 binding, int partition, Duration timeout)
+            throws Exception {
+        var plan = selected.plan();
+        var taskId = plan.taskIdSha256();
+        var cell = plan.sourceCut().identity().protocolCellSha256();
+        var metadata = binding.materializationMetadata(cell);
+        var admission = new M5MaterializationAdmissionV1(metadata, cell);
+        if (admission.read().orElseThrow().reservations().stream()
+                .noneMatch(reservation -> reservation.taskIdSha256().equals(taskId))) return;
+        if (selector.mode() != SelectorMode.PREFERRED_WITH_FALLBACK) {
+            throw new IllegalStateException("Kafka Object publication still owns capacity after fallback retirement");
+        }
+        var prefix = selected.prefix();
+        var original = prefix.sourceCut().sources();
+        var cover = prefix.coverage();
+        var ledgers = raw.sealedRoots().stream().filter(root -> {
+            long end = root.kafkaEndOffsetExclusive().orElseThrow();
+            return root.kafkaStartOffset() < end && end > cover.inclusiveStart()
+                    && root.kafkaStartOffset() < cover.exclusiveEnd();
+        }).map(root -> new PhysicalResourceIdV2.BookKeeperLedger(bookKeeperNamespace, root.ledgerIdentity().ledgerId()))
+                .toList();
+        if (!ledgers.stream().map(PhysicalResourceIdV2.BookKeeperLedger::sha256).toList().equals(
+                original.stream().map(extent -> extent.ledgerIdentitySha256().orElseThrow()).toList())) {
+            throw new IllegalStateException("Kafka Object publication cannot reconcile another BK source set");
+        }
+        var participants = participants(prefix, provider, raw, bookKeeper, ledgers, selected.versions());
+        var tickets = tickets(prefix, participants, selected.inventory().worker().nativeWorkerIdentitySha256());
+        var coordinator = new M5MaterializationCoordinatorV1(metadata, partition, selector.binding());
+        var outcome = coordinator.finishSelectedTask(plan, selected.validated(), prefix.originalFallbackSources(), selector);
+        if (!exact(outcome)) {
+            throw new IllegalStateException("Kafka Object selected Task audit remains unresolved: " + outcome);
+        }
+        var unresolved = tickets.guard().reconcileTerminalWithContexts(tickets.contexts(), tickets.terminalRoot())
+                .toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        if (!unresolved.isEmpty()) {
+            throw new IllegalStateException("Kafka Object selected publication retains original physical tickets");
+        }
+        releaseAdmission(admission, taskId);
+    }
+
+    private static WriterTickets tickets(KafkaObjectMaterializedPrefixV1 prefix,
+            Map<PhysicalResourceIdV2, Participant> participants, Sha256Digest workerFence) {
+        var root = publicationRoot(prefix, participants);
+        var routes = new ExactRoutes(participants.entrySet().stream().collect(Collectors.toUnmodifiableMap(
+                entry -> entry.getKey().authorityKey(), entry -> entry.getValue().route())));
+        var contexts = participants.entrySet().stream().collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
+                entry -> new Context(ProofBoundWriterClassV1.MANIFEST_SELECTOR_GENERATION_REPRESENTATION_V1,
+                        entry.getValue().capability(), workerFence, root)));
+        var guard = new M5TargetDeleteMultiWriterGuardV2(new M5TargetDeleteAuthorityCoordinatorV1(routes));
+        return new WriterTickets(guard, contexts, root);
     }
 
     private static void finishPublication(NereusKafkaObjectMaterialization.Registered task,
@@ -95,8 +163,11 @@ final class NereusKafkaObjectPublication {
         if (!result.unresolvedTargets().isEmpty() || !exact(attempt.outcome())) {
             throw new IllegalStateException("Kafka Object publication or original ticket cleanup remains unresolved");
         }
-        var released = new M5MaterializationAdmissionV1(task.metadata(), cell)
-                .release(task.prepared().plan().taskIdSha256());
+        releaseAdmission(new M5MaterializationAdmissionV1(task.metadata(), cell), task.prepared().plan().taskIdSha256());
+    }
+
+    private static void releaseAdmission(M5MaterializationAdmissionV1 admission, Sha256Digest taskId) {
+        var released = admission.release(taskId);
         if (released != M5MaterializationAdmissionV1.Outcome.APPLIED_EXACT
                 && released != M5MaterializationAdmissionV1.Outcome.EXISTING_EXACT) {
             throw new IllegalStateException("Kafka Object publication retains its unresolved Cell reservation");
@@ -104,27 +175,21 @@ final class NereusKafkaObjectPublication {
     }
 
     private static Map<PhysicalResourceIdV2, Participant> participants(
-            NereusKafkaObjectMaterialization.Verified verified, NereusKafkaObjectProvider provider,
-            KafkaBookKeeperPartitionV1 storage, OxiaQuotaTargetDeleteStoreV2 bookKeeper,
-            Map<Sha256Digest, List<PhysicalResourceIdV2>> membership) {
+            KafkaObjectMaterializedPrefixV1 prefix, NereusKafkaObjectProvider provider,
+            KafkaBookKeeperPartitionV1.NativeReadSources raw, OxiaQuotaTargetDeleteStoreV2 bookKeeper,
+            List<? extends PhysicalResourceIdV2> sources, List<PhysicalResourceIdV2.ObjectVersion> versions) {
         var profile = provider.profile();
-        var cut = verified.stored().task().prepared().plan().sourceCut();
-        var raw = storage.nativeReadSources();
+        var cut = prefix.sourceCut();
         var bkMember = new Member(PositionDomain.KAFKA_OFFSET,
                 raw.activeRoot().providerScopeId().digest(), cut.identity().binding());
         var objectMember = new Member(PositionDomain.KAFKA_OFFSET, profile.scopeId().digest(), cut.identity().binding());
         var result = new TreeMap<PhysicalResourceIdV2, Participant>();
-        for (var extent : cut.sources()) {
-            var resources = membership.get(extent.sourceIdentitySha256());
-            if (resources == null || resources.size() != 1
-                    || !(resources.get(0) instanceof PhysicalResourceIdV2.BookKeeperLedger ledger)
-                    || !extent.ledgerIdentitySha256().equals(Optional.of(ledger.sha256()))
-                    || result.putIfAbsent(ledger, new Participant(bookKeeper, raw.configurationSha256(), bkMember)) != null) {
+        for (var ledger : sources) {
+            if (result.putIfAbsent(ledger, new Participant(bookKeeper, raw.configurationSha256(), bkMember)) != null) {
                 throw new IllegalStateException("Kafka Object publication has another original BK source membership");
             }
         }
-        for (var credit : verified.stored().credits()) {
-            var object = credit.resource().orElseThrow();
+        for (var object : versions) {
             if (!object.namespace().equals(profile.physicalBinding().physicalNamespace())
                     || result.putIfAbsent(object,
                             new Participant(provider.physicalQuota(), profile.providerConfigurationSha256(), objectMember)) != null) {

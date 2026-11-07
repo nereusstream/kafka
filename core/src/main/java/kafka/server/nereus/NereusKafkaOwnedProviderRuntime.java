@@ -48,7 +48,6 @@ import com.nereusstream.kafka.bookkeeper.pipeline.KafkaAppendCapacityBudgetV1;
 import com.nereusstream.kafka.bookkeeper.pipeline.KafkaAppendCapacityControllerV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionFenceV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionPublicationObserver;
-import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
 import com.nereusstream.kafka.bookkeeper.recovery.KafkaBookKeeperRunBirthRecoveryV1;
 import com.nereusstream.kafka.bookkeeper.run.KafkaBookKeeperNativeRootVerifierV2;
 import com.nereusstream.metadata.oxia.v2.retention.Oxia09ExactMetadataTransactionStoreV1;
@@ -435,7 +434,8 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                                 Topic.GROUP_METADATA_TOPIC_NAME.equals(identity.topic())));
                         opened.requireRecoveredBirthSelection();
                         await(namespace.requireCurrent());
-                        installRecoveredReadOwner(opened, predecessorSelector, selected, recoveredObject);
+                        installRecoveredReadOwner(opened, predecessorSelector, selected,
+                                reconcileRecoveredObject(opened, predecessorSelector, recoveredObject));
                         if (!current.getAsBoolean()) {
                             opened.storage.fence();
                             throw new FencedLeaderEpochException("native assignment changed after BK recovery");
@@ -1574,7 +1574,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
 
     private void installRecoveredReadOwner(Opened opened, Optional<BindingReadSelector> predecessorSelector,
             Optional<KafkaBookKeeperClosedHistoryRecoveryV1.SelectedPrefix> selected,
-            Optional<KafkaObjectMaterializedPrefixV1> recoveredObject) {
+            Optional<NereusKafkaObjectRecovery.Selected> recoveredObject) {
         var owner = opened.nativeOwner;
         var roots = opened.rootsAuthority;
         var m4 = opened.m4Route;
@@ -1587,13 +1587,13 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         }
         var admission = m4Admission.orElseThrow();
         var sources = opened.storage.nativeReadSources();
-        var preferredView = recoveredObject.map(KafkaObjectMaterializedPrefixV1::manifestSha256)
+        var preferredView = recoveredObject.map(recovered -> recovered.prefix().manifestSha256())
                 .or(() -> selected.map(prefix -> prefix.view().descriptor().descriptorSha256()))
                 .orElseGet(sources::selectedViewSha256);
-        recoveredObject.ifPresent(prefix -> {
+        recoveredObject.ifPresent(recovered -> {
             var predecessor = predecessorSelector.orElseThrow();
             var objectSources = new KafkaBookKeeperNativeObjectReadSourcesV1(
-                    sources, prefix, opened.source.spec().namespace(),
+                    sources, recovered.prefix(), opened.source.spec().namespace(),
                     predecessor.mode() == SelectorMode.PREFERRED_WITH_FALLBACK, asyncObject.fetchExecutor());
             opened.storage.prepareRecoveredObjectReadSources(objectSources, predecessor);
         });
@@ -1662,7 +1662,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         }
     }
 
-    private Optional<KafkaObjectMaterializedPrefixV1> recoverObjectView(TopicBindingAggregateRecord aggregate,
+    private Optional<NereusKafkaObjectRecovery.Selected> recoverObjectView(TopicBindingAggregateRecord aggregate,
             OxiaKafkaBookKeeperM4ReadRouteV2 binding, int partition, Optional<BindingReadSelector> selector)
             throws Exception {
         if (!NereusBookKeeperCapability.usesAsyncObject(aggregate)) return Optional.empty();
@@ -1670,6 +1670,21 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         if (selector.isEmpty()) return Optional.empty();
         return NereusKafkaObjectRecovery.recover(binding, partition, selector.orElseThrow(), asyncObject,
                 context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout());
+    }
+
+    private Optional<NereusKafkaObjectRecovery.Selected> reconcileRecoveredObject(Opened opened,
+            Optional<BindingReadSelector> predecessor, Optional<NereusKafkaObjectRecovery.Selected> recovered)
+            throws Exception {
+        if (recovered.isEmpty()) return Optional.empty();
+        var selected = recovered.orElseThrow();
+        var selector = predecessor.orElseThrow();
+        if (!opened.currentAssignment.getAsBoolean()) {
+            throw new FencedLeaderEpochException("Kafka Object recovery lost the actual native assignment");
+        }
+        NereusKafkaObjectPublication.reconcileSelected(selected, selector, asyncObject, opened.storage.nativeReadSources(),
+                route, opened.source.spec().namespace(), opened.m4Route, opened.nativeScope.partition(),
+                context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout());
+        return recovered;
     }
 
     private void closeM4ReadOwnerLoop() throws InterruptedException {

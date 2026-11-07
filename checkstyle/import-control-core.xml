@@ -206,6 +206,7 @@
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationPlan" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PayloadKind" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.TaskState" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1.ValidatedGeneration" />
         <allow class="com.nereusstream.storage.object.materialization.M5PendingOutputInventoryV2" />
@@ -241,6 +242,7 @@
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationCodecV1" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationKeysV1" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.GenerationObject" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationPlan" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializedGeneration" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.TaskState" />

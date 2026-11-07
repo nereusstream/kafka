@@ -28,6 +28,7 @@ import com.nereusstream.storage.object.gc.M5ObjectBirthCreditV3;
 import com.nereusstream.storage.object.materialization.M5MaterializationCodecV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationKeysV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.GenerationObject;
+import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationPlan;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializedGeneration;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.TaskState;
@@ -40,6 +41,8 @@ import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.Prote
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.SelectorMode;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
@@ -50,7 +53,10 @@ import java.util.stream.Stream;
 final class NereusKafkaObjectRecovery {
     private NereusKafkaObjectRecovery() { }
 
-    static Optional<KafkaObjectMaterializedPrefixV1> recover(OxiaKafkaBookKeeperM4ReadRouteV2 binding,
+    record Selected(KafkaObjectMaterializedPrefixV1 prefix, MaterializationPlan plan, ValidatedGeneration validated,
+            M5PendingOutputInventoryV2 inventory, List<PhysicalResourceIdV2.ObjectVersion> versions) { }
+
+    static Optional<Selected> recover(OxiaKafkaBookKeeperM4ReadRouteV2 binding,
             int partition, BindingReadSelector selector, NereusKafkaObjectProvider provider, Duration timeout)
             throws Exception {
         var profile = provider.profile();
@@ -66,8 +72,8 @@ final class NereusKafkaObjectRecovery {
         var plan = M5MaterializationCodecV1.decodePlan(read(metadata, keys.plan(generation.taskIdSha256())));
         var cut = M5MaterializationCodecV1.encodeSourceCut(plan.sourceCut());
         var inventory = M5PendingOutputInventoryV2.decode(read(metadata, keys.pendingOutputs(generation.taskIdSha256())));
-        var prefix = new KafkaObjectMaterializedPrefixV1(
-                plan, new ValidatedGeneration(validation, generation, manifest), provider::readForFetch);
+        var validated = new ValidatedGeneration(validation, generation, manifest);
+        var prefix = new KafkaObjectMaterializedPrefixV1(plan, validated, provider::readForFetch);
         inventory.requirePlan(plan);
         if (!prefix.manifestSha256().equals(selector.selectedViewSha256())
                 || prefix.sourceGeneration() > selector.sourceGeneration()
@@ -82,12 +88,12 @@ final class NereusKafkaObjectRecovery {
         }
         requireOriginalTask(metadata, keys, generation, prefix.manifestSha256());
         requireProtectedFallback(binding, selector, prefix, timeout);
-        requireOriginalObjects(provider, inventory, generation, timeout);
+        var versions = requireOriginalObjects(provider, inventory, generation, timeout);
         await(provider.requireCurrent(), timeout);
         if (!binding.readSelector().equals(Optional.of(selector))) {
             throw new IllegalStateException("Kafka Object selector changed during exact recovery");
         }
-        return Optional.of(prefix);
+        return Optional.of(new Selected(prefix, plan, validated, inventory, versions));
     }
 
     private static void requireOriginalTask(CanonicalControlMetadataStore metadata, M5MaterializationKeysV1 keys,
@@ -126,8 +132,8 @@ final class NereusKafkaObjectRecovery {
         }
     }
 
-    private static void requireOriginalObjects(NereusKafkaObjectProvider provider, M5PendingOutputInventoryV2 inventory,
-            MaterializedGeneration generation, Duration timeout) throws Exception {
+    private static List<PhysicalResourceIdV2.ObjectVersion> requireOriginalObjects(NereusKafkaObjectProvider provider,
+            M5PendingOutputInventoryV2 inventory, MaterializedGeneration generation, Duration timeout) throws Exception {
         var route = provider.physicalQuota();
         var scope = await(route.quota().snapshot(), timeout).head().scope();
         var profile = provider.profile();
@@ -137,6 +143,7 @@ final class NereusKafkaObjectRecovery {
             throw new IllegalStateException("Kafka Object recovery does not name all original outputs");
         }
         var member = new Member(PositionDomain.KAFKA_OFFSET, profile.scopeId().digest(), generation.identity().binding());
+        var versions = new ArrayList<PhysicalResourceIdV2.ObjectVersion>();
         for (var slot : inventory.outputs()) {
             var object = objects.get(slot.objectKey());
             if (object == null) throw new IllegalStateException("Kafka Object recovery has another output key");
@@ -152,7 +159,9 @@ final class NereusKafkaObjectRecovery {
             if (!membership.protocolCell().equals(profile.protocolCellSha256()) || !membership.members().contains(member)) {
                 throw new IllegalStateException("Kafka Object recovery lacks its exact physical member");
             }
+            versions.add(physical);
         }
+        return List.copyOf(versions);
     }
 
     private static PhysicalResourceIdV2.ObjectVersion versionOf(GenerationObject object,

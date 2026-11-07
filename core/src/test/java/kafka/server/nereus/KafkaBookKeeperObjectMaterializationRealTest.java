@@ -38,20 +38,29 @@ import org.apache.kafka.server.common.MetadataVersion;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
 import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
 import com.nereusstream.kafka.bookkeeper.recovery.KafkaBookKeeperClosedHistoryRecoveryV1.ReadPhase;
+import com.nereusstream.domain.bytes.CanonicalBytes;
+import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
 import com.nereusstream.storage.api.kafka.KafkaRunRootRecordV2;
 import com.nereusstream.storage.object.gc.M5ObjectBirthCreditV3;
+import com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityCoordinatorV1;
 import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
 import com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationCodecV1;
+import com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PayloadKind;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.GenerationObject;
+import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.TaskState;
+import com.nereusstream.storage.object.retention.M5BindingAuthorityCodecV1;
 import com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport;
 
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -68,11 +77,13 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.IntStream;
 
+import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.OxiaClientBuilder;
 
 import static kafka.server.nereus.KafkaBookKeeperNativeInputRealScenario.BOUNDS;
@@ -87,16 +98,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final String TOPIC = "native-cold";
 
-    @Test
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     @Timeout(240)
-    public void storesAndVerifiesTheRealNativeSealedPrefix(@TempDir Path work) throws Exception {
+    public void storesAndVerifiesTheRealNativeSealedPrefix(boolean lostResponse, @TempDir Path work) throws Exception {
         writeM6Capability(work);
         var nativeConfig = KafkaBookKeeperOwnerRelocationRealTest.nativeConfig(work,
                 System.getProperty("nereus.nsip.bkUri"), System.getProperty("nereus.nsip.oxia"));
-        withObjectFixture(work, nativeConfig, fixture -> runColdCluster(work, fixture));
+        withObjectFixture(work, nativeConfig, fixture -> runColdCluster(work, fixture, new PublicationFault(lostResponse)));
     }
 
-    private static void runColdCluster(Path work, Fixture fixture) throws Exception {
+    private static void runColdCluster(Path work, Fixture fixture, PublicationFault fault) throws Exception {
         var first = new CompletableFuture<NereusKafkaOwnedProviderRuntime.Opened>();
         var cold = new CompletableFuture<NereusKafkaOwnedProviderRuntime.Opened>();
         var heldFetch = new HeldFetch();
@@ -107,7 +119,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 .setControllerStorageRuntimeFactory(new NereusControllerStorageRuntimeFactory())
                 .setBrokerStorageRuntimeFactory(context -> {
                     var ready = context.config().brokerId() == 0 ? first : cold;
-                    return new NereusBrokerStorageRuntime(context, new NereusKafkaOwnedProviderRuntime(context, observer(ready, heldFetch)));
+                    return new NereusBrokerStorageRuntime(context, new NereusKafkaOwnedProviderRuntime(
+                            context, observer(ready, heldFetch, ready == first ? fault : new PublicationFault(false))));
                 });
         KafkaBookKeeperM5PolicyRealScenario.configure(builder, work, fixture.settings(), true, "OBJECT_BYTES_DISABLED");
         builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.bytes.per.ledger", "1048576");
@@ -133,7 +146,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertTrue(sealedRuns(opened) >= 2, "native Produce did not seal two real BK sources");
             assertAppendWhileFetchHeld(cluster, client, topicId, heldFetch, produced);
             produced++;
-            verifyOutputs(opened, fixture, client, produced, new FetchProbe(cluster, topicId, heldFetch),
+            verifyOutputs(opened, fixture, client, produced, new FetchProbe(cluster, topicId, heldFetch, fault),
                     () -> relocate(cluster, client, cold));
             cluster.fatalFaultHandler().maybeRethrowFirstException();
             cluster.nonFatalFaultHandler().maybeRethrowFirstException();
@@ -141,8 +154,13 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     }
 
     private static NereusKafkaOwnedProviderRuntime.NativeRunResponseObserver observer(
-            CompletableFuture<NereusKafkaOwnedProviderRuntime.Opened> ready, HeldFetch heldFetch) {
+            CompletableFuture<NereusKafkaOwnedProviderRuntime.Opened> ready, HeldFetch heldFetch, PublicationFault fault) {
         return new NereusKafkaOwnedProviderRuntime.NativeRunResponseObserver() {
+            @Override
+            public AsyncOxiaClient controlClient(AsyncOxiaClient client) {
+                return fault.wrap(client);
+            }
+
             @Override
             public void afterReady(TopicIdPartition partition, NereusKafkaOwnedProviderRuntime.Opened opened) {
                 if (partition.topic().equals(TOPIC)) ready.complete(opened);
@@ -206,7 +224,71 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         assertEquals(0L, FetchResponse.recordsOrFail(data).batches().iterator().next().baseOffset());
     }
 
-    private record FetchProbe(KafkaClusterTestKit cluster, Uuid topicId, HeldFetch held) { }
+    private record FetchProbe(KafkaClusterTestKit cluster, Uuid topicId, HeldFetch held, PublicationFault fault) { }
+
+    private static final class PublicationFault {
+        private final boolean enabled;
+        private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
+        private volatile String blocked;
+
+        private PublicationFault(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        private AsyncOxiaClient wrap(AsyncOxiaClient client) {
+            if (!enabled) return client;
+            return (AsyncOxiaClient) Proxy.newProxyInstance(getClass().getClassLoader(),
+                    new Class<?>[] {AsyncOxiaClient.class}, (proxy, method, args) -> {
+                        String key = args != null && args.length > 0 && args[0] instanceof String value ? value : "";
+                        if (method.getName().equals("get") && key.equals(blocked)) {
+                            return CompletableFuture.failedFuture(new TimeoutException("original selector reread hidden"));
+                        }
+                        Object response;
+                        try {
+                            response = method.invoke(client, args);
+                        } catch (InvocationTargetException failure) {
+                            throw failure.getCause();
+                        }
+                        if (method.getName().equals("put") && selected(key, args)) {
+                            return ((CompletionStage<?>) response).thenCompose(applied -> {
+                                blocked = key;
+                                return CompletableFuture.failedFuture(new TimeoutException("applied Object selector response lost"));
+                            }).toCompletableFuture();
+                        }
+                        return response;
+                    });
+        }
+
+        private void verifyOriginalWork(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture,
+                NereusKafkaObjectMaterialization.Verified verified, boolean retained) throws Exception {
+            var cell = fixture.profile().protocolCellSha256();
+            var metadata = owner.nativeM5BindingRoute().materializationMetadata(cell);
+            var plan = verified.stored().task().prepared().plan();
+            var taskId = plan.taskIdSha256();
+            var coordinator = new M5MaterializationCoordinatorV1(metadata, 0, plan.sourceCut().identity().binding());
+            assertEquals(retained ? TaskState.OUTPUT_VERIFIED : TaskState.PUBLISHED, coordinator.readTask(taskId).orElseThrow().state());
+            var charge = new M5MaterializationAdmissionV1(metadata, cell).read().orElseThrow().reservations();
+            assertEquals(retained, charge.stream().anyMatch(item -> item.taskIdSha256().equals(taskId)));
+            var physical = new M5TargetDeleteAuthorityCoordinatorV1(fixture.provider().physicalQuota());
+            for (var credit : verified.stored().credits()) {
+                var resource = credit.resource().orElseThrow();
+                var fact = physical.inspect(resource.authorityKey()).toCompletableFuture().get(30, TimeUnit.SECONDS)
+                        .orElseThrow().fullAuthority().orElseThrow();
+                assertEquals(retained ? 1 : 0, fact.activeWriterTickets().size());
+                assertEquals(Optional.of(credit), fixture.provider().physicalQuota().quota().readBirth(credit.key())
+                        .toCompletableFuture().get(30, TimeUnit.SECONDS));
+            }
+        }
+
+        private boolean selected(String key, Object[] args) {
+            var expected = manifest.get();
+            if (expected == null || !key.contains("/read-m4/") || !key.endsWith("/selector")) return false;
+            var value = CanonicalBytes.copyOf((byte[]) args[1]);
+            return M5BindingAuthorityCodecV1.isAuthorityValue(value)
+                    && M5BindingAuthorityCodecV1.decodeAuthority(value).selectorProjection().selectedViewSha256().equals(expected)
+                    && manifest.compareAndSet(expected, null);
+        }
+    }
 
     private record Hold(CompletableFuture<Void> entered, CompletableFuture<Void> release) { }
 
@@ -361,6 +443,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             Fixture fixture, Properties client, int produced, FetchProbe probe, ColdTakeover cold) throws Exception {
         var provider = fixture.provider();
         var heldFetch = probe.held();
+        var fault = probe.fault();
+        var manifest = M5MaterializationCodecV1.manifestSha256(verified.generation().manifestView());
+        if (fault.enabled) fault.manifest.set(manifest);
         var reads = Executors.newSingleThreadExecutor();
         var dispatched = new AtomicInteger();
         try {
@@ -368,25 +453,39 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             try (var wire = fetch(probe.cluster(), probe.topicId())) {
                 try {
                     hold.entered().get(30, TimeUnit.SECONDS);
-                    captured.publishObjectMaterialization(verified, provider, task -> reads.execute(() -> {
+                    var publishing = captured.publishObjectMaterialization(verified, provider, task -> reads.execute(() -> {
                         dispatched.incrementAndGet();
                         task.run();
-                    }), Duration.ofSeconds(10)).toCompletableFuture().get(30, TimeUnit.SECONDS);
+                    }), Duration.ofSeconds(10)).toCompletableFuture();
+                    if (fault.enabled) {
+                        assertThrows(ExecutionException.class, () -> publishing.get(30, TimeUnit.SECONDS));
+                        assertTrue(fault.blocked != null, "the original selector write was not applied");
+                    } else {
+                        publishing.get(30, TimeUnit.SECONDS);
+                    }
                 } finally {
                     hold.release().complete(null);
                 }
                 assertPinnedFetch(wire, probe.topicId(), produced);
                 assertEquals(0, dispatched.get(), "the old pinned Fetch replanned after Object selection");
             }
-            captured.discard().toCompletableFuture().get(30, TimeUnit.SECONDS);
+            fault.blocked = null;
+            if (!fault.enabled) captured.discard().toCompletableFuture().get(30, TimeUnit.SECONDS);
             var selector = opened.nativeM5BindingRoute().readSelector().orElseThrow();
-            assertEquals(M5MaterializationCodecV1.manifestSha256(verified.generation().manifestView()),
-                    selector.selectedViewSha256());
+            assertEquals(manifest, selector.selectedViewSha256());
             assertTrue(selector.fallbackSetSha256().isPresent());
             var reopened = NereusKafkaObjectRecovery.recover(opened.nativeM5BindingRoute(), 0, selector,
-                    provider, Duration.ofSeconds(10)).orElseThrow();
+                    provider, Duration.ofSeconds(10)).orElseThrow().prefix();
             assertEquals(selector.selectedViewSha256(), reopened.manifestSha256());
             assertEquals(verified.protections(), reopened.originalFallbackSources());
+            if (fault.enabled) {
+                fault.verifyOriginalWork(opened, fixture, verified, true);
+                var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
+                var recovered = cold.relocate();
+                verifyColdSelector(selector, recovered, client, expected, heldFetch);
+                fault.verifyOriginalWork(recovered, fixture, verified, false);
+                return;
+            }
             long before = sealedRuns(opened);
             int end = produced;
             while (sealedRuns(opened) == before && end < produced + 32) {
@@ -402,12 +501,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertTrue(dispatched.get() > 0, "native Kafka Fetch never dispatched its selected Object reads");
             assertEquals(originalReads, heldFetch.originalPrefixReads.get(), "valid Object prefix was bypassed");
             var recovered = cold.relocate();
-            var coldSelector = recovered.nativeM5BindingRoute().readSelector().orElseThrow();
-            assertTrue(coldSelector.ownerEpoch() > selector.ownerEpoch());
-            assertEquals(selector.selectedViewSha256(), coldSelector.selectedViewSha256());
-            assertEquals(selector.fallbackSetSha256(), coldSelector.fallbackSetSha256());
-            assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, end));
-            assertEquals(originalReads, heldFetch.originalPrefixReads.get(), "cold Fetch bypassed its selected Object prefix");
+            verifyColdSelector(selector, recovered, client, expected, heldFetch);
             var payloads = verified.generation().generation().payloadObjects();
             fixture.removeVersion().accept(payloads.get(payloads.size() - 1));
             var afterLoss = new java.util.ArrayList<>(expected);
@@ -422,6 +516,19 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             reads.shutdown();
             assertTrue(reads.awaitTermination(30, TimeUnit.SECONDS));
         }
+    }
+
+    private static void verifyColdSelector(
+            com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector selector,
+            NereusKafkaOwnedProviderRuntime.Opened recovered, Properties client, List<String> expected,
+            HeldFetch heldFetch) throws Exception {
+        var coldSelector = recovered.nativeM5BindingRoute().readSelector().orElseThrow();
+        assertTrue(coldSelector.ownerEpoch() > selector.ownerEpoch());
+        assertEquals(selector.selectedViewSha256(), coldSelector.selectedViewSha256());
+        assertEquals(selector.fallbackSetSha256(), coldSelector.fallbackSetSha256());
+        int originalReads = heldFetch.originalPrefixReads.get();
+        assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, expected.size()));
+        assertEquals(originalReads, heldFetch.originalPrefixReads.get(), "cold Fetch bypassed its selected Object prefix");
     }
 
     private static void verifyPrefixRead(NereusKafkaNativeInputV2.Captured captured,
