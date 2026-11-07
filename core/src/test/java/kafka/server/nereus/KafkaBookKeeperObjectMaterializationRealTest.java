@@ -913,6 +913,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             KafkaObjectCompactionRealScenario.verifyReplacement(probe.cluster(), probe.topicId(), 0, latest);
             var recovered = takeover.relocate();
             assertEquals(next.selectedViewSha256(), recovered.nativeM5BindingRoute().readSelector().orElseThrow().selectedViewSha256());
+            recovered.storage().verifySelectedObjectPrefix(next.selectedViewSha256()).toCompletableFuture().get(30, TimeUnit.SECONDS);
             KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 1, end, client, latest, compactedEnd);
             KafkaObjectCompactionRealScenario.verifyReplacement(probe.cluster(), probe.topicId(), 1, latest);
         }
