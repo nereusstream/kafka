@@ -32,6 +32,7 @@ import com.nereusstream.storage.object.gc.M5TargetDeleteMultiWriterGuardV2.Compl
 import com.nereusstream.storage.object.gc.M5TargetDeleteMultiWriterGuardV2.Context;
 import com.nereusstream.storage.object.gc.M5TargetDeleteMultiWriterGuardV2.Result;
 import com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1;
+import com.nereusstream.storage.object.materialization.M5MaterializationCodecV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PublicationOutcome;
@@ -61,7 +62,20 @@ final class NereusKafkaObjectPublication {
     private record Attempt(PublicationOutcome outcome, Exception failure) { }
 
     private record WriterTickets(M5TargetDeleteMultiWriterGuardV2 guard,
-            Map<PhysicalResourceIdV2, Context> contexts, Sha256Digest terminalRoot) { }
+            Map<PhysicalResourceIdV2, Context> contexts, Sha256Digest terminalRoot) {
+        private void reconcile(Duration timeout) throws Exception {
+            long deadline = System.nanoTime() + timeout.toNanos();
+            var pending = contexts;
+            while (!pending.isEmpty()) {
+                var unresolved = guard.reconcileTerminalWithContexts(pending, terminalRoot)
+                        .toCompletableFuture().get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                if (unresolved.size() >= pending.size()) {
+                    throw new IllegalStateException("Kafka Object selected publication retains original physical tickets");
+                }
+                pending = unresolved.stream().collect(Collectors.toUnmodifiableMap(resource -> resource, contexts::get));
+            }
+        }
+    }
 
     static CompletionStage<Void> publish(NereusKafkaObjectMaterialization.Verified verified,
             NereusKafkaObjectProvider provider, KafkaBookKeeperPartitionV1 storage,
@@ -99,7 +113,7 @@ final class NereusKafkaObjectPublication {
         }, control);
     }
 
-    /** The closed former Owner and the exact selected manifest permit audit and ticket cleanup without another CAS. */
+    /** Only an already selected original manifest can settle its Task and physical writer tickets. */
     static void reconcileSelected(NereusKafkaObjectRecovery.Selected selected, BindingReadSelector selector,
             NereusKafkaObjectProvider provider, KafkaBookKeeperPartitionV1.NativeReadSources raw,
             OxiaQuotaTargetDeleteStoreV2 bookKeeper, PhysicalResourceIdV2.Namespace bookKeeperNamespace,
@@ -135,12 +149,32 @@ final class NereusKafkaObjectPublication {
         if (!exact(outcome)) {
             throw new IllegalStateException("Kafka Object selected Task audit remains unresolved: " + outcome);
         }
-        var unresolved = tickets.guard().reconcileTerminalWithContexts(tickets.contexts(), tickets.terminalRoot())
-                .toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
-        if (!unresolved.isEmpty()) {
-            throw new IllegalStateException("Kafka Object selected publication retains original physical tickets");
-        }
+        tickets.reconcile(timeout);
         releaseAdmission(admission, taskId);
+    }
+
+    /** Called after the original invocation returned; this does not dispatch another selector or Object write. */
+    static void reconcileOriginal(NereusKafkaObjectMaterialization.Verified verified,
+            NereusKafkaObjectProvider provider, KafkaBookKeeperPartitionV1 storage,
+            OxiaQuotaTargetDeleteStoreV2 bookKeeper, PhysicalResourceIdV2.Namespace bookKeeperNamespace,
+            OxiaKafkaBookKeeperM4ReadRouteV2 binding, Runnable requireCurrent, Duration timeout) throws Exception {
+        var task = verified.stored().task();
+        var plan = task.prepared().plan();
+        var manifest = M5MaterializationCodecV1.manifestSha256(verified.generation().manifestView());
+        requireCurrent.run();
+        var selector = binding.readSelector().orElseThrow();
+        if (!selector.selectedViewSha256().equals(manifest)
+                || selector.ownerEpoch() != plan.sourceCut().identity().ownerEpoch()) {
+            throw new IllegalStateException("Kafka Object publication has no exact selected original to reconcile");
+        }
+        var selected = NereusKafkaObjectRecovery.recover(binding, task.partition(), selector, provider, timeout).orElseThrow();
+        if (!selected.plan().equals(plan) || !selected.inventory().equals(task.pending())) {
+            throw new IllegalStateException("Kafka Object publication differs from the original local Task");
+        }
+        requireCurrent.run();
+        storage.finishSelectedNativeObjectPublication(manifest);
+        reconcileSelected(selected, selector, provider, storage.nativeReadSources(), bookKeeper, bookKeeperNamespace,
+                binding, task.partition(), timeout);
     }
 
     private static WriterTickets tickets(KafkaObjectMaterializedPrefixV1 prefix,

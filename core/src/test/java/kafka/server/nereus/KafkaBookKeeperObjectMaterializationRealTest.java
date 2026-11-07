@@ -99,13 +99,13 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final String TOPIC = "native-cold";
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
+    @ValueSource(strings = {"known", "cold", "hot"})
     @Timeout(240)
-    public void storesAndVerifiesTheRealNativeSealedPrefix(boolean lostResponse, @TempDir Path work) throws Exception {
+    public void storesAndVerifiesTheRealNativeSealedPrefix(String outcome, @TempDir Path work) throws Exception {
         writeM6Capability(work);
         var nativeConfig = KafkaBookKeeperOwnerRelocationRealTest.nativeConfig(work,
                 System.getProperty("nereus.nsip.bkUri"), System.getProperty("nereus.nsip.oxia"));
-        withObjectFixture(work, nativeConfig, fixture -> runColdCluster(work, fixture, new PublicationFault(lostResponse)));
+        withObjectFixture(work, nativeConfig, fixture -> runColdCluster(work, fixture, new PublicationFault(outcome)));
     }
 
     private static void runColdCluster(Path work, Fixture fixture, PublicationFault fault) throws Exception {
@@ -120,7 +120,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 .setBrokerStorageRuntimeFactory(context -> {
                     var ready = context.config().brokerId() == 0 ? first : cold;
                     return new NereusBrokerStorageRuntime(context, new NereusKafkaOwnedProviderRuntime(
-                            context, observer(ready, heldFetch, ready == first ? fault : new PublicationFault(false))));
+                            context, observer(ready, heldFetch, ready == first ? fault : new PublicationFault("known"))));
                 });
         KafkaBookKeeperM5PolicyRealScenario.configure(builder, work, fixture.settings(), true, "OBJECT_BYTES_DISABLED");
         builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.bytes.per.ledger", "1048576");
@@ -228,11 +228,13 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
 
     private static final class PublicationFault {
         private final boolean enabled;
+        private final boolean recoverHot;
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
         private volatile String blocked;
 
-        private PublicationFault(boolean enabled) {
-            this.enabled = enabled;
+        private PublicationFault(String outcome) {
+            enabled = !outcome.equals("known");
+            recoverHot = outcome.equals("hot");
         }
 
         private AsyncOxiaClient wrap(AsyncOxiaClient client) {
@@ -484,11 +486,20 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertEquals(verified.protections(), reopened.originalFallbackSources());
             if (fault.enabled) {
                 fault.verifyOriginalWork(opened, fixture, verified, true);
-                var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
-                var recovered = cold.relocate();
-                verifyColdSelector(selector, recovered, client, expected, heldFetch);
-                fault.verifyOriginalWork(recovered, fixture, verified, false);
-                return;
+                if (fault.recoverHot) {
+                    captured.publishObjectMaterialization(verified, provider, task -> {
+                        throw new AssertionError("reconciliation replaced the original provider executor");
+                    }, Duration.ofSeconds(10)).toCompletableFuture().get(30, TimeUnit.SECONDS);
+                    captured.discard().toCompletableFuture().get(30, TimeUnit.SECONDS);
+                    fault.verifyOriginalWork(opened, fixture, verified, false);
+                    assertEquals(selector, opened.nativeM5BindingRoute().readSelector().orElseThrow());
+                } else {
+                    var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
+                    var recovered = cold.relocate();
+                    verifyColdSelector(selector, recovered, client, expected, heldFetch);
+                    fault.verifyOriginalWork(recovered, fixture, verified, false);
+                    return;
+                }
             }
             long before = sealedRuns(opened);
             int end = produced;

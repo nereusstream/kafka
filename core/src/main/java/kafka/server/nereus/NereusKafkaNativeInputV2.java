@@ -358,6 +358,7 @@ public final class NereusKafkaNativeInputV2 {
         private int pending;
         private boolean discarded;
         private boolean unresolved;
+        private boolean unsettledObjectPublication;
         private boolean releasing;
         private boolean ownerCache;
         private Sha256Digest selectedView;
@@ -432,6 +433,19 @@ public final class NereusKafkaNativeInputV2 {
 
         <T> CompletionStage<T> ownOutput(java.util.function.Supplier<CompletionStage<T>> operation) {
             return own(operation, true);
+        }
+
+        CompletionStage<Void> ownObjectPublication(java.util.function.Supplier<CompletionStage<Void>> operation) {
+            return ownOutput(() -> {
+                synchronized (this) {
+                    unsettledObjectPublication = true;
+                }
+                return operation.get().thenRun(() -> {
+                    synchronized (this) {
+                        unsettledObjectPublication = false;
+                    }
+                });
+            });
         }
 
         private <T> CompletionStage<T> own(java.util.function.Supplier<CompletionStage<T>> operation, boolean outputOwned) {
@@ -517,7 +531,7 @@ public final class NereusKafkaNativeInputV2 {
             if (release.isDone() || releasing) return;
             // The selected cache remains owned by the Broker. A discarded observer cannot discharge its charge.
             if (ownerCache || prepared != null && prepared.requiresOwnerCacheDrain()) return;
-            if (unresolved) {
+            if (unresolved || unsettledObjectPublication) {
                 release.completeExceptionally(new IllegalStateException("native M5 capture failure retains its Cell reservation until Owner drain"));
                 return;
             }
@@ -677,6 +691,9 @@ public final class NereusKafkaNativeInputV2 {
         private final List<InputBatch> batches;
         private final KafkaCompactionRecoveryStateV1 recoveryState;
         private final CellReservation reservation;
+        private NereusKafkaObjectMaterialization.Verified originalObjectPublication;
+        private CompletableFuture<Void> objectPublication;
+        private volatile boolean objectPublicationDispatched;
 
         private Captured(Scan snapshot, CellReservation reservation) {
             if (reservation != null) snapshot.requireBounds(reservation.allowance.planCaps());
@@ -936,24 +953,63 @@ public final class NereusKafkaNativeInputV2 {
             }, control)));
         }
 
-        CompletionStage<Void> publishObjectMaterialization(NereusKafkaObjectMaterialization.Verified verified,
+        synchronized CompletionStage<Void> publishObjectMaterialization(NereusKafkaObjectMaterialization.Verified verified,
                 NereusKafkaObjectProvider provider, Executor providerReads, java.time.Duration timeout) {
             if (reservation == null || !verified.stored().task().prepared().plan().sourceCut().sources().equals(extents)) {
                 return CompletableFuture.failedFuture(new IllegalArgumentException(
                         "native Kafka Object publication requires its original retained source cut"));
             }
-            return opened.ownInputOperation(() -> reservation.own(() -> verifyInputs(extents, batches)
-                    .thenComposeAsync(membership -> {
-                        try {
-                            return NereusKafkaObjectPublication.publish(verified, provider, opened.storage(),
-                                    bookKeeperPhysical, membership, () -> {
-                                        requireOpen();
-                                        requireCurrentLocal();
-                                    }, control, providerReads, timeout);
-                        } catch (Exception failure) {
-                            return CompletableFuture.failedFuture(failure);
-                        }
-                    }, control)));
+            requireOpen();
+            if (originalObjectPublication != null && originalObjectPublication != verified) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException(
+                        "Kafka Object retry requires the original verified output"));
+            }
+            if (objectPublication == null) {
+                originalObjectPublication = verified;
+                objectPublication = dispatchObjectPublication(verified, provider, providerReads, timeout).toCompletableFuture();
+            } else if (objectPublication.isCompletedExceptionally()) {
+                objectPublication = (objectPublicationDispatched
+                        ? reconcileObjectPublication(verified, provider, timeout)
+                        : dispatchObjectPublication(verified, provider, providerReads, timeout)).toCompletableFuture();
+            }
+            return objectPublication.thenApply(ignored -> null);
+        }
+
+        private CompletionStage<Void> dispatchObjectPublication(NereusKafkaObjectMaterialization.Verified verified,
+                NereusKafkaObjectProvider provider, Executor providerReads, java.time.Duration timeout) {
+            return opened.ownInputOperation(() -> verifyInputs(extents, batches)
+                    .thenComposeAsync(membership -> reservation.ownObjectPublication(() ->
+                            publishVerifiedObject(verified, provider, membership, providerReads, timeout)), control));
+        }
+
+        private CompletionStage<Void> publishVerifiedObject(NereusKafkaObjectMaterialization.Verified verified,
+                NereusKafkaObjectProvider provider, Map<Sha256Digest, List<PhysicalResourceIdV2>> membership,
+                Executor providerReads, java.time.Duration timeout) {
+            try {
+                objectPublicationDispatched = true;
+                return NereusKafkaObjectPublication.publish(verified, provider, opened.storage(),
+                        bookKeeperPhysical, membership, () -> {
+                            requireOpen();
+                            requireCurrentLocal();
+                        }, control, providerReads, timeout);
+            } catch (Exception failure) {
+                return CompletableFuture.failedFuture(failure);
+            }
+        }
+
+        private CompletionStage<Void> reconcileObjectPublication(NereusKafkaObjectMaterialization.Verified verified,
+                NereusKafkaObjectProvider provider, java.time.Duration timeout) {
+            return opened.ownInputOperation(() -> reservation.ownObjectPublication(() -> CompletableFuture.runAsync(() -> {
+                try {
+                    NereusKafkaObjectPublication.reconcileOriginal(verified, provider, opened.storage(),
+                            bookKeeperPhysical, nativeClient.spec().namespace(), m4, () -> {
+                                requireOpen();
+                                if (!current.getAsBoolean()) throw new IllegalStateException("Kafka Object publication Owner changed");
+                            }, timeout);
+                } catch (Exception failure) {
+                    throw new CompletionException(failure);
+                }
+            }, control)));
         }
 
         private CompletionStage<M5MaterializationWorkerCoordinatorV1.Proposal> proposeWorker(

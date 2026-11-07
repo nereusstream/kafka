@@ -230,6 +230,7 @@
         <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteMultiWriterGuardV2.Context" />
         <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteMultiWriterGuardV2.Result" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationCodecV1" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PublicationOutcome" />
