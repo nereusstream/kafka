@@ -94,22 +94,30 @@ final class NereusKafkaCompactionPlanV2 {
                 (int) Math.ceil(config.minCleanableRatio * 1_000_000), config.deleteRetentionMs, nowMs,
                 topic.generation(), KafkaCompactionRecordsV1.NATIVE_REWRITE_POLICY_VERSION,
                 AppInfoParser.getVersion(), topic.compressionPolicy(), caps);
-        var cut = new MaterializationSourceCut(identity, capture.predecessorSelector(),
-                Sha256Digest.hash(M4ReadControlCodecV1.encodeSelector(capture.predecessorSelector())),
-                capture.predecessorSelector().selectedViewSha256(), new ProtocolCoverage(PositionDomain.KAFKA_OFFSET,
-                        frontiers.candidateStartOffset(), frontiers.candidateEndOffsetExclusive()),
-                frontiers.durableOffset(), frontiers.logEndOffset(), frontiers.highWatermark(),
-                frontiers.lastStableOffset(), frontiers.logStartOffset(), protocolRoot(capture),
-                roots.recoveryCheckpointSha256(), policyRoot(topic),
+        var cut = sourceCut(capture, identity,
                 hash("NEREUS_NATIVE_KAFKA_OUTPUT_POLICY_V1", out -> {
                     writeText(out, policy.rewritePolicyVersion());
                     writeText(out, policy.nativeKafkaOracleVersion());
                     out.writeInt(policy.kafkaFeatureLevel());
                     out.writeByte(policy.messageMagic());
                     out.writeByte(policy.compressionPolicy().ordinal());
-                }), M5MaterializationCodecV1.calculateSourceSetSha256(capture.extents()), capture.extents());
+                }));
         return new CompactionPlan(cut, policy, frontiers, roots, capture.batches(), keys, transactions,
                 leaderEpochs(capture), List.of(), List.of());
+    }
+
+    static MaterializationSourceCut sourceCut(NereusKafkaNativeInputV2.Captured capture, IdentityEnvelope identity,
+            Sha256Digest outputPolicy) {
+        var frontiers = capture.frontiers();
+        var checkpoint = capture.nativeSources().protocol().root().references().checkpointVector().contentDigest();
+        return new MaterializationSourceCut(identity, capture.predecessorSelector(),
+                Sha256Digest.hash(M4ReadControlCodecV1.encodeSelector(capture.predecessorSelector())),
+                capture.predecessorSelector().selectedViewSha256(), new ProtocolCoverage(PositionDomain.KAFKA_OFFSET,
+                        frontiers.candidateStartOffset(), frontiers.candidateEndOffsetExclusive()),
+                frontiers.durableOffset(), frontiers.logEndOffset(), frontiers.highWatermark(),
+                frontiers.lastStableOffset(), frontiers.logStartOffset(), protocolRoot(capture),
+                checkpoint, policyRoot(capture.topicPolicy()), outputPolicy,
+                M5MaterializationCodecV1.calculateSourceSetSha256(capture.extents()), capture.extents());
     }
 
     /** Only the sealed raw suffix is dirty when the complete key domain starts in a selected generation. */

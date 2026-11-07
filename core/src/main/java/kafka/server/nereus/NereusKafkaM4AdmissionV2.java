@@ -40,6 +40,7 @@ import io.oxia.client.api.OxiaClientBuilder;
 /** Checks an explicit current-source M4 receipt before the isolated Broker may provision read authority. */
 final class NereusKafkaM4AdmissionV2 {
     private static final String PREFIX = "m4IsolatedAdmission.";
+    private static final String M6_PREFIX = "m6IsolatedAdmission.";
     private static final String NEREUS_SCHEMA = "NEREUS_V2_M5_KAFKA_RUN_SOURCE_RUN_V2";
     private static final String BOOKKEEPER_IMAGE =
             "sha256:d0e78aaf987ac2feb526507ffb7d4c5137d58c0530f2a8cab4a9595abc89d605";
@@ -97,33 +98,32 @@ final class NereusKafkaM4AdmissionV2 {
             KafkaConfig config, BookKeeperCapabilitySnapshotV1 bookKeeper) throws Exception {
         Properties descriptor = NereusBookKeeperCapability.descriptor(
                 Path.of(config.getString(NereusKafkaConfigs.BOOKKEEPER_CAPABILITY_FILE_CONFIG)));
-        String summaryName = descriptor.getProperty(PREFIX + "runSummaryFile");
+        boolean m6 = descriptor.stringPropertyNames().stream().anyMatch(key -> key.startsWith(M6_PREFIX));
+        if (m6 && descriptor.stringPropertyNames().stream().anyMatch(key -> key.startsWith(PREFIX))) {
+            throw new IllegalArgumentException("mixed M4 and M6 isolated admission properties");
+        }
+        String prefix = m6 ? M6_PREFIX : PREFIX;
+        String summaryName = m6 ? required(descriptor, prefix, "runSummaryFile")
+                : descriptor.getProperty(prefix + "runSummaryFile");
         if (summaryName == null) {
             return Optional.empty();
         }
-        Path root = Path.of(required(descriptor, "sourceRoot")).toRealPath();
+        Path root = Path.of(required(descriptor, prefix, "sourceRoot")).toRealPath();
         Path summaryPath = Path.of(summaryName).toRealPath();
         Path output = Objects.requireNonNull(summaryPath.getParent(), "M4 summary directory");
-        if (!summaryPath.startsWith(root.resolve("build/m5-kafka-run-source"))) {
-            throw new IllegalArgumentException("M4 receipt is outside the isolated source-bound run output");
-        }
+        verifySummaryLocation(root, summaryPath, m6);
         byte[] summaryBytes = bounded(summaryPath, 1_048_576);
         Sha256Digest receipt = sha(summaryBytes);
-        if (!receipt.toHex().equals(required(descriptor, "runSummarySha256"))) {
+        if (!receipt.toHex().equals(required(descriptor, prefix, "runSummarySha256"))) {
             throw new IllegalArgumentException("M4 receipt differs from the explicit admission digest");
         }
         Map<?, ?> summary = object(summaryBytes);
-        requireText(summary, "schema", NEREUS_SCHEMA);
-        requireText(summary, "sourceAndProtocolAuthority", "SYNTHETIC_FACTS_WITH_REAL_OXIA_AND_BK");
         requireText(summary, "bookKeeperImageId", BOOKKEEPER_IMAGE);
         requireText(summary, "oxiaImageId", OXIA_IMAGE);
-        requireBoolean(summary, "capturedInputsUnchangedDuringRun", true);
-        requireBoolean(summary, "nativeM4HeldSelectorCasReadAndFenceReal", true);
-        for (String key : List.of("m5Receipt", "m5FinalAuthority", "physicalDeleteAuthority", "productionAuthority")) {
-            requireBoolean(summary, key, false);
-        }
+        if (m6) NereusKafkaM6ReadQualification.verify(output, summary);
+        else verifyHistoricalSummary(summary);
         Sha256Digest inputs = verifyInputs(root, output, summary);
-        verifySuites(output, summary);
+        if (!m6) verifySuites(output, summary);
         Map<?, ?> classes = nested(summary, "currentLoadedM4ReadClassSha256");
         verifyClasses(classes);
         verifyRuntimeArtifacts(nested(summary, "currentM4RuntimeArtifactSha256"));
@@ -146,6 +146,26 @@ final class NereusKafkaM4AdmissionV2 {
         if (!sha(sourceBytes).equals(inputs)) throw new IllegalArgumentException("verified M4 source manifest changed");
         return Optional.of(new NereusKafkaM4AdmissionV2(receipt, inputs, adapter, contract, verifier, backend,
                 readMillis, stringMap(object(sourceBytes)), stringMap(nested(summary, "currentM4RuntimeArtifactSha256"))));
+    }
+
+    private static void verifySummaryLocation(Path root, Path summaryPath, boolean m6) {
+        if (m6) {
+            if (summaryPath.startsWith(root) || !summaryPath.endsWith("m4-read-result.json")) {
+                throw new IllegalArgumentException("M6 M4 read qualification must be outside its source checkout");
+            }
+        } else if (!summaryPath.startsWith(root.resolve("build/m5-kafka-run-source"))) {
+            throw new IllegalArgumentException("M4 receipt is outside the isolated source-bound run output");
+        }
+    }
+
+    private static void verifyHistoricalSummary(Map<?, ?> summary) {
+        requireText(summary, "schema", NEREUS_SCHEMA);
+        requireText(summary, "sourceAndProtocolAuthority", "SYNTHETIC_FACTS_WITH_REAL_OXIA_AND_BK");
+        requireBoolean(summary, "capturedInputsUnchangedDuringRun", true);
+        requireBoolean(summary, "nativeM4HeldSelectorCasReadAndFenceReal", true);
+        for (String key : List.of("m5Receipt", "m5FinalAuthority", "physicalDeleteAuthority", "productionAuthority")) {
+            requireBoolean(summary, key, false);
+        }
     }
 
     /** Actual implementation source from the verified manifest, bound to its loaded tested runtime JAR. */
@@ -323,11 +343,11 @@ final class NereusKafkaM4AdmissionV2 {
         return sha(String.join("|", fields).getBytes(StandardCharsets.UTF_8));
     }
 
-    private static Sha256Digest sha(byte[] bytes) {
+    static Sha256Digest sha(byte[] bytes) {
         return Sha256Digest.hash(CanonicalBytes.copyOf(bytes));
     }
 
-    private static byte[] bounded(Path file, int maximum) throws Exception {
+    static byte[] bounded(Path file, int maximum) throws Exception {
         if (!Files.isRegularFile(file) || Files.size(file) > maximum) {
             throw new IllegalArgumentException("M4 input is missing or exceeds its bound: " + file);
         }
@@ -342,35 +362,35 @@ final class NereusKafkaM4AdmissionV2 {
         return value;
     }
 
-    private static Map<?, ?> nested(Map<?, ?> parent, String key) {
+    static Map<?, ?> nested(Map<?, ?> parent, String key) {
         if (!(parent.get(key) instanceof Map<?, ?> value)) {
             throw new IllegalArgumentException("M4 receipt lacks " + key);
         }
         return value;
     }
 
-    private static String required(Properties value, String key) {
-        String result = value.getProperty(PREFIX + key);
+    private static String required(Properties value, String prefix, String key) {
+        String result = value.getProperty(prefix + key);
         if (result == null || result.isBlank()) {
             throw new IllegalArgumentException("M4 isolated admission lacks " + key);
         }
         return result;
     }
 
-    private static String text(Map<?, ?> value, String key) {
+    static String text(Map<?, ?> value, String key) {
         if (!(value.get(key) instanceof String result) || result.isBlank()) {
             throw new IllegalArgumentException("M4 receipt lacks " + key);
         }
         return result;
     }
 
-    private static void requireText(Map<?, ?> value, String key, String expected) {
+    static void requireText(Map<?, ?> value, String key, String expected) {
         if (!expected.equals(text(value, key))) {
             throw new IllegalArgumentException("M4 receipt differs at " + key);
         }
     }
 
-    private static void requireBoolean(Map<?, ?> value, String key, boolean expected) {
+    static void requireBoolean(Map<?, ?> value, String key, boolean expected) {
         if (!(value.get(key) instanceof Boolean actual) || actual != expected) {
             throw new IllegalArgumentException("M4 receipt differs at " + key);
         }

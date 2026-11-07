@@ -64,18 +64,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class KafkaObjectProviderAdmissionRealTest {
     private static final String USER = "m6kafka";
     private static final String PASSWORD = "m6kafka-test-secret";
-    private static final String CREDENTIAL_SCOPE = "kafka-object";
-    private static final String PREFIX = "v2/m6/kafka-cell";
+    static final String CREDENTIAL_SCOPE = "kafka-object";
+    static final String PREFIX = "v2/m6/kafka-cell";
 
     @Test
     @Timeout(120)
     public void reopensExactRegisteredScopeAndRejectsForeignBucket(@TempDir Path work) throws Exception {
         var endpoint = URI.create(System.getProperty("nereus.nsip.s3Endpoint"));
         var oxia = System.getProperty("nereus.nsip.oxia");
-        try (var client = S3Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
-                     .forcePathStyle(true)
-                     .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(USER, PASSWORD)))
-                     .build();
+        try (var client = minio(endpoint);
                  var control = OxiaClientBuilder.create(oxia).asyncClient().get(30, TimeUnit.SECONDS)) {
             var namespace = OxiaPhysicalMetadataNamespaceV2.provision(control).toCompletableFuture()
                     .get(30, TimeUnit.SECONDS);
@@ -98,9 +95,19 @@ public class KafkaObjectProviderAdmissionRealTest {
             assertTrue(missing.getCause().getMessage().contains("Original Cell Provider scope is absent"));
             namespace.openCellProviderScopes(physical).thenCompose(registry -> registry.prepare(profile).admit())
                     .toCompletableFuture().get(30, TimeUnit.SECONDS);
+            var missingQuota = assertThrows(ExecutionException.class,
+                    () -> NereusKafkaObjectProvider.open(config, cell, namespace));
+            assertTrue(missingQuota.getCause().getMessage().contains("durable GC quota is not initialized"));
+            var physicalQuota = namespace.openAuthorityRoute(physical).toCompletableFuture()
+                    .get(30, TimeUnit.SECONDS);
+            long capacity = 4L << 20;
+            assertEquals(capacity, physicalQuota.initialize(capacity).toCompletableFuture()
+                    .get(30, TimeUnit.SECONDS).head().capacityBytes());
             try (var provider = NereusKafkaObjectProvider.open(config, cell, namespace)) {
                 provider.requireCurrent().toCompletableFuture().get(30, TimeUnit.SECONDS);
                 assertEquals(profile.scopeId(), provider.session().providerScopeId());
+                assertEquals(capacity, provider.physicalQuota().quota().snapshot().toCompletableFuture()
+                        .get(30, TimeUnit.SECONDS).head().capacityBytes());
                 assertExactObject(provider);
                 provider.beginDrain();
             }
@@ -125,6 +132,11 @@ public class KafkaObjectProviderAdmissionRealTest {
         props.put("controller.quorum.voters", "1@127.0.0.1:9193");
         props.put("controller.listener.names", "CONTROLLER");
         props.put("log.dirs", work.resolve("logs").toString());
+        configureObject(props, work, endpoint, bucket);
+        return props;
+    }
+
+    static void configureObject(Map<String, Object> props, Path work, URI endpoint, String bucket) throws Exception {
         props.put(NereusKafkaConfigs.PROFILE_CONFIG, "BOOKKEEPER_WAL_ASYNC_OBJECT");
         props.put(NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG, "s3");
         props.put(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG, bucket);
@@ -136,10 +148,14 @@ public class KafkaObjectProviderAdmissionRealTest {
         Files.writeString(credentials, "[" + CREDENTIAL_SCOPE + "]\naws_access_key_id=" + USER
                 + "\naws_secret_access_key=" + PASSWORD + "\n");
         props.put(NereusKafkaConfigs.OBJECT_CREDENTIALS_FILE_CONFIG, credentials.toString());
-        return props;
     }
 
-    private static String newVersionedBucket(S3Client client) {
+    static S3Client minio(URI endpoint) {
+        return S3Client.builder().endpointOverride(endpoint).region(Region.US_EAST_1).forcePathStyle(true)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(USER, PASSWORD))).build();
+    }
+
+    static String newVersionedBucket(S3Client client) {
         String name = "nereus-m6-" + UUID.randomUUID();
         client.createBucket(request -> request.bucket(name));
         client.putBucketVersioning(request -> request.bucket(name)

@@ -71,6 +71,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -321,6 +322,8 @@ public final class NereusKafkaNativeInputV2 {
     private static boolean terminated(Throwable failure) {
         return failure instanceof KafkaBookKeeperRunSourceV2.TerminatedReadException
                 || failure instanceof KafkaBookKeeperReadOwnerV2.TerminatedReadException
+                // This attempt dispatched no SDK write; durable Task and any reserved births still retain their charges.
+                || failure instanceof NereusKafkaObjectMaterialization.QuotaExhaustedException
                 || failure instanceof TerminatedCaptureException;
     }
 
@@ -849,24 +852,102 @@ public final class NereusKafkaNativeInputV2 {
 
         /** Prepares a real owner/scope/storage fence; no output work is admitted until a complete task is bound. */
         CompletionStage<M5MaterializationWorkerCoordinatorV1.Proposal> proposeWorker() {
+            return proposeWorker(m4.workers(), nativeCut.sources().activeRoot().providerScopeId().digest(),
+                    opened.nativeM5NamespaceBinding());
+        }
+
+        /** Builds bytes only; Object dispatch and publication both require the later exact worker admission. */
+        CompletionStage<NereusKafkaObjectMaterialization.Prepared> prepareObjectMaterialization(
+                NereusKafkaObjectProvider provider) {
+            if (reservation == null) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("native Kafka Object materialization requires retained Cell capacity"));
+            }
+            var profile = provider.profile();
+            if (!opened.nativeM5ProtocolCell().equals(profile.protocolCellSha256())) {
+                return CompletableFuture.failedFuture(new IllegalArgumentException("Kafka Object materialization has another Cell"));
+            }
+            var workers = new M5MaterializationWorkerCoordinatorV1(
+                    m4.materializationMetadata(profile.protocolCellSha256()),
+                    nativeCut.sources().activeRoot().partitionId(), binding);
+            return opened.ownInputOperation(() -> reservation.own(() -> provider.requireCurrent()
+                    .thenCompose(ignored -> proposeWorker(workers, profile.scopeId().digest(),
+                            Sha256Digest.hash(profile.physicalBinding().encode())))
+                    .thenApplyAsync(proposal -> terminatedLocal(() ->
+                            NereusKafkaObjectMaterialization.prepare(this, proposal, profile)), control)));
+        }
+
+        CompletionStage<NereusKafkaObjectMaterialization.Registered> registerObjectMaterialization(
+                NereusKafkaObjectMaterialization.Prepared prepared, NereusKafkaObjectProvider provider) {
+            if (reservation == null) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("native Kafka Object registration requires retained Cell capacity"));
+            }
+            return opened.ownInputOperation(() -> reservation.own(() -> provider.requireCurrent().thenApplyAsync(ignored -> {
+                requireOpen();
+                var cut = prepared.plan().sourceCut();
+                if (!cut.sources().equals(extents) || !cut.predecessorSelector().equals(selector.get())) {
+                    throw new IllegalStateException("Kafka Object task no longer matches the retained BK source cut");
+                }
+                var profile = provider.profile();
+                int partition = nativeCut.sources().activeRoot().partitionId();
+                var metadata = m4.materializationMetadata(profile.protocolCellSha256());
+                var workers = new M5MaterializationWorkerCoordinatorV1(metadata, partition, binding);
+                return NereusKafkaObjectMaterialization.register(prepared, profile, partition, metadata, () -> {
+                    requireOpen();
+                    requireCurrentLocal();
+                }, () -> proposeCurrentWorker(workers, profile.scopeId().digest(),
+                        Sha256Digest.hash(profile.physicalBinding().encode())));
+            }, control)));
+        }
+
+        CompletionStage<NereusKafkaObjectMaterialization.Verified> storeObjectMaterialization(
+                NereusKafkaObjectMaterialization.Registered task, NereusKafkaObjectProvider provider,
+                java.time.Duration timeout) {
+            if (reservation == null) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("native Kafka Object output requires retained Cell capacity"));
+            }
+            return opened.ownInputOperation(() -> reservation.own(() -> CompletableFuture.supplyAsync(() -> {
+                try {
+                    Runnable requireCurrent = () -> {
+                        requireOpen();
+                        requireCurrentLocal();
+                    };
+                    var stored = NereusKafkaObjectMaterialization.store(task, provider, requireCurrent, timeout);
+                    return NereusKafkaObjectMaterialization.protectAndVerify(stored, provider, requireCurrent, timeout);
+                } catch (Exception failure) {
+                    throw new CompletionException(failure);
+                }
+            }, control)));
+        }
+
+        private CompletionStage<M5MaterializationWorkerCoordinatorV1.Proposal> proposeWorker(
+                M5MaterializationWorkerCoordinatorV1 workers,
+                Sha256Digest outputProviderScope, Sha256Digest outputNamespaceBinding) {
             return opened.ownInputOperation(() -> verifyInputs(extents, batches).thenApplyAsync(ignored -> {
                 terminatedLocal(() -> {
                     requireOpen();
                     requireCurrentLocal();
                     return null;
                 });
-                var workers = m4.workers();
                 if (!workers.migrateLegacyAuthority())
                     throw new IllegalStateException("native M5 worker authority migration is unresolved");
-                byte[] domain = "NEREUS_M5_KAFKA_NATIVE_WORKER_OWNER_V1".getBytes(StandardCharsets.US_ASCII);
-                var bytes = ByteBuffer.allocate(domain.length + 3 * Long.BYTES + 2 * Integer.BYTES)
-                        .put(domain).putLong(owner.ownerEpoch()).putInt(owner.kafkaLeaderEpoch())
-                        .putInt(owner.brokerId()).putLong(owner.brokerEpoch()).putLong(owner.metadataOffset());
-                return workers.propose(selector.get(), opened.nativeM5ProtocolCell(),
-                        nativeCut.sources().activeRoot().providerScopeId().digest(), opened.nativeM5StorageFence(),
-                        Sha256Digest.hash(CanonicalBytes.copyOf(bytes.array())), opened.nativeM5NamespaceBinding())
-                        .orElseThrow(() -> new IllegalStateException("native M5 worker predecessor changed"));
+                return proposeCurrentWorker(workers, outputProviderScope, outputNamespaceBinding);
             }, control));
+        }
+
+        private M5MaterializationWorkerCoordinatorV1.Proposal proposeCurrentWorker(
+                M5MaterializationWorkerCoordinatorV1 workers, Sha256Digest outputProviderScope,
+                Sha256Digest outputNamespaceBinding) {
+            byte[] domain = "NEREUS_M5_KAFKA_NATIVE_WORKER_OWNER_V1".getBytes(StandardCharsets.US_ASCII);
+            var bytes = ByteBuffer.allocate(domain.length + 3 * Long.BYTES + 2 * Integer.BYTES)
+                    .put(domain).putLong(owner.ownerEpoch()).putInt(owner.kafkaLeaderEpoch())
+                    .putInt(owner.brokerId()).putLong(owner.brokerEpoch()).putLong(owner.metadataOffset());
+            return workers.propose(selector.get(), opened.nativeM5ProtocolCell(),
+                    outputProviderScope, opened.nativeM5StorageFence(),
+                    Sha256Digest.hash(CanonicalBytes.copyOf(bytes.array())), outputNamespaceBinding)
+                    .orElseThrow(() -> new IllegalStateException("native M5 worker predecessor changed"));
         }
 
         /** Exact native membership recheck, for use before the separately authorized publication CAS. */

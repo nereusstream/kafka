@@ -160,6 +160,8 @@
       <file name="(NereusKafkaObjectProvider|KafkaObjectProviderAdmissionRealTest)(\.java)?" regex="true">
         <allow class="com.nereusstream.storage.object.materialization.M5CellProviderProfileV2" />
         <allow class="com.nereusstream.storage.object.provider.C1ObjectProviderSession" />
+        <allow class="com.nereusstream.storage.object.provider.C1ObjectProviderSession.VerifiedObjectConsumption" />
+        <allow class="com.nereusstream.storage.object.provider.C1ObjectProviderSession.VerifiedReadCleanupException" />
         <allow class="com.nereusstream.storage.object.provider.ObjectIdentity" />
         <allow class="com.nereusstream.storage.object.provider.ProviderObjectOutcome" />
         <allow class="com.nereusstream.storage.object.provider.RepeatableObjectBody" />
@@ -172,6 +174,42 @@
         <allow class="software.amazon.awssdk.regions.Region" />
         <allow class="software.amazon.awssdk.services.s3.S3Client" />
         <allow class="software.amazon.awssdk.services.s3.model.BucketVersioningStatus" />
+      </file>
+      <file name="(NereusKafkaObjectMaterialization|KafkaBookKeeperObjectMaterializationRealTest)(\.java)?" regex="true">
+        <allow class="com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMemberInventoryV2.Member" />
+        <allow class="com.nereusstream.storage.object.control.CanonicalControlMetadataStore" />
+        <allow class="com.nereusstream.storage.object.gc.M5GcQuotaCoordinatorV2.BirthResult" />
+        <allow class="com.nereusstream.storage.object.gc.M5ObjectBirthCreditV3" />
+        <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityCoordinatorV1" />
+        <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityRecordsV1.PhysicalDeleteTargetV1" />
+        <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityRecordsV1.ProofBoundWriterClassV1" />
+        <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityRecordsV1.ProofBoundWriterEnrollmentV1" />
+        <allow class="com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityStateMachineV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5BytePreservingMaterializerV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5CellProviderProfileV2" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationKeysV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationObjectSessionV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationObjectSessionV1.Candidate" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationPlannerV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IndexKind" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.GenerationObject" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationPlan" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PayloadKind" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1.ValidatedGeneration" />
+        <allow class="com.nereusstream.storage.object.materialization.M5PendingOutputInventoryV2" />
+        <allow class="com.nereusstream.storage.object.provider.ObjectIdentity" />
+        <allow class="com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport" />
+        <allow class="com.nereusstream.storage.object.retention.M5MaterializationWorkerCoordinatorV1.Admission" />
+        <allow class="com.nereusstream.storage.object.retention.M5MaterializationWorkerCoordinatorV1.Proposal" />
+      </file>
+      <file name="NereusKafkaM6ReadQualification(\.java)?" regex="true">
+        <allow class="org.w3c.dom.Element" />
+        <allow class="javax.xml.XMLConstants" />
+        <allow class="javax.xml.parsers.DocumentBuilderFactory" />
       </file>
       <!-- Only the deterministic native release fixture implements the existing raw Cell CAS contract. -->
       <file name="NereusKafkaNativeInputReleaseTest(\.java)?" regex="true">

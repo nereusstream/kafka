@@ -1123,6 +1123,7 @@ project(':core') {
       filter {
         excludeTestsMatching 'kafka.server.nereus.KafkaBookKeeperAckRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaObjectProviderAdmissionRealTest'
+        excludeTestsMatching 'kafka.server.nereus.KafkaBookKeeperObjectMaterializationRealTest'
         excludeTestsMatching 'kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest'
         excludeTestsMatching 'kafka.server.nsip.KafkaBookKeeperProcessRealTest'
       }
@@ -1172,6 +1173,23 @@ project(':core') {
       classpath = sourceSets.test.runtimeClasspath
       destinationDirectory = layout.buildDirectory.dir('classes/nereusM5SourceFenceFixtures')
       options.release = 17
+    }
+    tasks.register('nereusBookKeeperObjectMaterializationRealTest', Test) {
+      group = 'verification'
+      description = 'Materializes a real native Kafka sealed BK cut using the qualified MinIO/Oxia route.'
+      testClassesDirs = sourceSets.test.output.classesDirs
+      classpath = sourceSets.test.runtimeClasspath + files(sourceFenceFixtures.flatMap { it.destinationDirectory })
+      useJUnitPlatform()
+      filter { includeTestsMatching 'kafka.server.nereus.KafkaBookKeeperObjectMaterializationRealTest' }
+      dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain', sourceFenceFixtures
+      outputs.upToDateWhen { false }
+      doFirst {
+        systemProperty 'nereus.nsip.bkUri', providers.gradleProperty('v2M2BookKeeperMetadataServiceUri').get()
+        systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+        systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
+        systemProperty 'nereus.nsip.m4RunSummary', providers.gradleProperty('v2M5KafkaRunSourceSummary').get()
+        systemProperty 'nereus.nsip.m4SourceRoot', providers.gradleProperty('v2M5KafkaRunSourceRoot').get()
+      }
     }
     tasks.register('nereusBookKeeperM4AdmissionRealTest', Test) {
       group = 'verification'

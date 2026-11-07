@@ -26,17 +26,24 @@ import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.domain.protocol.KafkaProtocolCellIdentity;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaCellProviderScopeRegistryV2;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaQuotaTargetDeleteStoreV2;
 import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
 import com.nereusstream.storage.object.provider.C1ObjectProviderSession;
+import com.nereusstream.storage.object.provider.C1ObjectProviderSession.VerifiedObjectConsumption;
+import com.nereusstream.storage.object.provider.C1ObjectProviderSession.VerifiedReadCleanupException;
+import com.nereusstream.storage.object.provider.ObjectIdentity;
 import com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport;
 import com.nereusstream.storage.object.s3.S3M5PhysicalNamespaceAuthorityV2;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.ArrayDeque;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
@@ -57,12 +64,16 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
     private final OxiaCellProviderScopeRegistryV2.Admission admission;
     private final S3C1ObjectProviderTransport transport;
     private final C1ObjectProviderSession session;
+    private final OxiaQuotaTargetDeleteStoreV2 physicalQuota;
+    private final ArrayDeque<VerifiedReadCleanupException> readCleanup = new ArrayDeque<>();
 
     private NereusKafkaObjectProvider(OxiaCellProviderScopeRegistryV2.Admission admission,
-            S3C1ObjectProviderTransport transport, C1ObjectProviderSession session) {
+            S3C1ObjectProviderTransport transport, C1ObjectProviderSession session,
+            OxiaQuotaTargetDeleteStoreV2 physicalQuota) {
         this.admission = admission;
         this.transport = transport;
         this.session = session;
+        this.physicalQuota = physicalQuota;
     }
 
     static M5CellProviderProfileV2 profile(KafkaConfig config, KafkaProtocolCellIdentity cell) throws IOException {
@@ -104,6 +115,9 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
             var admission = namespace.openCellProviderScopes(physical)
                     .thenCompose(registry -> registry.reopen(profile)).toCompletableFuture()
                     .get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            var physicalQuota = namespace.openAuthorityRoute(physical)
+                    .thenCompose(route -> route.quota().snapshot().thenApply(ignored -> route))
+                    .toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
             var transport = S3C1ObjectProviderTransport.admitVersionMatchDeleteV1(
                     client, bucket, expected.serviceIdentity().value(), true, profile.maximumListPageKeys(),
                     profile.references().allowedEncryptionScope());
@@ -115,7 +129,7 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
             }
             var session = new C1ObjectProviderSession(transport, profile.scopeId(), profile.exclusiveNamespacePrefix(),
                     profile.maximumObjectBytes(), Math.min(profile.maximumRangeBytes(), 65_536));
-            return new NereusKafkaObjectProvider(admission, transport, session);
+            return new NereusKafkaObjectProvider(admission, transport, session, physicalQuota);
         } catch (Exception | Error failure) {
             try {
                 client.close();
@@ -166,6 +180,28 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
         return session;
     }
 
+    VerifiedObjectConsumption<CanonicalBytes> readVersion(ObjectIdentity identity, CanonicalBytes version)
+            throws IOException {
+        int length = Math.toIntExact(identity.bodyLength());
+        try {
+            return session.consumeVerifiedObject(identity, Optional.of(version),
+                    input -> CanonicalBytes.copyOf(input.readNBytes(length)));
+        } catch (VerifiedReadCleanupException failure) {
+            synchronized (this) {
+                readCleanup.addLast(failure);
+            }
+            throw failure;
+        }
+    }
+
+    M5CellProviderProfileV2 profile() {
+        return admission.profile();
+    }
+
+    OxiaQuotaTargetDeleteStoreV2 physicalQuota() {
+        return physicalQuota;
+    }
+
     CompletionStage<Void> requireCurrent() {
         return admission.requireCurrent();
     }
@@ -175,7 +211,16 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
+        session.drain();
+        while (!readCleanup.isEmpty()) {
+            try {
+                readCleanup.getFirst().reconcileCleanup();
+                readCleanup.removeFirst();
+            } catch (IOException failure) {
+                throw new UncheckedIOException("Kafka Object still owns an original GET response", failure);
+            }
+        }
         session.close();
         transport.close();
     }
