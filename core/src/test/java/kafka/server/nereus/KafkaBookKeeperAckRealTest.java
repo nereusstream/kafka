@@ -177,8 +177,8 @@ public class KafkaBookKeeperAckRealTest {
             var client = new Properties();
             client.setProperty("bootstrap.servers", cluster.bootstrapServers());
             try (var admin = Admin.create(client)) {
-                admin.createTopics(List.of(new NewTopic(TOPIC, Map.of(0, List.of(0)))))
-                        .all().get(30, TimeUnit.SECONDS);
+                var topicId = admin.createTopics(List.of(new NewTopic(TOPIC, Map.of(0, List.of(0)))))
+                        .topicId(TOPIC).get(30, TimeUnit.SECONDS);
                 var old = observer.storage.get(30, TimeUnit.SECONDS);
                 assertAckAfterPublication(client, observer, old, "all", 0);
                 var cut = new Cut(1, new CompletableFuture<>(), new CompletableFuture<>(), true);
@@ -199,6 +199,17 @@ public class KafkaBookKeeperAckRealTest {
                 assertEquals(1, after.highWatermark());
                 assertEquals(1, after.readableEndOffset());
                 var partition = new TopicPartition(TOPIC, 0);
+                short fetchVersion = 16;
+                var fetch = FetchRequest.Builder.forConsumer(fetchVersion, 0, 0,
+                                Map.of(partition, new FetchRequest.PartitionData(topicId, 0,
+                                        FetchRequest.INVALID_LOG_START_OFFSET, 1 << 20, Optional.empty())))
+                        .build(fetchVersion);
+                try (var wire = new NativeKafkaRequest(cluster, 0, fetch)) {
+                    var response = (FetchResponse) wire.receive(30_000);
+                    var result = response.responseData(Map.of(topicId, TOPIC), fetchVersion).get(partition);
+                    assertEquals(Errors.KAFKA_STORAGE_ERROR.code(), result.errorCode());
+                    assertEquals(0, FetchResponse.recordsSize(result));
+                }
                 admin.alterPartitionReassignments(Map.of(partition,
                                 Optional.of(new NewPartitionReassignment(List.of(1)))))
                         .all().get(30, TimeUnit.SECONDS);

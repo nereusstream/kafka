@@ -56,6 +56,7 @@ import com.nereusstream.kafka.bookkeeper.protocol.KafkaReadIsolationV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadBatchV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadCursorV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadOutcomeV1;
+import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadResultV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperSequentialReadRequestV1;
 
 import java.io.File;
@@ -271,7 +272,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 return super.appendAsLeader(
                         records, epoch, origin, requestLocal, verificationGuard, transactionVersion);
             if (admission.get() != null) throw new IllegalStateException("nested shared BK append");
-            try (var reserved = duplicate ? null : exact.admit(lengths)) {
+            try (var reserved = duplicate ? null : admitStorage(exact, lengths)) {
                 if (reserved != null) admission.set(reserved);
                 LogAppendInfo result = super.appendAsLeader(
                         records, epoch, origin, requestLocal, verificationGuard, transactionVersion);
@@ -298,6 +299,16 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 admission.remove();
                 physicallyDispatched.remove();
             }
+        }
+    }
+
+    private static KafkaBookKeeperPartitionV1.AdmittedAppend admitStorage(
+            KafkaBookKeeperPartitionV1 exact, List<Integer> lengths) {
+        try {
+            return exact.admit(lengths);
+        } catch (IllegalStateException failure) {
+            // A fenced run (including an unresolved write) or an in-progress rollover cannot admit offsets.
+            throw NereusKafkaExceptionMapper.map(failure);
         }
     }
 
@@ -359,10 +370,15 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                         false,
                         isolation == FetchIsolation.TXN_COMMITTED ? Optional.of(List.of()) : Optional.empty());
             }
-            var result = await(
-                    exact.read(new KafkaBookKeeperSequentialReadRequestV1(
-                            offset, mode, Math.min(maximumBytes, hardMaxFetchBytes), cursor)),
-                    fetchTimeout);
+            KafkaBookKeeperReadResultV1 result;
+            try {
+                result = await(
+                        exact.read(new KafkaBookKeeperSequentialReadRequestV1(
+                                offset, mode, Math.min(maximumBytes, hardMaxFetchBytes), cursor)),
+                        fetchTimeout);
+            } catch (IllegalStateException failure) {
+                throw NereusKafkaExceptionMapper.map(failure);
+            }
             if (result.outcome() != KafkaBookKeeperReadOutcomeV1.FOUND) {
                 if (result.outcome() == KafkaBookKeeperReadOutcomeV1.END_OF_SNAPSHOT) {
                     return new FetchDataInfo(new LogOffsetMetadata(offset), MemoryRecords.EMPTY);
