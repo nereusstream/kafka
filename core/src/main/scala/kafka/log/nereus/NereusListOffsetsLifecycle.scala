@@ -23,10 +23,12 @@ import kafka.server.storage.BrokerStorageRuntimeContext
 import org.apache.kafka.common.TopicIdPartition
 import org.apache.kafka.common.errors.{FencedLeaderEpochException, KafkaStorageException}
 import org.apache.kafka.common.metadata.TopicBindingAggregateRecord
+import org.apache.kafka.image.{MetadataDelta, MetadataImage}
 
 import java.time.Duration
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 
 /** One exact native recovery slot. Stale completions close only their own connections and never install readiness. */
 final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, provider: NereusKafkaOwnedProviderRuntime)
@@ -41,7 +43,7 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
     val attempt = guard.synchronized {
       if (closed) return CompletableFuture.failedFuture(new KafkaStorageException("Nereus lifecycle is draining"))
       slots.get(identity).foreach { previous =>
-        if (previous.epoch == leaderEpoch && previous.brokerEpoch == brokerEpoch && (previous.partition eq partition)) {
+        if (previous.live && previous.epoch == leaderEpoch && previous.brokerEpoch == brokerEpoch && (previous.partition eq partition)) {
           return previous.result.copy()
         }
         if (leaderEpoch <= previous.epoch) return CompletableFuture.failedFuture(new FencedLeaderEpochException("stale Nereus leader recovery"))
@@ -100,9 +102,50 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
     attempt.result.copy()
   }
 
-  private def current(slot: Slot): Boolean = {
-    if (closed || !slot.live) return false
-    val image = context.metadataCache.getImage
+  def publishMetadataImage(delta: MetadataDelta, newImage: MetadataImage, publish: () => Unit): Unit = {
+    val brokerId = context.config.brokerId
+    val brokerChanged = Option(delta.clusterDelta()).exists(_.changedBrokers().containsKey(brokerId))
+    val topics = Option(delta.topicsDelta())
+    if (!brokerChanged && topics.isEmpty) {
+      publish()
+      return
+    }
+
+    guard.synchronized {
+      def fenceIfReplaced(slot: Slot): Unit = {
+        if (slot.live && !matchesAssignment(slot, newImage)) {
+          // This fences the same ordered pipeline that publishes a durable callback,
+          // without waiting for ReplicaManager's partition lock or closing any resources.
+          slot.opened.foreach(_.fence())
+          slot.live = false
+        }
+      }
+
+      if (brokerChanged) {
+        slots.valuesIterator.foreach(fenceIfReplaced)
+      } else {
+        topics.foreach { changes =>
+          changes.changedTopics().asScala.valuesIterator.foreach { topic =>
+            topic.partitionChanges().asScala.keysIterator.foreach { partition =>
+              slots.get(new TopicIdPartition(topic.id(), partition, topic.name())).foreach(fenceIfReplaced)
+            }
+          }
+          changes.deletedTopicIds().asScala.foreach { id =>
+            val previous = changes.image().getTopic(id)
+            previous.partitions().asScala.keysIterator.foreach { partition =>
+              slots.get(new TopicIdPartition(id, partition, previous.name())).foreach(fenceIfReplaced)
+            }
+          }
+        }
+      }
+      publish()
+    }
+  }
+
+  private def current(slot: Slot): Boolean =
+    !closed && slot.live && matchesAssignment(slot, context.metadataCache.getImage)
+
+  private def matchesAssignment(slot: Slot, image: MetadataImage): Boolean = {
     val topic = image.topics().getTopic(slot.identity.topicId())
     val registration = image.cluster().broker(context.config.brokerId)
     val assignment = if (topic == null) null else topic.partitions().get(slot.identity.partition())

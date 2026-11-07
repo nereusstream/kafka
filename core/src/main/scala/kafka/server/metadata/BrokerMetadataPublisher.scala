@@ -130,8 +130,12 @@ class BrokerMetadataPublisher(
         trace(s"Publishing delta $delta with highest offset $highestOffsetAndEpoch")
       }
 
-      // Publish the new metadata image to the metadata cache.
-      metadataCache.setImage(newImage)
+      // The stock partition update can wait for a pending append's read lock. Fence the
+      // affected storage publications before exposing a newer Owner in the metadata cache.
+      asyncTopicDeltaLifecycle match {
+        case Some(lifecycle) => lifecycle.publishMetadataImage(delta, newImage, () => metadataCache.setImage(newImage))
+        case None => metadataCache.setImage(newImage)
+      }
 
       def metadataVersionLogMsg = s"metadata.version ${newImage.features().metadataVersion()}"
 

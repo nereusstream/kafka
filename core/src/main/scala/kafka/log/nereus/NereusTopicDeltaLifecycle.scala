@@ -23,7 +23,7 @@ import kafka.server.metadata.AsyncTopicDeltaLifecycle
 import org.apache.kafka.common.{TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.common.errors.KafkaStorageException
 import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1
-import org.apache.kafka.image.{MetadataImage, TopicsDelta}
+import org.apache.kafka.image.{MetadataDelta, MetadataImage, TopicsDelta}
 
 import java.time.Duration
 import java.util.Objects
@@ -58,6 +58,9 @@ final class NereusTopicDeltaLifecycle(
     throw new IllegalArgumentException("Kafka cluster ID must be nonblank and broker ID must be non-negative")
   }
   requirePositive(operationTimeout)
+
+  override def publishMetadataImage(delta: MetadataDelta, newImage: MetadataImage, publish: () => Unit): Unit =
+    partitionLifecycle.publishMetadataImage(delta, newImage, publish)
 
   override def onLeaderStatePublished(partition: Partition, topicId: Uuid, leaderEpoch: Int): Unit = {
     Objects.requireNonNull(partition, "partition")

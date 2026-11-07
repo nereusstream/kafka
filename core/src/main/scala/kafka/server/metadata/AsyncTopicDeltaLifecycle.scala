@@ -19,7 +19,7 @@ package kafka.server.metadata
 
 import kafka.cluster.Partition
 import org.apache.kafka.common.{TopicPartition, Uuid}
-import org.apache.kafka.image.{MetadataImage, TopicsDelta}
+import org.apache.kafka.image.{MetadataDelta, MetadataImage, TopicsDelta}
 
 import java.util.concurrent.CompletableFuture
 
@@ -28,6 +28,9 @@ import java.util.concurrent.CompletableFuture
  * Implementations invoke the callbacks only after the corresponding partition operation is fully ready.
  */
 trait AsyncTopicDeltaLifecycle {
+  /** Fence storage Owners losing authority before publishing the new metadata image. */
+  def publishMetadataImage(delta: MetadataDelta, newImage: MetadataImage, publish: () => Unit): Unit = publish()
+
   /** Called synchronously under ReplicaManager's state-change lock immediately after a new leader epoch is published. */
   def onLeaderStatePublished(partition: Partition, topicId: Uuid, leaderEpoch: Int): Unit
 
