@@ -95,7 +95,8 @@ final class NereusKafkaObjectReplacementV1 {
         var checkpoint = NereusKafkaM5GcInputsV1.fact(nativeScope);
         var result = new ArrayList<KafkaBookKeeperReplacementSemanticsV2.SourceEvidence>();
         for (var extent : selection.sourceCut().sources()) {
-            var raw = roots.readSelectedRootFact(extent.physicalKey()).toCompletableFuture().join().orElseThrow().record();
+            var raw = roots.readSelectedRootCleanupFact(extent.physicalKey()).toCompletableFuture().join()
+                    .orElseThrow(() -> new IllegalStateException("Kafka Object replacement lost its exact source catalog entry")).record();
             if (extent.kind() != SourceKind.BOOKKEEPER_LEDGER || !raw.resource().namespace().equals(selection.bookKeeper())
                     || !extent.ledgerIdentitySha256().orElseThrow().equals(raw.resource().sha256())) {
                 throw new IllegalStateException("Kafka Object replacement names another original BK resource");
