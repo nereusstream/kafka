@@ -112,16 +112,28 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
         var selector = route.readSelector().orElseThrow();
         var timeout = config.lifecycle().recoveryTimeout();
         var current = retirement(owner, selector);
-        if (current == null && selector.mode() == SelectorMode.PREFERRED_WITH_FALLBACK) {
+        if (current == null && selector.admissionState() == AdmissionState.ADMITTING) {
             try {
-                if (!owner.nativeM5GcAdmissionOpen().toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS)) return false;
                 var raw = owner.storage().nativeReadSources();
+                if (selector.selectedViewSha256().equals(raw.selectedViewSha256())
+                        || !owner.nativeM5GcAdmissionOpen().toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS)) return false;
                 var selected = NereusKafkaObjectRecovery.recover(route, raw.activeRoot().partitionId(), selector, provider, timeout);
                 if (selected.isEmpty()) return false;
-                var prefix = selected.orElseThrow().prefix();
-                if (!prefix.rawFallbackEquivalent() || prefix.originalFallbackSources().stream().anyMatch(source ->
-                        source.firstFallbackCapableReadAdmissionEpoch() != selector.readAdmissionEpoch())) return false;
-                current = new NereusKafkaObjectRetirement(selector, selected.orElseThrow());
+                var original = selected.orElseThrow();
+                var prefix = original.prefix();
+                if (!prefix.rawFallbackEquivalent()) return false;
+                if (selector.mode() == SelectorMode.PREFERRED_ONLY) {
+                    var scope = NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata
+                            .recoverObjectScope(owner, Optional.of(selector), selected, true, timeout);
+                    if (scope.isEmpty()) return false;
+                    current = NereusKafkaObjectRetirement.resumePersisted(selector, scope.orElseThrow());
+                } else if (selector.mode() == SelectorMode.PREFERRED_WITH_FALLBACK
+                        && prefix.originalFallbackSources().stream().allMatch(source ->
+                                source.firstFallbackCapableReadAdmissionEpoch() == selector.readAdmissionEpoch())) {
+                    current = new NereusKafkaObjectRetirement(selector, original);
+                } else {
+                    return false;
+                }
                 if (!rememberRetirement(owner, current)) return false;
             } catch (Exception failure) {
                 throw new java.util.concurrent.CompletionException(failure);

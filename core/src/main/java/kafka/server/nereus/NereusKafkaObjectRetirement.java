@@ -18,6 +18,7 @@ package kafka.server.nereus;
 
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperNativeFallbackRetirementV2;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1;
+import com.nereusstream.kafka.bookkeeper.recovery.KafkaBookKeeperClosedHistoryRecoveryV1;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.SelectorMode;
 
@@ -51,6 +52,21 @@ final class NereusKafkaObjectRetirement {
         coveredEnd = verified.prefix().coverage().exclusiveEnd();
     }
 
+    private NereusKafkaObjectRetirement(BindingReadSelector original, long coveredEnd) {
+        this.original = original;
+        this.coveredEnd = coveredEnd;
+        persisted = true;
+    }
+
+    static NereusKafkaObjectRetirement resumePersisted(BindingReadSelector current,
+            KafkaBookKeeperClosedHistoryRecoveryV1.ObjectPrefix recovered) {
+        recovered.scope().requireSelection(recovered.prefix(), current);
+        if (!recovered.prefix().rawFallbackEquivalent()) {
+            throw new IllegalStateException("native Object cleanup needs the exact byte-preserving replacement");
+        }
+        return new NereusKafkaObjectRetirement(current, recovered.scope().prefixEnd());
+    }
+
     boolean sameSelection(BindingReadSelector observed) {
         return observed.binding().equals(original.binding()) && observed.ownerEpoch() == original.ownerEpoch()
                 && observed.selectedViewSha256().equals(original.selectedViewSha256());
@@ -61,7 +77,14 @@ final class NereusKafkaObjectRetirement {
         if (!sameSelection(selector)) throw new IllegalStateException("native Object retirement changed its original manifest");
         if (!observeCompleted() || settled) return;
         var storage = owner.storage();
-        if (actor == null) {
+        if (persisted) {
+            start(owner, () -> reclaim(owner).thenRunAsync(() -> {
+                settled = true;
+                actor = null;
+                released = null;
+                transfer = null;
+            }, control));
+        } else if (actor == null) {
             if (System.nanoTime() - observedAt < sourceGrace.toNanos()) return;
             start(owner, () -> storage.verifySelectedObjectPrefix(original.selectedViewSha256()).thenRunAsync(() -> {
                 var current = owner.nativeM5BindingRoute().readSelector().orElseThrow();
@@ -79,16 +102,9 @@ final class NereusKafkaObjectRetirement {
                     .thenAcceptAsync(result -> released = result, control));
         } else if (transfer == null) {
             if (retainedCheckpointAvailable(storage)) transfer = storage.transferRetiredObjectBookKeeperPrefix(released);
-        } else if (transfer.durableCheckpoint().isPresent() && !persisted) {
+        } else if (transfer.durableCheckpoint().isPresent()) {
             start(owner, () -> NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata
                     .persistObjectScope(owner, provider, transfer, timeout).thenRunAsync(() -> persisted = true, control));
-        } else if (persisted) {
-            start(owner, () -> reclaim(owner).thenRunAsync(() -> {
-                settled = true;
-                actor = null;
-                released = null;
-                transfer = null;
-            }, control));
         }
     }
 

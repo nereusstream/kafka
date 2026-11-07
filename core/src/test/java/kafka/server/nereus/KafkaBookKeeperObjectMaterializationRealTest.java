@@ -115,7 +115,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final String TOPIC = "native-cold";
 
     @ParameterizedTest
-    @ValueSource(strings = {"known", "cold", "hot", "automatic", "stale-registration", "retirement", "background-retirement", "faults", "semantic"})
+    @ValueSource(strings = {"known", "cold", "hot", "automatic", "stale-registration", "retirement",
+        "background-retirement", "cold-retirement", "faults", "semantic"})
     @Timeout(240)
     public void storesAndVerifiesTheRealNativeSealedPrefix(String outcome, @TempDir Path work) throws Exception {
         writeM6Capability(work);
@@ -279,18 +280,22 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean staleRegistration;
         private final boolean retireFallback;
         private final boolean backgroundRetirement;
+        private final boolean coldRetirement;
         private final boolean readFaults;
         private final boolean semantic;
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
         private final CompletableFuture<M5PendingOutputInventoryV2> pendingApplied = new CompletableFuture<>();
         private final CompletableFuture<Void> pendingReadDenied = new CompletableFuture<>();
+        private final CompletableFuture<Void> nativeScopeApplied = new CompletableFuture<>();
         private volatile String pendingBlocked;
         private volatile String blocked;
+        private volatile String scopeBlocked;
 
         private PublicationFault(String outcome) {
             recoverHot = outcome.equals("hot");
             enabled = recoverHot || outcome.equals("cold");
-            backgroundRetirement = outcome.equals("background-retirement");
+            coldRetirement = outcome.equals("cold-retirement");
+            backgroundRetirement = coldRetirement || outcome.equals("background-retirement");
             staleRegistration = outcome.equals("stale-registration");
             automatic = outcome.equals("automatic") || backgroundRetirement || staleRegistration;
             retireFallback = outcome.equals("retirement");
@@ -303,7 +308,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             return (AsyncOxiaClient) Proxy.newProxyInstance(getClass().getClassLoader(),
                     new Class<?>[] {AsyncOxiaClient.class}, (proxy, method, args) -> {
                         String key = args != null && args.length > 0 && args[0] instanceof String value ? value : "";
-                        if (method.getName().equals("get") && key.equals(blocked)) {
+                        if (method.getName().equals("get") && (key.equals(blocked) || key.equals(scopeBlocked))) {
                             return CompletableFuture.failedFuture(new TimeoutException("original selector reread hidden"));
                         }
                         if (method.getName().equals("get") && key.equals(pendingBlocked)) {
@@ -323,8 +328,17 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                                 return CompletableFuture.failedFuture(new TimeoutException("applied Object selector response lost"));
                             }).toCompletableFuture();
                         }
-                        return pendingResponse(key, args, response);
+                        return pendingResponse(key, args, nativeScopeResponse(key, response));
                     });
+        }
+
+        private Object nativeScopeResponse(String key, Object response) {
+            if (!coldRetirement || nativeScopeApplied.isDone() || !key.endsWith("/native-object-read-scope")) return response;
+            return ((CompletionStage<?>) response).thenCompose(applied -> {
+                scopeBlocked = key;
+                nativeScopeApplied.complete(null);
+                return CompletableFuture.failedFuture(new TimeoutException("applied retained checkpoint scope response lost"));
+            }).toCompletableFuture();
         }
 
         private Object pendingResponse(String key, Object[] args, Object response) {
@@ -558,17 +572,22 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                         || !metadata.quota().requireExistingReservation(resource).toCompletableFuture().get(5, TimeUnit.SECONDS).settled()) {
                     return false;
                 }
-                assertEquals(com.nereusstream.storage.bookkeeper.M5BookKeeperDeleteAdapterV1.CaptureOutcome.DEFINITIVELY_ABSENT,
-                        client.captureExactTarget(handle).toCompletableFuture().get(5, TimeUnit.SECONDS).outcome());
             }
             return true;
         }
 
-        void requirePresentBeforeCheckpoint() throws Exception {
+        void requirePhysicallyAbsent() throws Exception {
+            for (var handle : handles) {
+                assertEquals(com.nereusstream.storage.bookkeeper.M5BookKeeperDeleteAdapterV1.CaptureOutcome.DEFINITIVELY_ABSENT,
+                        client.captureExactTarget(handle).toCompletableFuture().get(5, TimeUnit.SECONDS).outcome());
+            }
+        }
+
+        void requirePresent(String message) throws Exception {
             for (var handle : handles) {
                 assertEquals(com.nereusstream.storage.bookkeeper.M5BookKeeperDeleteAdapterV1.CaptureOutcome.EXACT_TARGET,
                         client.captureExactTarget(handle).toCompletableFuture().get(5, TimeUnit.SECONDS).outcome(),
-                        "BK deletion preceded the independent retained checkpoint");
+                        message);
             }
         }
     }
@@ -774,7 +793,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         assertEquals(PayloadKind.KAFKA_BATCH_PRESERVING_V1, selected.validated().generation().payloadKind());
         assertTrue(selected.prefix().coverage().exclusiveEnd() > 0);
         if (fault.backgroundRetirement) {
-            verifyScheduledRetirement(owner, selector, selected.prefix().coverage().exclusiveEnd(), client, produced, fetch, takeover);
+            verifyScheduledRetirement(owner, selector, selected.prefix().coverage().exclusiveEnd(),
+                    client, produced, fetch, takeover, fault);
             return;
         }
         var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
@@ -801,7 +821,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     }
 
     private static void verifyScheduledRetirement(NereusKafkaOwnedProviderRuntime.Opened owner, BindingReadSelector original,
-            long coveredEnd, Properties client, int produced, HeldFetch fetch, ColdTakeover takeover) throws Exception {
+            long coveredEnd, Properties client, int produced, HeldFetch fetch, ColdTakeover takeover, PublicationFault fault) throws Exception {
         var raw = owner.storage().nativeReadSources().sealedRoots().stream().filter(root -> root.kafkaStartOffset() < coveredEnd).toList();
         assertFalse(raw.isEmpty());
         var deletion = ScheduledDeletion.observe(owner, raw);
@@ -811,14 +831,29 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         TestUtils.waitForCondition(() -> owner.storage().nativeReadSources().sealedRoots().stream().noneMatch(raw::contains),
                 30_000, "background retirement did not transfer the drained raw prefix");
         long carrier = owner.storage().nativeReadSources().activeRoot().ledgerIdentity().ledgerId();
-        deletion.requirePresentBeforeCheckpoint();
+        deletion.requirePresent("BK deletion preceded the independent retained checkpoint");
         int end = produceThroughRollover(owner, client, afterRollover);
         fetch.observeRetainedCheckpoint(carrier, raw.stream().map(root -> root.ledgerIdentity().ledgerId()).toList());
-        TestUtils.waitForCondition(deletion::settled,
-                45_000, "background retirement did not settle exact native BK deletion and quota");
         var selected = owner.nativeM5BindingRoute().readSelector().orElseThrow();
         assertEquals(original.selectedViewSha256(), selected.selectedViewSha256());
         var expected = IntStream.range(0, end).mapToObj(offset -> "input-" + offset).toList();
+        if (fault.coldRetirement) {
+            fault.nativeScopeApplied.get(30, TimeUnit.SECONDS);
+            deletion.requirePresent("the previous Owner reclaimed its BK source before resolving its native scope write");
+            fetch.beginColdRecoveryObservation();
+            var recovered = takeover.relocate();
+            verifyColdSelector(selected, recovered, client, expected, fetch);
+            fetch.assertRetainedRecovery();
+            TestUtils.waitForCondition(deletion::settled, 45_000, "the cold Owner did not reclaim the exact already retired BK sources");
+            TestUtils.waitForCondition(() -> {
+                ScheduledDeletion.observe(recovered, raw).requirePhysicallyAbsent();
+                return true;
+            }, 15_000, "cold native retirement did not delete the exact ledgers");
+            return;
+        }
+        TestUtils.waitForCondition(deletion::settled,
+                45_000, "background retirement did not settle exact native BK deletion and quota");
+        deletion.requirePhysicallyAbsent();
         assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, end));
         fetch.beginColdRecoveryObservation();
         verifyColdSelector(selected, takeover.relocate(), client, expected, fetch);
