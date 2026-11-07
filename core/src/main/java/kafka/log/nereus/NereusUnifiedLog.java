@@ -67,10 +67,12 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /** Native validation and producer state over the one shared BK commit and closed-history recovery path. */
@@ -85,7 +87,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private final ThreadLocal<KafkaBookKeeperPartitionV1.AdmittedAppend> admission = new ThreadLocal<>();
     private KafkaBookKeeperPartitionV1 storage;
     // One disposable position per log. The reader checks it against a fresh snapshot on every use.
-    private Optional<KafkaBookKeeperReadCursorV1> nextFetchCursor = Optional.empty();
+    private final AtomicReference<Optional<KafkaBookKeeperReadCursorV1>> nextFetchCursor =
+            new AtomicReference<>(Optional.empty());
     private int publishedEpoch = -1;
     private java.util.function.BooleanSupplier currentOwner = () -> false;
     private long configMetadataOffset = -1;
@@ -202,7 +205,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         synchronized (guard) {
             if (publishedEpoch == epoch && (expected == null || storage == expected)) {
                 storage = null;
-                nextFetchCursor = Optional.empty();
+                nextFetchCursor.set(Optional.empty());
                 publishedEpoch = -1;
                 m5PolicyWriter = null;
             }
@@ -345,18 +348,26 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     }
 
     @Override
-    public LogReadInfo withFetchState(Supplier<LogReadInfo> read) {
+    public LogReadInfo withFetchState(Supplier<CompletionStage<LogReadInfo>> read) {
+        final CompletionStage<LogReadInfo> planned;
         synchronized (guard) {
-            return read.get();
+            planned = read.get();
         }
+        return awaitFetch(planned);
     }
 
     @Override
     public FetchDataInfo read(long offset, int maximumBytes, FetchIsolation isolation, boolean minOneMessage) {
+        return awaitFetch(planFetch(offset, maximumBytes, isolation, minOneMessage));
+    }
+
+    @Override
+    public CompletionStage<FetchDataInfo> planFetch(
+            long offset, int maximumBytes, FetchIsolation isolation, boolean minOneMessage) {
+        long start = System.nanoTime();
         synchronized (guard) {
             var exact = requireStorage(publishedEpoch);
-            var cursor = nextFetchCursor;
-            nextFetchCursor = Optional.empty();
+            var cursor = nextFetchCursor.getAndSet(Optional.empty());
             var mode = readIsolation(isolation);
             var snapshot = exact.capture();
             if (offset < snapshot.root().frontiers().trimStartOffset()
@@ -364,52 +375,66 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                 throw new OffsetOutOfRangeException("shared BK Fetch offset is outside the captured range");
             }
             if (maximumBytes <= 0 || offset >= snapshot.root().readUpperBound(mode)) {
-                return new FetchDataInfo(
+                return CompletableFuture.completedFuture(new FetchDataInfo(
                         new LogOffsetMetadata(offset),
                         MemoryRecords.EMPTY,
                         false,
-                        isolation == FetchIsolation.TXN_COMMITTED ? Optional.of(List.of()) : Optional.empty());
+                        isolation == FetchIsolation.TXN_COMMITTED ? Optional.of(List.of()) : Optional.empty()));
             }
-            KafkaBookKeeperReadResultV1 result;
+            KafkaBookKeeperPartitionV1.PlannedRead planned;
             try {
-                result = await(
-                        exact.read(new KafkaBookKeeperSequentialReadRequestV1(
-                                offset, mode, Math.min(maximumBytes, hardMaxFetchBytes), cursor)),
-                        fetchTimeout);
+                planned = exact.planRead(new KafkaBookKeeperSequentialReadRequestV1(
+                        offset, mode, Math.min(maximumBytes, hardMaxFetchBytes), cursor));
+                var pinned = awaitFetch(planned.pinned());
+                if (!pinned.root().frontiers().equals(snapshot.root().frontiers())
+                        || !pinned.root().fence().equals(snapshot.root().fence())) {
+                    throw new KafkaStorageException("native Fetch pinned a different frontier or Owner");
+                }
             } catch (IllegalStateException failure) {
                 throw NereusKafkaExceptionMapper.map(failure);
             }
-            if (result.outcome() != KafkaBookKeeperReadOutcomeV1.FOUND) {
-                if (result.outcome() == KafkaBookKeeperReadOutcomeV1.END_OF_SNAPSHOT) {
-                    return new FetchDataInfo(new LogOffsetMetadata(offset), MemoryRecords.EMPTY);
-                }
-                throw new KafkaStorageException("shared BK Fetch failed: " + result.outcome());
-            }
-            int bytes = result.batches().stream()
-                    .mapToInt(batch -> batch.rawAssignedRecordBatch().length())
-                    .sum();
-            if (bytes > hardMaxFetchBytes)
-                throw new KafkaStorageException("shared BK Fetch exceeds the hard response cap");
-            if (bytes > maximumBytes && !minOneMessage)
+            long remaining = Math.max(0, fetchTimeout.toNanos() - (System.nanoTime() - start));
+            // Timeout applies only to this observer. The accepted read still owns its source and pin until drain.
+            return planned.result().thenApply(result -> fetchData(result, offset, maximumBytes, isolation, minOneMessage))
+                    .toCompletableFuture().orTimeout(remaining, TimeUnit.NANOSECONDS);
+        }
+    }
+
+    private FetchDataInfo fetchData(KafkaBookKeeperReadResultV1 result, long offset, int maximumBytes,
+            FetchIsolation isolation, boolean minOneMessage) {
+        if (result.outcome() != KafkaBookKeeperReadOutcomeV1.FOUND) {
+            if (result.outcome() == KafkaBookKeeperReadOutcomeV1.END_OF_SNAPSHOT) {
                 return new FetchDataInfo(new LogOffsetMetadata(offset), MemoryRecords.EMPTY);
-            var buffer = ByteBuffer.allocate(bytes);
-            result.batches()
-                    .forEach(batch -> buffer.put(batch.rawAssignedRecordBatch().toByteArray()));
-            buffer.flip();
-            var aborted = isolation == FetchIsolation.TXN_COMMITTED
-                    ? Optional.of(result.abortedTransactions().stream()
-                            .map(transaction ->
-                                    new org.apache.kafka.common.message.FetchResponseData.AbortedTransaction()
-                                            .setProducerId(transaction.producerId())
-                                            .setFirstOffset(transaction.firstOffset()))
-                            .toList())
-                    : Optional.<List<org.apache.kafka.common.message.FetchResponseData.AbortedTransaction>>empty();
-            nextFetchCursor = result.nextCursor();
-            return new FetchDataInfo(
-                    new LogOffsetMetadata(result.batches().get(0).startOffset(), 0, 0),
-                    MemoryRecords.readableRecords(buffer),
-                    false,
-                    aborted);
+            }
+            throw new KafkaStorageException("shared BK Fetch failed: " + result.outcome());
+        }
+        int bytes = result.batches().stream()
+                .mapToInt(batch -> batch.rawAssignedRecordBatch().length())
+                .sum();
+        if (bytes > hardMaxFetchBytes)
+            throw new KafkaStorageException("shared BK Fetch exceeds the hard response cap");
+        if (bytes > maximumBytes && !minOneMessage)
+            return new FetchDataInfo(new LogOffsetMetadata(offset), MemoryRecords.EMPTY);
+        var buffer = ByteBuffer.allocate(bytes);
+        result.batches().forEach(batch -> buffer.put(batch.rawAssignedRecordBatch().toByteArray()));
+        buffer.flip();
+        var aborted = isolation == FetchIsolation.TXN_COMMITTED
+                ? Optional.of(result.abortedTransactions().stream()
+                        .map(transaction -> new org.apache.kafka.common.message.FetchResponseData.AbortedTransaction()
+                                .setProducerId(transaction.producerId()).setFirstOffset(transaction.firstOffset()))
+                        .toList())
+                : Optional.<List<org.apache.kafka.common.message.FetchResponseData.AbortedTransaction>>empty();
+        // Completion runs on the read owner's event loop. A concurrent Fetch may be pinning under the log guard.
+        nextFetchCursor.set(result.nextCursor());
+        return new FetchDataInfo(new LogOffsetMetadata(result.batches().get(0).startOffset(), 0, 0),
+                MemoryRecords.readableRecords(buffer), false, aborted);
+    }
+
+    private <T> T awaitFetch(CompletionStage<T> stage) {
+        try {
+            return await(stage, fetchTimeout);
+        } catch (IllegalStateException failure) {
+            throw NereusKafkaExceptionMapper.map(failure);
         }
     }
 

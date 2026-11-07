@@ -17,6 +17,9 @@
 
 package org.apache.kafka.storage.internals.log;
 
+import org.apache.kafka.server.storage.log.FetchIsolation;
+
+import java.util.concurrent.CompletionStage;
 import java.util.function.Supplier;
 
 /**
@@ -25,8 +28,10 @@ import java.util.function.Supplier;
 public interface BrokerStorageManagedLog {
     LogConfig updateConfigAtMetadataOffset(LogConfig newConfig, long metadataOffset);
 
-    /** Capture Fetch response offsets and read its records from the same published state. */
-    LogReadInfo withFetchState(Supplier<LogReadInfo> read);
+    /** Pin the Fetch plan with its response offsets, then await its reads after releasing the protocol state lock. */
+    LogReadInfo withFetchState(Supplier<CompletionStage<LogReadInfo>> read);
+
+    CompletionStage<FetchDataInfo> planFetch(long offset, int maxBytes, FetchIsolation isolation, boolean minOneMessage);
 
     long deleteRecords(
         int leaderEpoch,

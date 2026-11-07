@@ -18,10 +18,17 @@ package kafka.server.nereus;
 
 import kafka.server.KafkaConfig;
 import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
+import kafka.server.nsip.NativeKafkaRequest;
 
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.FetchRequest;
+import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
@@ -29,7 +36,9 @@ import org.apache.kafka.server.common.MetadataVersion;
 
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
 import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
+import com.nereusstream.kafka.bookkeeper.recovery.KafkaBookKeeperClosedHistoryRecoveryV1.ReadPhase;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
+import com.nereusstream.storage.api.kafka.KafkaRunRootRecordV2;
 import com.nereusstream.storage.object.gc.M5ObjectBirthCreditV3;
 import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
 import com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1;
@@ -51,8 +60,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.IntStream;
 
 import io.oxia.client.api.OxiaClientBuilder;
@@ -67,23 +78,32 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Verified Object output from native sealed BK bytes, before any selector publication. */
 public class KafkaBookKeeperObjectMaterializationRealTest {
+    private static final String TOPIC = "native-cold";
+
     @Test
     @Timeout(240)
     public void storesAndVerifiesTheRealNativeSealedPrefix(@TempDir Path work) throws Exception {
         writeM6Capability(work);
         var ready = new CompletableFuture<NereusKafkaOwnedProviderRuntime.Opened>();
+        var heldFetch = new HeldFetch();
         var bootstrap = BootstrapMetadata.fromVersion(MetadataVersion.latestTesting(), "nsip-object-bytes")
                 .copyWithFeatureRecord("nereus.storage.version", (short) 2);
         var nodes = new TestKitNodes.Builder(bootstrap).setNumBrokerNodes(1).setNumControllerNodes(1).build();
         var observer = new NereusKafkaOwnedProviderRuntime.NativeRunResponseObserver() {
             @Override
             public void afterReady(TopicIdPartition partition, NereusKafkaOwnedProviderRuntime.Opened opened) {
-                if (partition.topic().equals("native-cold")) ready.complete(opened);
+                if (partition.topic().equals(TOPIC)) ready.complete(opened);
             }
 
             @Override
             public void afterRecovery(TopicIdPartition partition, Throwable failure) {
-                if (partition.topic().equals("native-cold") && failure != null) ready.completeExceptionally(failure);
+                if (partition.topic().equals(TOPIC) && failure != null) ready.completeExceptionally(failure);
+            }
+
+            @Override
+            public CompletionStage<Void> afterHistoryReaderClose(
+                    KafkaRunRootRecordV2 record, ReadPhase phase, CompletionStage<Void> response) {
+                return heldFetch.afterClose(phase, response);
             }
         };
         var builder = new KafkaClusterTestKit.Builder(nodes)
@@ -101,9 +121,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             cluster.waitForReadyBrokers();
             var client = new Properties();
             client.put("bootstrap.servers", cluster.bootstrapServers());
+            Uuid topicId;
             try (var admin = Admin.create(client)) {
-                admin.createTopics(List.of(new NewTopic("native-cold", Map.of(0, List.of(0)))))
-                        .all().get(30, TimeUnit.SECONDS);
+                topicId = admin.createTopics(List.of(new NewTopic(TOPIC, Map.of(0, List.of(0)))))
+                        .topicId(TOPIC).get(30, TimeUnit.SECONDS);
             }
             var opened = ready.get(30, TimeUnit.SECONDS);
             int produced = 0;
@@ -112,11 +133,51 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 produced++;
             }
             assertTrue(sealedRuns(opened) >= 2, "native Produce did not seal two real BK sources");
+            assertAppendWhileFetchHeld(cluster, client, topicId, heldFetch, produced);
+            produced++;
             materialize(cluster, opened, work);
             assertEquals(IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList(),
                     KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
             cluster.fatalFaultHandler().maybeRethrowFirstException();
             cluster.nonFatalFaultHandler().maybeRethrowFirstException();
+        }
+    }
+
+    private static void assertAppendWhileFetchHeld(KafkaClusterTestKit cluster, Properties client,
+            Uuid topicId, HeldFetch held, int highWatermark) throws Exception {
+        var partition = new TopicPartition(TOPIC, 0);
+        short version = 16;
+        var fetch = FetchRequest.Builder.forConsumer(version, 0, 0, Map.of(partition,
+                new FetchRequest.PartitionData(topicId, 0, FetchRequest.INVALID_LOG_START_OFFSET, 1, Optional.empty())))
+                .setMaxBytes(1).isolationLevel(IsolationLevel.READ_COMMITTED).build(version);
+        held.armed.set(true);
+        try (var wire = new NativeKafkaRequest(cluster, 0, fetch)) {
+            try {
+                held.awaitingResponse.get(30, TimeUnit.SECONDS);
+                KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + highWatermark, highWatermark);
+            } finally {
+                held.release.complete(null);
+            }
+            var response = (FetchResponse) wire.receive(30_000);
+            var data = response.responseData(Map.of(topicId, TOPIC), version).get(partition);
+            assertEquals(Errors.NONE, Errors.forCode(data.errorCode()));
+            assertEquals(highWatermark, data.highWatermark(), "Fetch replaced its captured HW after Produce");
+            assertEquals(highWatermark, data.lastStableOffset(), "Fetch replaced its captured LSO after Produce");
+            assertEquals(0L, FetchResponse.recordsOrFail(data).batches().iterator().next().baseOffset());
+        }
+    }
+
+    private static final class HeldFetch {
+        private final AtomicBoolean armed = new AtomicBoolean();
+        private final CompletableFuture<Void> awaitingResponse = new CompletableFuture<>();
+        private final CompletableFuture<Void> release = new CompletableFuture<>();
+
+        private CompletionStage<Void> afterClose(ReadPhase phase, CompletionStage<Void> response) {
+            if (phase != ReadPhase.FETCH || !armed.compareAndSet(true, false)) return response;
+            return response.thenCompose(ignored -> {
+                awaitingResponse.complete(null);
+                return release;
+            });
         }
     }
 

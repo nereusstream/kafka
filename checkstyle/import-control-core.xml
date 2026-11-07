@@ -176,6 +176,7 @@
         <allow class="software.amazon.awssdk.services.s3.model.BucketVersioningStatus" />
       </file>
       <file name="(NereusKafkaObjectMaterialization|KafkaBookKeeperObjectMaterializationRealTest)(\.java)?" regex="true">
+        <allow class="com.nereusstream.kafka.bookkeeper.recovery.KafkaBookKeeperClosedHistoryRecoveryV1.ReadPhase" />
         <allow class="com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1" />
         <allow class="com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMemberInventoryV2.Member" />
         <allow class="com.nereusstream.storage.object.control.CanonicalControlMetadataStore" />

@@ -19,7 +19,7 @@ package kafka.cluster
 import java.lang.{Long => JLong}
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.{Objects, Optional}
-import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
+import java.util.concurrent.{CompletableFuture, CompletionStage, ConcurrentHashMap, CopyOnWriteArrayList}
 import java.util.function.Supplier
 import kafka.log._
 import kafka.server._
@@ -1429,23 +1429,26 @@ class Partition(val topicPartition: TopicPartition,
     fetchIsolation: FetchIsolation,
     minOneMessage: Boolean
   ): LogReadInfo = {
-    def read(): LogReadInfo = readRecordsInCurrentState(localLog, lastFetchedEpoch, fetchOffset, currentLeaderEpoch,
-      maxBytes, fetchIsolation, minOneMessage)
     localLog match {
-      case managed: BrokerStorageManagedLog => managed.withFetchState(() => read())
-      case _ => read()
+      case managed: BrokerStorageManagedLog =>
+        managed.withFetchState(() =>
+          readRecordsInCurrentState[CompletionStage[LogReadInfo]](localLog, lastFetchedEpoch, fetchOffset,
+            currentLeaderEpoch)(
+            info => CompletableFuture.completedFuture(info),
+            assemble => managed.planFetch(fetchOffset, maxBytes, fetchIsolation, minOneMessage)
+              .thenApply(data => assemble(data))))
+      case _ =>
+        readRecordsInCurrentState[LogReadInfo](localLog, lastFetchedEpoch, fetchOffset, currentLeaderEpoch)(
+          info => info, assemble => assemble(localLog.read(fetchOffset, maxBytes, fetchIsolation, minOneMessage)))
     }
   }
 
-  private def readRecordsInCurrentState(
+  private def readRecordsInCurrentState[T](
     localLog: UnifiedLog,
     lastFetchedEpoch: Optional[Integer],
     fetchOffset: Long,
-    currentLeaderEpoch: Optional[Integer],
-    maxBytes: Int,
-    fetchIsolation: FetchIsolation,
-    minOneMessage: Boolean
-  ): LogReadInfo = {
+    currentLeaderEpoch: Optional[Integer]
+  )(divergence: LogReadInfo => T, readData: (FetchDataInfo => LogReadInfo) => T): T = {
     if (leaderEpochAwareOffsetLookupPending.contains(leaderEpoch)) {
       throw new OffsetNotAvailableException(
         s"Nereus Fetch for partition $topicPartition at leader epoch $leaderEpoch is still recovering")
@@ -1480,31 +1483,24 @@ class Partition(val topicPartition: TopicPartition,
           .setEpoch(epochEndOffset.leaderEpoch)
           .setEndOffset(epochEndOffset.endOffset)
 
-        return new LogReadInfo(
+        return divergence(new LogReadInfo(
           FetchDataInfo.empty(fetchOffset),
           Optional.of(divergingEpoch),
           initialHighWatermark,
           initialLogStartOffset,
           initialLogEndOffset,
-          initialLastStableOffset)
+          initialLastStableOffset))
       }
     }
 
-    val fetchedData = localLog.read(
-      fetchOffset,
-      maxBytes,
-      fetchIsolation,
-      minOneMessage
-    )
-
-    new LogReadInfo(
+    readData(fetchedData => new LogReadInfo(
       fetchedData,
       Optional.empty(),
       initialHighWatermark,
       initialLogStartOffset,
       initialLogEndOffset,
       initialLastStableOffset
-    )
+    ))
   }
 
   def fetchOffsetForTimestamp(timestamp: Long,
