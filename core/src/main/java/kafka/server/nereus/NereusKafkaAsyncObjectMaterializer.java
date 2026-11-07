@@ -131,8 +131,9 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
         // Never create a new task for this Binding while such an original reservation still needs reconciliation.
         if (materialization.orElseThrow().reservations().stream()
                 .anyMatch(item -> tasks.readPlan(item.taskIdSha256()).isPresent())) return Optional.empty();
+        boolean semantic = owner.nativeM5InputCut().policy().config().compact;
         return Optional.of(Candidate.admitted(raw.activeRoot().providerScopeId(), selector.binding(),
-                config.retentionCompaction(), cell.orElseThrow().caps(), materialization.orElseThrow().caps()));
+                config.retentionCompaction(), cell.orElseThrow().caps(), materialization.orElseThrow().caps(), semantic));
     }
 
     synchronized void beginDrain() {
@@ -159,7 +160,8 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
             CellCaps cell, NereusKafkaNativeInputV2.CaptureAllowance allowance) {
         private static Candidate admitted(com.nereusstream.storage.api.bookkeeper.CellProviderScopeId providerScope,
                 com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingIdentity binding,
-                NereusKafkaStorageConfig.RetentionCompaction config, CellCaps cell, M5MaterializationAdmissionV1.Caps output) {
+                NereusKafkaStorageConfig.RetentionCompaction config, CellCaps cell, M5MaterializationAdmissionV1.Caps output,
+                boolean semantic) {
             long bytes = Math.min(Math.min(config.compactionTaskMaxSourceBytes(), cell.maximumDirtyBytes()),
                     Math.min(output.maximumSourceBytes(), 128 * MIB));
             int batches = (int) Math.min(cell.maximumInputBatches(), KafkaCompactionRecordsV1.MAX_BATCHES);
@@ -167,9 +169,13 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
                     KafkaCompactionRecordsV1.MAX_RECORDS);
             long decoded = Math.min(config.compactionDecodeMaxUncompressedBytes(), 256 * MIB);
             var bounds = new KafkaBookKeeperRunSourceV2.Bounds(131072, batches, records, 256 * MIB, bytes, decoded);
-            // Byte-preserving output creates no key history, tombstone or transaction planning tables.
-            var plan = new KafkaCompactionRecordsV1.Caps(bytes, batches, records, 1, 1,
-                    cell.maximumOutputBytes(), cell.maximumIndexBytes(), 1, 1);
+            // Reserve only the actual cleaner envelope for compact topics.
+            int keys = semantic ? (int) Math.min(records, cell.maximumDistinctKeys()) : 1;
+            long keyBytes = semantic ? Math.min(decoded, cell.maximumKeyBytes()) : 1;
+            int transactions = semantic ? (int) Math.min(records, cell.maximumTransactions()) : 1;
+            int tombstones = semantic ? (int) Math.min(records, cell.maximumTombstones()) : 1;
+            var plan = new KafkaCompactionRecordsV1.Caps(bytes, batches, records, keys, keyBytes,
+                    cell.maximumOutputBytes(), cell.maximumIndexBytes(), transactions, tombstones);
             var allowance = new NereusKafkaNativeInputV2.CaptureAllowance(plan, 0, 0,
                     cell.maximumProviderOperations(), 0, cell.maximumMetadataOperations(), cell.maximumResponseUnknowns());
             var share = KafkaBookKeeperReadCellBudgetV2.Usage.forRunSource(bounds);
