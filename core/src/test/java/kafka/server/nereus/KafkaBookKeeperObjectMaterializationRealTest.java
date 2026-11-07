@@ -32,7 +32,6 @@ import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
-import org.apache.kafka.metadata.BrokerState;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
 import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.test.TestUtils;
@@ -950,7 +949,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                             .anyMatch(GraceShutdown::awaitingGrace),
                     30_000, "native GC did not persist its mark and schedule its grace task");
             broker.shutdown();
-            assertEquals(BrokerState.NOT_RUNNING, broker.brokerState());
+            broker.awaitShutdown();
         }
 
         private static boolean awaitingGrace(Runnable task) {
