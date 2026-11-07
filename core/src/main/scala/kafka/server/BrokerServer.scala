@@ -827,6 +827,16 @@ class BrokerServer(
       val deadline = time.milliseconds() + timeout.toMillis
       info("shutting down")
 
+      // Nereus inject start: drain native maintenance fences before the Controller can assign a successor
+      if (brokerStorageRuntime != null) {
+        val drainTimeout = remainingBrokerStorageDrainTimeout(deadline)
+        CoreUtils.swallow(
+          brokerStorageRuntime.beginDrain(brokerStorageDrainReason).toCompletableFuture.
+            get(drainTimeout.toMillis, TimeUnit.MILLISECONDS),
+          this)
+      }
+      // Nereus inject end: drain native maintenance fences before the Controller can assign a successor
+
       if (config.controlledShutdownEnable) {
         if (replicaManager != null)
           replicaManager.beginControlledShutdown()
@@ -852,15 +862,6 @@ class BrokerServer(
       if (socketServer != null) {
         CoreUtils.swallow(socketServer.stopProcessingRequests(), this)
       }
-      // Nereus inject start: close storage admission before publishers and request handlers drain
-      if (brokerStorageRuntime != null) {
-        val drainTimeout = remainingBrokerStorageDrainTimeout(deadline)
-        CoreUtils.swallow(
-          brokerStorageRuntime.beginDrain(brokerStorageDrainReason).toCompletableFuture.
-            get(drainTimeout.toMillis, TimeUnit.MILLISECONDS),
-          this)
-      }
-      // Nereus inject end: close storage admission before publishers and request handlers drain
       metadataPublishers.forEach(p => sharedServer.loader.removeAndClosePublisher(p).get())
       metadataPublishers.clear()
       if (dataPlaneRequestHandlerPool != null)

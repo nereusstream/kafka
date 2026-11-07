@@ -900,7 +900,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         long carrier = owner.storage().nativeReadSources().activeRoot().ledgerIdentity().ledgerId();
         deletion.requirePresent("BK deletion preceded the independent retained checkpoint");
         if (fault.shutdownRetirement) {
-            GraceShutdown.verify(probe.cluster(), deletion, () -> produceThroughRollover(owner, client, afterRollover));
+            GraceShutdown.verify(probe.cluster(), deletion, client, () -> produceThroughRollover(owner, client, afterRollover));
             return;
         }
         int end = produceThroughRollover(owner, client, afterRollover);
@@ -939,17 +939,22 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             int appendThroughSeal() throws Exception;
         }
 
-        static void verify(KafkaClusterTestKit cluster, ScheduledDeletion deletion, Rollover rollover) throws Exception {
+        static void verify(KafkaClusterTestKit cluster, ScheduledDeletion deletion, Properties client, Rollover rollover) throws Exception {
             var broker = cluster.brokers().get(0);
             var scheduler = (ScheduledThreadPoolExecutor) broker.kafkaScheduler().scheduledExecutorService();
             var existing = Set.copyOf(scheduler.getQueue());
-            rollover.appendThroughSeal();
+            int end = rollover.appendThroughSeal();
             TestUtils.waitForCondition(() -> deletion.graceMarked() && scheduler.getQueue().stream()
                             .filter(task -> !existing.contains(task))
                             .anyMatch(GraceShutdown::awaitingGrace),
                     30_000, "native GC did not persist its mark and schedule its grace task");
             broker.shutdown();
             broker.awaitShutdown();
+            try (var admin = Admin.create(client)) {
+                assertEquals(1, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 0));
+            }
+            var expected = IntStream.range(0, end).mapToObj(offset -> "input-" + offset).toList();
+            assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, end));
         }
 
         private static boolean awaitingGrace(Runnable task) {

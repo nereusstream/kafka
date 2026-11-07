@@ -1620,6 +1620,10 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         if (asyncObject != null && !asyncObjectReleased) asyncObject.beginDrain();
     }
 
+    public CompletableFuture<Void> drainNativeSourceScans() {
+        return Opened.stopNativeM5SourceScans(List.copyOf(owned));
+    }
+
     private void installRecoveredReadOwner(Opened opened, Optional<BindingReadSelector> predecessorSelector,
             Optional<KafkaBookKeeperClosedHistoryRecoveryV1.SelectedPrefix> selected,
             Optional<NereusKafkaObjectRecovery.Selected> recoveredObject) {
@@ -1669,7 +1673,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         fence();
         // Kafka has stopped its scheduler. Close native scans to cancel their pending grace waits
         // while accepted operations can still close their provider clients on openings.
-        var scans = Opened.stopNativeM5SourceScans(List.copyOf(owned));
+        var scans = drainNativeSourceScans();
         drainObjectReads();
         scans.get(context.config().nereusKafkaStorageConfig().rollout().shutdownDrainTimeout().toMillis(), TimeUnit.MILLISECONDS);
         if (objectMaterializer != null) objectMaterializer.close();

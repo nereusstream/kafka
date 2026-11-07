@@ -55,7 +55,7 @@ final class NereusBrokerStorageRuntime(context: BrokerStorageRuntimeContext, pro
   override def beginDrain(reason: BrokerStorageDrainReason): CompletionStage[Void] = {
     guard.synchronized { closed = true }
     partitions.beginDrain(); provider.fence(); append.close(); fetch.close()
-    CompletableFuture.completedFuture(null)
+    provider.drainNativeSourceScans()
   }
   override def awaitDrained(timeout: Duration): CompletionStage[Void] =
     CompletableFuture.allOf(append.drained.toCompletableFuture, fetch.drained.toCompletableFuture).orTimeout(timeout.toMillis, TimeUnit.MILLISECONDS)
