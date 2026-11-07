@@ -43,6 +43,7 @@ import org.apache.kafka.common.requests.ProduceRequest;
 import org.apache.kafka.common.requests.ProduceResponse;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
+import org.apache.kafka.test.TestUtils;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -52,6 +53,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -189,11 +191,19 @@ final class KafkaObjectCompactionRealScenario {
         private static void seed(KafkaClusterTestKit cluster, long timestamp) throws Exception {
             var request = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
                     .setTransactionalId(null).setTransactionTimeoutMs(30_000)).build((short) 4);
-            try (var wire = new NativeKafkaRequest(cluster, 0, request)) {
-                var producer = ((InitProducerIdResponse) wire.receive(30_000)).data();
-                assertEquals(Errors.NONE, Errors.forCode(producer.errorCode()));
-                append(cluster, 0, 0, records(producer.producerId(), producer.producerEpoch(), timestamp));
-            }
+            var initialized = new AtomicReference<InitProducerIdResponse>();
+            // The stock RPC allocator returns this retriable response until its first Controller ID block arrives.
+            TestUtils.waitForCondition(() -> {
+                try (var wire = new NativeKafkaRequest(cluster, 0, request)) {
+                    var result = (InitProducerIdResponse) wire.receive(30_000);
+                    if (Errors.forCode(result.data().errorCode()) == Errors.COORDINATOR_LOAD_IN_PROGRESS) return false;
+                    initialized.set(result);
+                    return true;
+                }
+            }, 30_000, "the native Producer ID allocator did not load its Controller block");
+            var producer = initialized.get().data();
+            assertEquals(Errors.NONE, Errors.forCode(producer.errorCode()));
+            append(cluster, 0, 0, records(producer.producerId(), producer.producerEpoch(), timestamp));
         }
 
         private static void verifyReplay(KafkaClusterTestKit cluster, int broker, RecordBatch compacted) throws Exception {
