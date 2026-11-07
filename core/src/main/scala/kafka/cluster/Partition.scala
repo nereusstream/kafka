@@ -1429,6 +1429,23 @@ class Partition(val topicPartition: TopicPartition,
     fetchIsolation: FetchIsolation,
     minOneMessage: Boolean
   ): LogReadInfo = {
+    def read(): LogReadInfo = readRecordsInCurrentState(localLog, lastFetchedEpoch, fetchOffset, currentLeaderEpoch,
+      maxBytes, fetchIsolation, minOneMessage)
+    localLog match {
+      case managed: BrokerStorageManagedLog => managed.withFetchState(() => read())
+      case _ => read()
+    }
+  }
+
+  private def readRecordsInCurrentState(
+    localLog: UnifiedLog,
+    lastFetchedEpoch: Optional[Integer],
+    fetchOffset: Long,
+    currentLeaderEpoch: Optional[Integer],
+    maxBytes: Int,
+    fetchIsolation: FetchIsolation,
+    minOneMessage: Boolean
+  ): LogReadInfo = {
     if (leaderEpochAwareOffsetLookupPending.contains(leaderEpoch)) {
       throw new OffsetNotAvailableException(
         s"Nereus Fetch for partition $topicPartition at leader epoch $leaderEpoch is still recovering")

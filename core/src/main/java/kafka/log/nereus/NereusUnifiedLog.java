@@ -37,6 +37,7 @@ import org.apache.kafka.storage.internals.log.LogConfig;
 import org.apache.kafka.storage.internals.log.LogDirFailureChannel;
 import org.apache.kafka.storage.internals.log.LogOffsetMetadata;
 import org.apache.kafka.storage.internals.log.LogOffsetsListener;
+import org.apache.kafka.storage.internals.log.LogReadInfo;
 import org.apache.kafka.storage.internals.log.LogSegments;
 import org.apache.kafka.storage.internals.log.OffsetResultHolder;
 import org.apache.kafka.storage.internals.log.PartitionLeaderAuthority;
@@ -68,6 +69,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Supplier;
 
 /** Native validation and producer state over the one shared BK commit and closed-history recovery path. */
 public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAwareAppend, BrokerStorageManagedLog {
@@ -325,6 +327,13 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             case HIGH_WATERMARK -> KafkaReadIsolationV1.READ_UNCOMMITTED;
             case TXN_COMMITTED -> KafkaReadIsolationV1.READ_COMMITTED;
         };
+    }
+
+    @Override
+    public LogReadInfo withFetchState(Supplier<LogReadInfo> read) {
+        synchronized (guard) {
+            return read.get();
+        }
     }
 
     @Override

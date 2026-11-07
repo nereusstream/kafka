@@ -17,11 +17,16 @@
 
 package org.apache.kafka.storage.internals.log;
 
+import java.util.function.Supplier;
+
 /**
- * Stock-package boundary for a log whose config history and durable log-start mutation are owned by alternate storage.
+ * Stock-package boundary for a log whose protocol state and durable log-start mutation are owned by alternate storage.
  */
 public interface BrokerStorageManagedLog {
     LogConfig updateConfigAtMetadataOffset(LogConfig newConfig, long metadataOffset);
+
+    /** Capture Fetch response offsets and read its records from the same published state. */
+    LogReadInfo withFetchState(Supplier<LogReadInfo> read);
 
     long deleteRecords(
         int leaderEpoch,
