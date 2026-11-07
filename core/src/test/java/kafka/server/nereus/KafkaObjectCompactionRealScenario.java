@@ -108,6 +108,24 @@ final class KafkaObjectCompactionRealScenario {
                 value == null ? null : value.getBytes(StandardCharsets.UTF_8));
     }
 
+    static void appendReplacement(KafkaClusterTestKit cluster, long offset) throws Exception {
+        append(cluster, offset, row(System.currentTimeMillis(), "replace", "new-successor"));
+    }
+
+    static void verifyReplacement(KafkaClusterTestKit cluster, Uuid topic, int broker, long latest) throws Exception {
+        var fromOld = fetch(cluster, topic, broker, 3);
+        assertEquals(Errors.NONE, Errors.forCode(fromOld.errorCode()));
+        var offsets = new ArrayList<Long>();
+        FetchResponse.recordsOrFail(fromOld).records().forEach(record -> offsets.add(record.offset()));
+        assertTrue(offsets.contains(4L), "the successor discarded an unrelated record in the same batch");
+        assertTrue(!offsets.contains(3L), "the successor exposed the old value for a superseded key");
+        var fromLatest = fetch(cluster, topic, broker, latest);
+        assertEquals(Errors.NONE, Errors.forCode(fromLatest.errorCode()));
+        var record = FetchResponse.recordsOrFail(fromLatest).records().iterator().next();
+        assertEquals(latest, record.offset());
+        assertEquals("new-successor", StandardCharsets.UTF_8.decode(record.value()).toString());
+    }
+
     private static void append(KafkaClusterTestKit cluster, long offset, SimpleRecord... rows) throws Exception {
         append(cluster, 0, offset, MemoryRecords.withRecords(Compression.NONE, rows));
     }
@@ -128,6 +146,11 @@ final class KafkaObjectCompactionRealScenario {
     }
 
     static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client) throws Exception {
+        verify(cluster, topic, broker, end, client, -1);
+    }
+
+    static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client, long replacement)
+            throws Exception {
         // The provider can finish before the Controller acknowledges RECOVERED. The official Admin client
         // retries the broker's recovery response; the wire Fetches below then inspect the exact ready owner.
         try (var admin = Admin.create(client)) {
@@ -156,10 +179,11 @@ final class KafkaObjectCompactionRealScenario {
         assertNull(tombstone.value(), "compaction discarded or rewrote the latest tombstone");
         assertTrue(tombstoneBatch.deleteHorizonMs().orElseThrow() > tombstone.timestamp());
 
-        verifyTransactions(cluster, topic, broker, end, client);
+        verifyTransactions(cluster, topic, broker, end, client, replacement);
     }
 
-    private static void verifyTransactions(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client)
+    private static void verifyTransactions(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client,
+            long replacement)
             throws Exception {
         verifyMarker(cluster, topic, broker, 8, ControlRecordType.COMMIT);
         verifyMarker(cluster, topic, broker, 10, ControlRecordType.ABORT);
@@ -173,7 +197,9 @@ final class KafkaObjectCompactionRealScenario {
         assertEquals(data.producerId(), aborted.abortedTransactions().get(0).producerId());
 
         var visible = new ArrayList<>(Arrays.asList("middle", "new-three", "new-four", null, "committed-seven"));
-        for (int offset = SEALED_TRANSACTION_END; offset < end; offset++) visible.add("input-" + offset);
+        if (replacement >= 0) visible.remove("new-three");
+        for (int offset = SEALED_TRANSACTION_END; offset < end; offset++)
+            visible.add(offset == replacement ? "new-successor" : "input-" + offset);
         assertEquals(visible, KafkaBookKeeperOwnerRelocationRealTest.consume(client, visible.size()));
     }
 

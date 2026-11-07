@@ -32,6 +32,7 @@ import java.util.function.Supplier;
 final class NereusKafkaObjectRetirement {
     private final BindingReadSelector original;
     private final long coveredEnd;
+    private final boolean reclaimBookKeeper;
     private final long observedAt = System.nanoTime();
     private KafkaBookKeeperNativeFallbackRetirementV2 actor;
     private boolean admissionClosed;
@@ -42,7 +43,7 @@ final class NereusKafkaObjectRetirement {
     private volatile CompletableFuture<Void> pending;
 
     NereusKafkaObjectRetirement(BindingReadSelector original, NereusKafkaObjectRecovery.Selected verified) {
-        if (original.mode() != SelectorMode.PREFERRED_WITH_FALLBACK || !verified.prefix().rawFallbackEquivalent()
+        if (original.mode() != SelectorMode.PREFERRED_WITH_FALLBACK
                 || !original.selectedViewSha256().equals(verified.prefix().manifestSha256())
                 || verified.prefix().originalFallbackSources().stream().anyMatch(source ->
                         source.firstFallbackCapableReadAdmissionEpoch() != original.readAdmissionEpoch())) {
@@ -50,11 +51,13 @@ final class NereusKafkaObjectRetirement {
         }
         this.original = original;
         coveredEnd = verified.prefix().coverage().exclusiveEnd();
+        reclaimBookKeeper = verified.prefix().rawFallbackEquivalent();
     }
 
     private NereusKafkaObjectRetirement(BindingReadSelector original, long coveredEnd) {
         this.original = original;
         this.coveredEnd = coveredEnd;
+        reclaimBookKeeper = true;
         persisted = true;
     }
 
@@ -70,6 +73,10 @@ final class NereusKafkaObjectRetirement {
     boolean sameSelection(BindingReadSelector observed) {
         return observed.binding().equals(original.binding()) && observed.ownerEpoch() == original.ownerEpoch()
                 && observed.selectedViewSha256().equals(original.selectedViewSha256());
+    }
+
+    boolean settled() {
+        return settled;
     }
 
     void advance(NereusKafkaOwnedProviderRuntime.Opened owner, BindingReadSelector selector, NereusKafkaObjectProvider provider,
@@ -99,7 +106,10 @@ final class NereusKafkaObjectRetirement {
                     .thenRunAsync(() -> admissionClosed = true, control));
         } else if (released == null) {
             start(owner, () -> storage.finishNativeObjectFallbackRetirement(actor, control)
-                    .thenAcceptAsync(result -> released = result, control));
+                    .thenAcceptAsync(result -> {
+                        released = result;
+                        if (!reclaimBookKeeper) settled = true;
+                    }, control));
         } else if (transfer == null) {
             if (retainedCheckpointAvailable(storage)) transfer = storage.transferRetiredObjectBookKeeperPrefix(released);
         } else if (transfer.durableCheckpoint().isPresent()) {

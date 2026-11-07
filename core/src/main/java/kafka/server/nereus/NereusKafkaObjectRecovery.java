@@ -34,6 +34,7 @@ import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationPlan;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializedGeneration;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain;
+import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceKind;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.TaskState;
 import com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1.ValidatedGeneration;
 import com.nereusstream.storage.object.materialization.M5PendingOutputInventoryV2;
@@ -60,6 +61,16 @@ final class NereusKafkaObjectRecovery {
             M5PendingOutputInventoryV2 inventory, List<PhysicalResourceIdV2.ObjectVersion> versions) { }
 
     static Optional<Selected> recover(OxiaKafkaBookKeeperM4ReadRouteV2 binding,
+            int partition, BindingReadSelector selector, NereusKafkaObjectProvider provider, Duration timeout)
+            throws Exception {
+        var selected = load(binding, partition, selector, provider, timeout);
+        if (selected.isPresent() && !binding.readSelector().equals(Optional.of(selector))) {
+            throw new IllegalStateException("Kafka Object selector changed during exact recovery");
+        }
+        return selected;
+    }
+
+    private static Optional<Selected> load(OxiaKafkaBookKeeperM4ReadRouteV2 binding,
             int partition, BindingReadSelector selector, NereusKafkaObjectProvider provider, Duration timeout)
             throws Exception {
         var profile = provider.profile();
@@ -93,10 +104,33 @@ final class NereusKafkaObjectRecovery {
         requireProtectedFallback(binding, selector, prefix, timeout);
         var versions = requireOriginalObjects(provider, inventory, generation, timeout);
         await(provider.requireCurrent(), timeout);
-        if (!binding.readSelector().equals(Optional.of(selector))) {
-            throw new IllegalStateException("Kafka Object selector changed during exact recovery");
-        }
         return Optional.of(new Selected(prefix, plan, validated, inventory, versions));
+    }
+
+    /** Reconstructs only the old manifest's physical ticket membership, never its read authority. */
+    static List<PhysicalResourceIdV2.ObjectVersion> predecessorVersions(Selected successor,
+            OxiaKafkaBookKeeperM4ReadRouteV2 binding, int partition, NereusKafkaObjectProvider provider, Duration timeout)
+            throws Exception {
+        var cut = successor.plan().sourceCut();
+        var source = cut.sources().get(0);
+        if (source.kind() != SourceKind.KAFKA_NMS1_DATA_V2) return List.of();
+        var selector = cut.predecessorSelector();
+        if (selector.mode() != SelectorMode.PREFERRED_ONLY || !source.formatRootSha256().equals(selector.selectedViewSha256())) {
+            throw new IllegalStateException("Kafka Object successor lacks its exact prior input manifest");
+        }
+        var predecessor = load(binding, partition, selector, provider, timeout).orElseThrow();
+        var generation = predecessor.validated().generation();
+        var payload = generation.payloadObjects().get(0);
+        var physical = versionOf(payload, provider.profile().physicalBinding().physicalNamespace());
+        boolean exactBytes = payload.identity().key().equals(source.physicalKey())
+                && payload.identity().bodyLength() == source.canonicalLength()
+                && payload.identity().bodySha256().equals(source.bodySha256());
+        if (predecessor.prefix().rawFallbackEquivalent() || !payload.coverage().equals(source.coverage()) || !exactBytes
+                || !payload.immutableProviderVersionToken().equals(source.immutableProviderVersionToken())
+                || !physical.sha256().equals(source.sourceIdentitySha256())) {
+            throw new IllegalStateException("Kafka Object successor changed its exact prior physical input");
+        }
+        return predecessor.versions();
     }
 
     static Optional<KafkaBookKeeperClosedHistoryRecoveryV1.ObjectPrefix> nativeScope(Optional<Selected> selected,
@@ -239,7 +273,7 @@ final class NereusKafkaObjectRecovery {
         return List.copyOf(versions);
     }
 
-    private static PhysicalResourceIdV2.ObjectVersion versionOf(GenerationObject object,
+    static PhysicalResourceIdV2.ObjectVersion versionOf(GenerationObject object,
             PhysicalResourceIdV2.Namespace namespace) {
         return new PhysicalResourceIdV2.ObjectVersion(namespace, CanonicalUtf8.fromString(object.identity().key()),
                 PhysicalResourceIdV2.ObjectIdentityKind.IMMUTABLE_VERSION,

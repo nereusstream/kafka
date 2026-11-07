@@ -108,22 +108,24 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
 
     private boolean advanceRetirement(NereusKafkaOwnedProviderRuntime.Opened owner) {
         var policy = config.bookKeeper().orElseThrow().ledgerGc();
-        if (!policy.enabled() || policy.dryRun()) return false;
+        boolean reclaimBookKeeper = policy.enabled() && !policy.dryRun();
+        boolean compact = owner.nativeM5InputCut().policy().config().compact;
+        if (!reclaimBookKeeper && !compact) return false;
         var route = owner.nativeM5BindingRoute();
         var selector = route.readSelector().orElseThrow();
         var timeout = config.lifecycle().recoveryTimeout();
         var current = retirement(owner, selector);
         if (current == null && selector.admissionState() == AdmissionState.ADMITTING) {
-            current = prepareRetirement(owner, selector, timeout);
+            current = prepareRetirement(owner, selector, timeout, reclaimBookKeeper);
             if (current != null && !rememberRetirement(owner, current)) return false;
         }
-        if (current == null) return false;
+        if (current == null || current.settled()) return false;
         current.advance(owner, selector, provider, config.retentionCompaction().materializationSourceRetirementGrace(), timeout, control);
         return true;
     }
 
     private NereusKafkaObjectRetirement prepareRetirement(NereusKafkaOwnedProviderRuntime.Opened owner,
-            BindingReadSelector selector, Duration timeout) {
+            BindingReadSelector selector, Duration timeout, boolean reclaimBookKeeper) {
         try {
             var raw = owner.storage().nativeReadSources();
             if (selector.selectedViewSha256().equals(raw.selectedViewSha256())
@@ -133,8 +135,10 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
             if (selected.isEmpty()) return null;
             var original = selected.orElseThrow();
             var prefix = original.prefix();
-            if (!prefix.rawFallbackEquivalent()) return null;
+            if (prefix.rawFallbackEquivalent() ? !reclaimBookKeeper
+                    : !hasSealedTail(raw, prefix.coverage().exclusiveEnd())) return null;
             if (selector.mode() == SelectorMode.PREFERRED_ONLY) {
+                if (!prefix.rawFallbackEquivalent()) return null;
                 return NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata
                         .recoverObjectScope(owner, Optional.of(selector), selected, true, timeout)
                         .map(scope -> NereusKafkaObjectRetirement.resumePersisted(selector, scope)).orElse(null);
@@ -178,13 +182,18 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
 
     private Optional<Candidate> candidate(NereusKafkaOwnedProviderRuntime.Opened owner) {
         var raw = owner.storage().nativeReadSources();
-        if (raw.sealedRoots().stream().noneMatch(root -> root.kafkaStartOffset() < root.kafkaEndOffsetExclusive().orElseThrow())) {
-            return Optional.empty();
-        }
         var route = owner.nativeM5BindingRoute();
         var selector = route.readSelector().orElseThrow();
-        if (selector.mode() != SelectorMode.PREFERRED_ONLY || selector.admissionState() != AdmissionState.ADMITTING
-                || !selector.selectedViewSha256().equals(raw.selectedViewSha256())) return Optional.empty();
+        if (selector.mode() != SelectorMode.PREFERRED_ONLY || selector.admissionState() != AdmissionState.ADMITTING)
+            return Optional.empty();
+        boolean semantic = owner.nativeM5InputCut().policy().config().compact;
+        if (selector.selectedViewSha256().equals(raw.selectedViewSha256())) {
+            if (!hasSealedTail(raw, 0)) return Optional.empty();
+        } else {
+            var previous = owner.storage().nativeSelectedObjectInput(raw, selector);
+            if (!semantic || previous.isEmpty() || !hasSealedTail(raw, previous.orElseThrow().exclusiveEnd()))
+                return Optional.empty();
+        }
         var profile = provider.profile();
         var metadata = route.materializationMetadata(profile.protocolCellSha256());
         var materialization = new M5MaterializationAdmissionV1(metadata, profile.protocolCellSha256()).read();
@@ -195,9 +204,14 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
         // Never create a new task for this Binding while such an original reservation still needs reconciliation.
         if (materialization.orElseThrow().reservations().stream()
                 .anyMatch(item -> tasks.readPlan(item.taskIdSha256()).isPresent())) return Optional.empty();
-        boolean semantic = owner.nativeM5InputCut().policy().config().compact;
         return Optional.of(Candidate.admitted(raw.activeRoot().providerScopeId(), selector.binding(),
                 config.retentionCompaction(), cell.orElseThrow().caps(), materialization.orElseThrow().caps(), semantic));
+    }
+
+    private static boolean hasSealedTail(
+            com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1.NativeReadSources raw, long coveredEnd) {
+        return raw.sealedRoots().stream().anyMatch(root -> root.kafkaStartOffset() >= coveredEnd
+                && root.kafkaStartOffset() < root.kafkaEndOffsetExclusive().orElseThrow());
     }
 
     synchronized void beginDrain() {

@@ -41,6 +41,7 @@ import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Com
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Frontiers;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.InputBatch;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.OutputCompressionPolicy;
+import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1.SemanticInput;
 import com.nereusstream.metadata.oxia.v2.compaction.OxiaKafkaRunRootAuthorityV2;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
 import com.nereusstream.storage.api.kafka.KafkaOwnerAdmissionV1;
@@ -98,6 +99,10 @@ public final class NereusKafkaNativeInputV2 {
     private final AtomicReference<BindingReadSelector> selector = new AtomicReference<>();
     private final KafkaBookKeeperRunSourceV2 source;
     private final Optional<NativeSelectedInputSources> selectedInput;
+    private final Optional<ProtocolCoverage> selectedObjectCoverage;
+    private final BindingReadSelector initialSelector;
+    private final NereusKafkaObjectProvider inputProvider;
+    private final KafkaBookKeeperReadCellBudgetV2 readBudget;
     private final KafkaBookKeeperMixedSourceV2 mixedSource;
     private final KafkaBookKeeperRunSourceV2.Bounds bounds;
     private final M5BookKeeperNativeCreateClientV2 nativeClient;
@@ -197,7 +202,7 @@ public final class NereusKafkaNativeInputV2 {
             KafkaOwnerIdentityV1 owner, OxiaKafkaRunRootAuthorityV2 roots, OxiaKafkaBookKeeperM4ReadRouteV2 m4,
             BooleanSupplier current, M5BookKeeperNativeCreateClientV2 client, M5TargetDeleteMultiWriterGuardV2 guard,
             OxiaQuotaTargetDeleteStoreV2 bookKeeperPhysical, KafkaBookKeeperReadCellBudgetV2 budget,
-            KafkaBookKeeperRunSourceV2.Bounds bounds, Executor control) {
+            KafkaBookKeeperRunSourceV2.Bounds bounds, Executor control, NereusKafkaObjectProvider inputProvider) {
         this.opened = opened;
         this.nativeCut = cut.inputs();
         this.topicPolicy = cut.policy();
@@ -208,6 +213,8 @@ public final class NereusKafkaNativeInputV2 {
         this.current = Objects.requireNonNull(current, "native assignment");
         this.control = control;
         this.bounds = bounds;
+        this.readBudget = budget;
+        this.inputProvider = inputProvider;
         this.nativeClient = Objects.requireNonNull(client, "native source client");
         this.writerGuard = Objects.requireNonNull(guard, "native writer guard");
         this.bookKeeperPhysical = Objects.requireNonNull(bookKeeperPhysical, "native BK physical route");
@@ -218,12 +225,16 @@ public final class NereusKafkaNativeInputV2 {
         var all = new ArrayList<>(nativeCut.sources().sealedRoots());
         all.add(active);
         completeRoots = List.copyOf(all);
-        selectedInput = opened.storage().nativeSelectedInputSources(nativeCut, m4.readSelector().orElseThrow());
-        long selectedEnd = selectedInput.map(input -> input.descriptor().sourceCut().coverage().exclusiveEnd()).orElse(-1L);
+        initialSelector = m4.readSelector().orElseThrow();
+        selectedInput = opened.storage().nativeSelectedInputSources(nativeCut, initialSelector);
+        selectedObjectCoverage = ObjectInput.coverage(opened, nativeCut, initialSelector, inputProvider);
+        var selectedCoverage = selectedInput.map(input -> input.descriptor().sourceCut().coverage())
+                .or(() -> selectedObjectCoverage);
+        long selectedEnd = selectedCoverage.map(ProtocolCoverage::exclusiveEnd).orElse(-1L);
         inputRoots = nativeCut.sources().sealedRoots().stream()
                 .filter(root -> root.kafkaEndOffsetExclusive().orElseThrow() > root.kafkaStartOffset())
                 .filter(root -> root.kafkaEndOffsetExclusive().orElseThrow() > selectedEnd).toList();
-        if (inputRoots.isEmpty() && selectedInput.isEmpty())
+        if (inputRoots.isEmpty() && (selectedInput.isEmpty() || selectedObjectCoverage.isPresent()))
             throw new IllegalStateException("native M5 cut has no sealed input data");
         var checkpoint = nativeCut.recoveryCheckpoint().orElseThrow(
                 () -> new IllegalStateException("native M5 cut lacks its resolved recovery checkpoint"));
@@ -232,13 +243,13 @@ public final class NereusKafkaNativeInputV2 {
             throw new IllegalStateException("native M5 checkpoint differs from the sealed input boundary");
         keys = inputRoots.stream().map(root -> roots.nativeRootKey(root.runId())).toList();
         var actual = nativeCut.protocol().root().frontiers();
-        long start = selectedInput.map(input -> input.descriptor().sourceCut().coverage().inclusiveStart())
+        long start = selectedCoverage.map(ProtocolCoverage::inclusiveStart)
                 .orElseGet(() -> inputRoots.get(0).kafkaStartOffset());
         long candidateEnd = inputRoots.isEmpty() ? selectedEnd
                 : inputRoots.get(inputRoots.size() - 1).kafkaEndOffsetExclusive().orElseThrow();
         frontiers = new Frontiers(actual.trimStartOffset(), actual.durableEndOffset(), actual.allocatedEndOffset(),
                 actual.highWatermark(), actual.lastStableOffset(), start, candidateEnd);
-        long end = selectedInput.isPresent() ? selectedEnd : start;
+        long end = selectedCoverage.isPresent() ? selectedEnd : start;
         for (var root : inputRoots) {
             if (root.kafkaStartOffset() != end) throw new IllegalStateException("native M5 sealed cut has a hole");
             end = root.kafkaEndOffsetExclusive().orElseThrow();
@@ -587,6 +598,7 @@ public final class NereusKafkaNativeInputV2 {
     }
 
     private record Scan(Optional<KafkaBookKeeperSelectedSourceV2.Snapshot> selected,
+            Optional<ObjectInput> object,
             List<KafkaBookKeeperRunSourceV2.Snapshot> raw) {
         private Scan {
             raw = List.copyOf(raw);
@@ -595,6 +607,7 @@ public final class NereusKafkaNativeInputV2 {
         List<SourceExtent> extents() {
             var result = new ArrayList<SourceExtent>();
             selected.ifPresent(snapshot -> result.add(snapshot.extent()));
+            object.ifPresent(snapshot -> result.add(snapshot.extent()));
             raw.forEach(snapshot -> result.add(snapshot.extent()));
             return List.copyOf(result);
         }
@@ -602,6 +615,7 @@ public final class NereusKafkaNativeInputV2 {
         List<InputBatch> batches() {
             var result = new ArrayList<InputBatch>();
             selected.ifPresent(snapshot -> result.addAll(snapshot.batches()));
+            object.ifPresent(snapshot -> result.addAll(snapshot.batches()));
             raw.forEach(snapshot -> result.addAll(snapshot.batches()));
             return List.copyOf(result);
         }
@@ -619,6 +633,7 @@ public final class NereusKafkaNativeInputV2 {
         Map<Sha256Digest, List<PhysicalResourceIdV2>> membership() {
             Map<Sha256Digest, List<PhysicalResourceIdV2>> result = new LinkedHashMap<>();
             selected.ifPresent(snapshot -> result.put(snapshot.extent().sourceIdentitySha256(), snapshot.resources()));
+            object.ifPresent(snapshot -> result.put(snapshot.extent().sourceIdentitySha256(), snapshot.resources()));
             for (var snapshot : raw) {
                 if (result.put(snapshot.extent().sourceIdentitySha256(), List.of(snapshot.root().resource())) != null)
                     throw new IllegalStateException("native M5 source identity repeats");
@@ -627,15 +642,68 @@ public final class NereusKafkaNativeInputV2 {
         }
     }
 
+    private record ObjectInput(SourceExtent extent, CanonicalBytes bytes, List<InputBatch> batches,
+            List<PhysicalResourceIdV2> resources) {
+        static Optional<ProtocolCoverage> coverage(NereusKafkaOwnedProviderRuntime.Opened owner,
+                NativeInputSources cut, BindingReadSelector selector, NereusKafkaObjectProvider provider) {
+            return provider == null ? Optional.empty() : owner.storage().nativeSelectedObjectInput(cut.sources(), selector);
+        }
+
+        static ObjectInput exact(SemanticInput selected, BindingReadSelector predecessor, NereusKafkaObjectProvider provider) {
+            var profile = provider.profile();
+            var descriptor = selected.object();
+            var namespace = profile.physicalBinding().physicalNamespace();
+            var payload = NereusKafkaObjectRecovery.versionOf(descriptor, namespace);
+            var identity = payload.sha256();
+            var extent = new SourceExtent(SourceKind.KAFKA_NMS1_DATA_V2, identity, descriptor.coverage(),
+                    descriptor.identity().key(), descriptor.identity().bodyLength(), selected.recordCount(),
+                    selected.minimumTimestamp(), selected.maximumTimestamp(), descriptor.identity().bodySha256(),
+                    descriptor.immutableProviderVersionToken(), Optional.empty(), predecessor.selectedViewSha256(),
+                    Sha256Digest.hash(CanonicalBytes.copyOf(profile.references().allowedEncryptionScope()
+                            .getBytes(StandardCharsets.UTF_8))), true, true, List.of(predecessor.binding().bindingId().digest()));
+            var batches = new ArrayList<InputBatch>();
+            for (var batch : selected.batches()) {
+                batches.add(new InputBatch(identity, batches.size(), batch.rawAssignedRecordBatch()));
+            }
+            var resources = new ArrayList<PhysicalResourceIdV2>();
+            resources.add(payload);
+            selected.indexes().forEach(index -> resources.add(NereusKafkaObjectRecovery.versionOf(index, namespace)));
+            return new ObjectInput(extent, selected.encoded(), List.copyOf(batches), List.copyOf(resources));
+        }
+
+        static KafkaBookKeeperRunSourceV2.Bounds remaining(KafkaBookKeeperRunSourceV2.Bounds before, SemanticInput used) {
+            return new KafkaBookKeeperRunSourceV2.Bounds(before.entries() - used.extentCount(),
+                    before.batches() - used.batches().size(), before.records() - used.recordCount(),
+                    before.nativeBytes() - used.nativeBytes(), before.payloadBytes() - used.encoded().length(),
+                    before.decodedBytes() - used.decodedBytes());
+        }
+    }
+
+    private CompletionStage<Scan> scanObjectAndRaw() {
+        return CompletableFuture.runAsync(this::requireSelector, control)
+                .thenCompose(ignored -> requireOwnerAdmission())
+                .thenCompose(ignored -> inputProvider.requireCurrent())
+                .thenCompose(ignored -> opened.storage().captureSelectedObjectInput(initialSelector.selectedViewSha256(), bounds))
+                .thenComposeAsync(selected -> {
+                    var actual = ObjectInput.exact(selected, initialSelector, inputProvider);
+                    var remaining = ObjectInput.remaining(bounds, selected);
+                    var tail = new KafkaBookKeeperRunSourceV2(readBudget, this::readSelectedInput, nativeClient,
+                            writerGuard, remaining, control, opened::openInputSession);
+                    return tail.captureSelectedRuns(keys, binding).thenApply(raw -> new Scan(Optional.empty(), Optional.of(actual), raw));
+                }, control);
+    }
+
     private CompletionStage<Scan> scan() {
         CompletionStage<Scan> scanned;
-        if (mixedSource == null) {
+        if (selectedObjectCoverage.isPresent()) {
+            scanned = scanObjectAndRaw();
+        } else if (mixedSource == null) {
             // The raw reader reserves before invoking its catalog adapter.
-            scanned = source.captureSelectedRuns(keys, binding).thenApply(raw -> new Scan(Optional.empty(), raw));
+            scanned = source.captureSelectedRuns(keys, binding).thenApply(raw -> new Scan(Optional.empty(), Optional.empty(), raw));
         } else {
             scanned = CompletableFuture.runAsync(this::requireSelector, control).thenCompose(ignored -> requireOwnerAdmission())
                     .thenCompose(ignored -> mixedSource.capture(keys, binding))
-                    .thenApply(snapshot -> new Scan(Optional.of(snapshot.selected()), snapshot.raw()));
+                    .thenApply(snapshot -> new Scan(Optional.of(snapshot.selected()), Optional.empty(), snapshot.raw()));
         }
         return scanned.thenApplyAsync(snapshot -> terminatedLocal(() -> {
             requireCurrentLocal();
@@ -647,7 +715,8 @@ public final class NereusKafkaNativeInputV2 {
         requireCurrentLocal();
         var value = m4.readSelector().orElseThrow(() -> new IllegalStateException("native M5 selector is absent"));
         var view = selectedInput.map(input -> input.descriptor().descriptorSha256())
-                .orElse(nativeCut.sources().selectedViewSha256());
+                .orElseGet(() -> selectedObjectCoverage.isPresent() ? initialSelector.selectedViewSha256()
+                        : nativeCut.sources().selectedViewSha256());
         if (!value.binding().equals(binding) || value.ownerEpoch() != owner.ownerEpoch()
                 || value.admissionState() != AdmissionState.ADMITTING || value.mode() != SelectorMode.PREFERRED_ONLY
                 || !value.selectedViewSha256().equals(view))
@@ -782,6 +851,11 @@ public final class NereusKafkaNativeInputV2 {
         boolean dirtyInput(InputBatch batch) {
             return extents.stream().anyMatch(extent -> extent.kind() == SourceKind.BOOKKEEPER_LEDGER
                     && extent.sourceIdentitySha256().equals(batch.sourceIdentitySha256()));
+        }
+
+        Optional<CanonicalBytes> selectedObjectBytes(SourceExtent source) {
+            requireOpen();
+            return snapshot.object().filter(input -> input.extent().equals(source)).map(ObjectInput::bytes);
         }
 
         public List<SourceExtent> extents() {
@@ -1127,9 +1201,10 @@ public final class NereusKafkaNativeInputV2 {
         private CompletionStage<Map<Sha256Digest, List<PhysicalResourceIdV2>>> verifyScan() {
             requireOpen();
             return scan().thenApply(actual -> terminatedLocal(() -> {
-                if (!actual.extents().equals(extents) || !actual.batches().equals(batches))
+                if (!actual.extents().equals(extents) || !actual.batches().equals(batches)
+                        || !actual.membership().equals(snapshot.membership()))
                     throw new IllegalStateException("native M5 inputs changed after capture");
-                return snapshot.membership();
+                return actual.membership();
             }));
         }
 

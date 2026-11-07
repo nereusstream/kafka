@@ -36,6 +36,7 @@ import com.nereusstream.storage.object.materialization.M5MaterializationCodecV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PublicationOutcome;
+import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceKind;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.SelectorMode;
 
@@ -90,8 +91,23 @@ final class NereusKafkaObjectPublication {
         }
         var raw = storage.nativeReadSources();
         var sources = new ArrayList<PhysicalResourceIdV2>();
+        var versions = new ArrayList<PhysicalResourceIdV2.ObjectVersion>();
         for (var extent : plan.sourceCut().sources()) {
             var resources = membership.get(extent.sourceIdentitySha256());
+            if (extent.kind() == SourceKind.KAFKA_NMS1_DATA_V2) {
+                if (resources == null || resources.isEmpty()
+                        || !(resources.get(0) instanceof PhysicalResourceIdV2.ObjectVersion payload)) {
+                    throw new IllegalStateException("Kafka Object publication lacks its prior Object payload");
+                }
+                if (!payload.sha256().equals(extent.sourceIdentitySha256())
+                        || !payload.objectKey().value().equals(extent.physicalKey())
+                        || !Optional.of(payload.immutableIdentity().bytes()).equals(extent.immutableProviderVersionToken())
+                        || resources.stream().anyMatch(resource -> !(resource instanceof PhysicalResourceIdV2.ObjectVersion))) {
+                    throw new IllegalStateException("Kafka Object publication has another prior Object source");
+                }
+                resources.forEach(resource -> versions.add((PhysicalResourceIdV2.ObjectVersion) resource));
+                continue;
+            }
             if (resources == null || resources.size() != 1
                     || !(resources.get(0) instanceof PhysicalResourceIdV2.BookKeeperLedger ledger)
                     || !extent.ledgerIdentitySha256().equals(Optional.of(ledger.sha256()))) {
@@ -99,7 +115,7 @@ final class NereusKafkaObjectPublication {
             }
             sources.add(ledger);
         }
-        var versions = verified.stored().credits().stream().map(credit -> credit.resource().orElseThrow()).toList();
+        verified.stored().credits().forEach(credit -> versions.add(credit.resource().orElseThrow()));
         var participants = participants(prefix, provider, raw, bookKeeper, sources, versions);
         var tickets = tickets(prefix, participants, task.worker().worker().nativeWorkerIdentitySha256());
         var binding = plan.sourceCut().identity().binding();
@@ -130,11 +146,13 @@ final class NereusKafkaObjectPublication {
             throw new IllegalStateException("Kafka Object publication still owns capacity after fallback retirement");
         }
         var prefix = selected.prefix();
-        var original = prefix.sourceCut().sources();
+        var sources = prefix.sourceCut().sources();
+        var original = sources.stream().filter(source -> source.kind() == SourceKind.BOOKKEEPER_LEDGER).toList();
         var cover = prefix.coverage();
+        long rawStart = original.get(0).coverage().inclusiveStart();
         var ledgers = raw.sealedRoots().stream().filter(root -> {
             long end = root.kafkaEndOffsetExclusive().orElseThrow();
-            return root.kafkaStartOffset() < end && end > cover.inclusiveStart()
+            return root.kafkaStartOffset() < end && end > rawStart
                     && root.kafkaStartOffset() < cover.exclusiveEnd();
         }).map(root -> new PhysicalResourceIdV2.BookKeeperLedger(bookKeeperNamespace, root.ledgerIdentity().ledgerId()))
                 .toList();
@@ -142,7 +160,9 @@ final class NereusKafkaObjectPublication {
                 original.stream().map(extent -> extent.ledgerIdentitySha256().orElseThrow()).toList())) {
             throw new IllegalStateException("Kafka Object publication cannot reconcile another BK source set");
         }
-        var participants = participants(prefix, provider, raw, bookKeeper, ledgers, selected.versions());
+        var versions = new ArrayList<>(selected.versions());
+        versions.addAll(NereusKafkaObjectRecovery.predecessorVersions(selected, binding, partition, provider, timeout));
+        var participants = participants(prefix, provider, raw, bookKeeper, ledgers, versions);
         var tickets = tickets(prefix, participants, selected.inventory().worker().nativeWorkerIdentitySha256());
         var coordinator = new M5MaterializationCoordinatorV1(metadata, partition, selector.binding());
         var outcome = coordinator.finishSelectedTask(plan, selected.validated(), prefix.originalFallbackSources(), selector);

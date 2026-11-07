@@ -119,19 +119,25 @@ final class NereusKafkaObjectMaterialization {
         }
         var sources = capture.extents().stream().collect(Collectors.toUnmodifiableMap(
                 SourceExtent::sourceIdentitySha256, Function.identity()));
+        boolean semantic = capture.topicPolicy().config().compact;
         if (sources.values().stream().anyMatch(source -> source.kind() != SourceKind.BOOKKEEPER_LEDGER
+                && (!semantic || source.kind() != SourceKind.KAFKA_NMS1_DATA_V2)
                 || source.canonicalLength() >= provider.maximumObjectBytes())) {
-            throw new IllegalStateException("Kafka byte-preserving materialization requires complete bounded BK sources");
+            throw new IllegalStateException("Kafka materialization requires complete bounded native sources");
         }
         var batches = capture.batches().stream().collect(Collectors.groupingBy(InputBatch::sourceIdentitySha256));
         M5BytePreservingMaterializerV1.SourceReader reader = source -> {
             capture.requireOpen();
             if (!source.equals(sources.get(source.sourceIdentitySha256()))) {
-                throw new IOException("Kafka Object build attempted to read an unretained BK source");
+                throw new IOException("Kafka Object build attempted to read an unretained source");
+            }
+            if (source.kind() == SourceKind.KAFKA_NMS1_DATA_V2) {
+                return capture.selectedObjectBytes(source).orElseThrow(
+                        () -> new IOException("Kafka Object build lost its exact selected source bytes"));
             }
             return sourceBytes(source, batches.getOrDefault(source.sourceIdentitySha256(), List.of()));
         };
-        var prepared = capture.topicPolicy().config().compact
+        var prepared = semantic
                 ? prepareSemantic(capture, worker, provider, reader, caps, decodedBytes)
                 : preparePreserving(capture, worker, provider, reader);
         if (prepared.candidates().stream().anyMatch(candidate ->

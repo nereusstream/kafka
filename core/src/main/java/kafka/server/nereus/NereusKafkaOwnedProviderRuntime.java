@@ -617,7 +617,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                 KafkaBookKeeperReadCellBudgetV2 budget, KafkaBookKeeperRunSourceV2.Bounds bounds) {
             return ownInputOperation(() -> new NereusKafkaNativeInputV2(this, nativeM5InputCut(),
                     nativeOwner, rootsAuthority, m4Route, currentAssignment, source, writerAdmission.inputReadGuard(),
-                    route, budget, bounds, openings).capture());
+                    route, budget, bounds, openings, null).capture());
         }
 
         /** Native task preparation retains durable Cell capacity beyond the SDK scan's local read allowance. */
@@ -638,7 +638,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                 try {
                     var capture = new NereusKafkaNativeInputV2(this, nativeM5InputCut(),
                             nativeOwner, rootsAuthority, m4Route, currentAssignment, source, writerAdmission.inputReadGuard(),
-                            route, budget, bounds, control).capture(caps, allowance);
+                            route, budget, bounds, control, asyncObject).capture(caps, allowance);
                     handedOff = true;
                     return capture;
                 } catch (Throwable failure) {

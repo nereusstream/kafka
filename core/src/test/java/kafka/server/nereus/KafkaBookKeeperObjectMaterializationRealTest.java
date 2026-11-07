@@ -67,6 +67,7 @@ import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.Selec
 import com.nereusstream.storage.object.retention.M5BindingAuthorityCodecV1;
 import com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport;
 
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -129,6 +130,12 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         withObjectFixture(work, nativeConfig, fault.readFaults || fault.unknownPut, fixture -> runColdCluster(work, fixture, fault));
     }
 
+    @Test
+    @Timeout(240)
+    void selectsCompactedSuccessorFromExactObjectAndBookKeeperTail(@TempDir Path work) throws Exception {
+        storesAndVerifiesTheRealNativeSealedPrefix("semantic-next", work);
+    }
+
     private static void runColdCluster(Path work, Fixture fixture, PublicationFault fault) throws Exception {
         var first = new CompletableFuture<NereusKafkaOwnedProviderRuntime.Opened>();
         var cold = new CompletableFuture<NereusKafkaOwnedProviderRuntime.Opened>();
@@ -178,7 +185,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.bytes.per.ledger", "1048576");
         builder.setConfigProp("message.max.bytes", "4096");
         if (fault.automatic) builder.setConfigProp("nereus.kafka.storage.retention.check.interval.ms", "1000");
-        if (fault.backgroundRetirement) {
+        if (fault.backgroundRetirement || fault.semanticNext) {
             builder.setConfigProp("nereus.kafka.storage.materialization.source.retirement.grace.ms", "5000");
         }
         if (fault.shutdownRetirement) {
@@ -292,6 +299,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean readFaults;
         private final boolean unknownPut;
         private final boolean semantic;
+        private final boolean semanticNext;
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
         private final CompletableFuture<M5PendingOutputInventoryV2> pendingApplied = new CompletableFuture<>();
         private final CompletableFuture<Void> pendingReadDenied = new CompletableFuture<>();
@@ -307,11 +315,12 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             shutdownRetirement = outcome.equals("shutdown-retirement");
             backgroundRetirement = coldRetirement || shutdownRetirement || outcome.equals("background-retirement");
             staleRegistration = outcome.equals("stale-registration");
-            automatic = outcome.equals("automatic") || backgroundRetirement || staleRegistration;
+            semanticNext = outcome.equals("semantic-next");
+            automatic = outcome.equals("automatic") || backgroundRetirement || staleRegistration || semanticNext;
             retireFallback = outcome.equals("retirement");
             readFaults = outcome.equals("faults");
             unknownPut = outcome.equals("put-unknown");
-            semantic = outcome.equals("semantic");
+            semantic = outcome.equals("semantic") || semanticNext;
         }
 
         private AsyncOxiaClient wrap(AsyncOxiaClient client) {
@@ -855,6 +864,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 .get(30, TimeUnit.SECONDS).orElseThrow();
         assertTrue(M5BindingAuthorityCodecV1.decodeAuthority(authority.canonicalStoredBytes()).trimMutationTickets().stream()
                 .noneMatch(ticket -> ticket.key().endsWith("/pending-outputs/" + original.worker().taskIdSha256().toHex())));
+        if (fault.semanticNext) {
+            SemanticSuccessor.verify(owner, fixture, client, produced, probe, takeover, limits, selected);
+            return;
+        }
         assertEquals(PayloadKind.KAFKA_BATCH_PRESERVING_V1, selected.validated().generation().payloadKind());
         assertTrue(selected.prefix().coverage().exclusiveEnd() > 0);
         if (fault.backgroundRetirement) {
@@ -865,6 +878,43 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
         assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
         verifyColdSelector(selector, takeover.relocate(), client, expected, probe.held());
+    }
+
+    private static final class SemanticSuccessor {
+        static void verify(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture, Properties client, int produced,
+                FetchProbe probe, ColdTakeover takeover, ScheduledLimits limits, NereusKafkaObjectRecovery.Selected first)
+                throws Exception {
+            var original = first.prefix().manifestSha256();
+            var firstCoverage = first.prefix().coverage();
+            var firstPayload = first.validated().generation().payloadObjects().get(0);
+            assertEquals(PayloadKind.KAFKA_SEMANTIC_COMPACTED_V1, first.validated().generation().payloadKind());
+            assertTrue(firstCoverage.exclusiveEnd() >= KafkaObjectCompactionRealScenario.SEALED_TRANSACTION_END);
+            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 0, produced, client);
+            int latest = produced;
+            KafkaObjectCompactionRealScenario.appendReplacement(probe.cluster(), latest);
+            int end = produceThroughRollover(owner, client, latest + 1);
+            TestUtils.waitForCondition(() -> {
+                var selector = owner.nativeM5BindingRoute().readSelector().orElseThrow();
+                return !selector.selectedViewSha256().equals(original) && selector.fallbackSetSha256().isPresent() && limits.settled();
+            }, 60_000, "native Broker did not select a successor from the prior compacted Object and the sealed BK tail");
+            var next = owner.nativeM5BindingRoute().readSelector().orElseThrow();
+            var selected = NereusKafkaObjectRecovery.recover(owner.nativeM5BindingRoute(), 0, next, fixture.provider(),
+                    Duration.ofSeconds(10)).orElseThrow();
+            var source = selected.plan().sourceCut().sources().get(0);
+            assertEquals(com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceKind.KAFKA_NMS1_DATA_V2,
+                    source.kind());
+            assertEquals(original, source.formatRootSha256());
+            assertEquals(firstCoverage, source.coverage());
+            assertEquals(firstPayload.immutableProviderVersionToken(), source.immutableProviderVersionToken());
+            assertTrue(selected.prefix().coverage().exclusiveEnd() > latest);
+            assertTrue(selected.plan().sourceCut().sources().size() > 1);
+            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 0, end, client, latest);
+            KafkaObjectCompactionRealScenario.verifyReplacement(probe.cluster(), probe.topicId(), 0, latest);
+            var recovered = takeover.relocate();
+            assertEquals(next.selectedViewSha256(), recovered.nativeM5BindingRoute().readSelector().orElseThrow().selectedViewSha256());
+            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 1, end, client, latest);
+            KafkaObjectCompactionRealScenario.verifyReplacement(probe.cluster(), probe.topicId(), 1, latest);
+        }
     }
 
     record ScheduledLimits(M5MaterializationAdmissionV1 outputs, KafkaCompactionAdmissionV1 inputs) {
