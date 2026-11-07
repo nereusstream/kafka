@@ -694,14 +694,35 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertEquals(selected.selectedViewSha256(), result.selector().selectedViewSha256());
             assertEquals(selected.readAdmissionEpoch() + 1, result.selector().readAdmissionEpoch());
             assertEquals(result.selector(), route.readSelector().orElseThrow());
-            var expected = IntStream.range(0, end).mapToObj(offset -> "input-" + offset).toList();
-            assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, end));
-            verifyColdSelector(result.selector(), cold.relocate(), client, expected, probe.held());
+            verifyTransferredCheckpoint(owner, probe, result, client, end, cold);
         } finally {
             hold.release().complete(null);
             control.shutdown();
             assertTrue(control.awaitTermination(30, TimeUnit.SECONDS));
         }
+    }
+
+    private static void verifyTransferredCheckpoint(NereusKafkaOwnedProviderRuntime.Opened owner, FetchProbe probe,
+            com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperNativeFallbackRetirementV2.Result released,
+            Properties client, int end, ColdTakeover cold) throws Exception {
+        var before = owner.storage().nativeInputSources().recoveryCheckpoint().orElseThrow();
+        var transfer = owner.storage().transferRetiredObjectBookKeeperPrefix(released);
+        assertEquals(before.components(), transfer.checkpoint().components());
+        assertEquals(before.vector(), transfer.checkpoint().vector());
+        assertEquals(transfer.retained(), owner.storage().nativeReadSources());
+        assertTrue(transfer.retained().sealedRoots().size() < transfer.original().sealedRoots().size());
+        assertTrue(transfer.durableCheckpoint().isEmpty(), "a local transfer was mistaken for a durable checkpoint");
+        int produced = produceThroughRollover(owner, client, end);
+        var checkpoint = transfer.durableCheckpoint().orElseThrow();
+        assertTrue(owner.storage().nativeReadSources().sealedRoots().contains(checkpoint.sealedCarrier()));
+        assertEquals(transfer.retained().activeRoot().runId(), checkpoint.sealedCarrier().runId());
+        assertEquals(transfer.retained().activeRoot().ledgerIdentity(), checkpoint.sealedCarrier().ledgerIdentity());
+        assertTrue(checkpoint.checkpointEntry() > 0 && !checkpoint.checkpointSha256().isZero() && !checkpoint.footerSha256().isZero());
+        var selector = owner.nativeM5BindingRoute().readSelector().orElseThrow();
+        assertEquals(released.selector().selectedViewSha256(), selector.selectedViewSha256());
+        var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
+        assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
+        verifyColdSelector(selector, cold.relocate(), client, expected, probe.held());
     }
 
     private static void verifyColdSelector(
