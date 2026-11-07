@@ -1833,14 +1833,24 @@ class ReplicaManager(val config: KafkaConfig,
     quota: ReplicaQuota,
     responseCallback: Seq[(TopicIdPartition, FetchPartitionData)] => Unit
   ): Unit = {
+    // Fetch v12 and earlier supply only the topic name. Bind once to the local topic ID
+    // so delayed reads subscribe to the actual owner and cannot read a recreated topic.
+    val boundFetchInfos = if (fetchInfos.exists(_._1.topicId == Uuid.ZERO_UUID)) {
+      fetchInfos.map { case (identity, data) =>
+        val bound = if (identity.topicId == Uuid.ZERO_UUID) topicIdPartition(identity.topicPartition) else identity
+        bound -> data
+      }
+    } else {
+      fetchInfos
+    }
     val submitted = try {
       executor.submit(
         params,
-        fetchInfos,
+        boundFetchInfos,
         initialWave => try {
           readFromLog(
             params,
-            fetchInfos,
+            boundFetchInfos,
             quota,
             readFromPurgatory = !initialWave)
         } finally {
@@ -1852,30 +1862,33 @@ class ReplicaManager(val config: KafkaConfig,
         completeStorageFetch(
           params,
           fetchInfos,
+          boundFetchInfos,
           responseCallback,
-          failedStorageFetch(fetchInfos, failure))
+          failedStorageFetch(boundFetchInfos, failure))
         return
     }
     submitted.whenComplete { (results, failure) =>
       val exactResults =
         if (failure == null) results
-        else failedStorageFetch(fetchInfos, failure)
-      completeStorageFetch(params, fetchInfos, responseCallback, exactResults)
+        else failedStorageFetch(boundFetchInfos, failure)
+      completeStorageFetch(params, fetchInfos, boundFetchInfos, responseCallback, exactResults)
     }
   }
 
   private def completeStorageFetch(
     params: FetchParams,
     fetchInfos: Seq[(TopicIdPartition, PartitionData)],
+    boundFetchInfos: Seq[(TopicIdPartition, PartitionData)],
     responseCallback: Seq[(TopicIdPartition, FetchPartitionData)] => Unit,
     suppliedResults: Seq[(TopicIdPartition, LogReadResult)]
   ): Unit = {
     val logReadResults =
       if (suppliedResults != null &&
-        suppliedResults.size == fetchInfos.size &&
-        suppliedResults.iterator.zip(fetchInfos.iterator)
+        suppliedResults.size == boundFetchInfos.size &&
+        suppliedResults.iterator.zip(boundFetchInfos.iterator)
           .forall { case ((actual, _), (expected, _)) => actual == expected }) {
-        suppliedResults
+        if (boundFetchInfos eq fetchInfos) suppliedResults
+        else suppliedResults.zip(fetchInfos).map { case ((_, result), (wireIdentity, _)) => wireIdentity -> result }
       } else {
         failedStorageFetch(
           fetchInfos,
