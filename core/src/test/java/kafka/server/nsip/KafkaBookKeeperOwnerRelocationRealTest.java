@@ -277,6 +277,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                         awaitCondition(
                                 () -> log(cluster, first).logEndOffset() == 3,
                                 "disconnected Produce did not reach shared commit");
+                        var nonIdempotent = lostNonIdempotentAppend(cluster, first);
                         delayedMetadata.pauseResponses();
                         cluster.brokers().get(first).shutdown();
                         int pending = awaitLeader(admin, first);
@@ -321,7 +322,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                         int second = awaitLeader(admin, pending);
                         assertEquals(2, second);
                         awaitCondition(
-                                () -> log(cluster, second).highWatermark() == 3,
+                                () -> log(cluster, second).highWatermark() == 4,
                                 "replacement did not recover shared prefix");
                         delayedMetadata.resumeResponses();
                         awaitCondition(() -> !pendingPartition.isLeader(), "superseded recovery retained leadership");
@@ -333,27 +334,30 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                         var retryPartition = retry.data().responses().iterator().next().partitionResponses().get(0);
                         assertEquals(Errors.NONE.code(), retryPartition.errorCode());
                         assertEquals(2, retryPartition.baseOffset());
-                        assertEquals(3, log(cluster, second).logEndOffset());
+                        assertEquals(4, log(cluster, second).logEndOffset());
+                        assertProduceOffset(cluster, second, nonIdempotent, 4);
                         assertEquals(1, readGroupOffset(client));
                         transaction.commitTransaction();
                         assertEquals(
-                                4,
+                                6,
                                 producer.send(new ProducerRecord<>("native-cold", 0, "key", "after-first"))
                                         .get(30, TimeUnit.SECONDS)
                                         .offset());
                         assertEquals(
-                                List.of("before", "transaction", "lost-response", "after-first"), consume(client, 4));
+                                List.of("before", "transaction", "lost-response", "non-idempotent", "non-idempotent",
+                                        "after-first"), consume(client, 6));
                         cluster.brokers().get(second).shutdown();
                         int third = awaitLeader(admin, second);
                         assertNotEquals(second, third);
                         assertEquals(
-                                5,
+                                7,
                                 producer.send(new ProducerRecord<>("native-cold", 0, "key", "after-second"))
                                         .get(30, TimeUnit.SECONDS)
                                         .offset());
                         assertEquals(
-                                List.of("before", "transaction", "lost-response", "after-first", "after-second"),
-                                consume(client, 5));
+                                List.of("before", "transaction", "lost-response", "non-idempotent", "non-idempotent",
+                                        "after-first", "after-second"),
+                                consume(client, 7));
                         assertEquals(1, readGroupOffset(client));
                     }
                     cluster.fatalFaultHandler().maybeRethrowFirstException();
@@ -652,6 +656,23 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
         return request;
     }
 
+    private static ProduceRequest lostNonIdempotentAppend(KafkaClusterTestKit cluster, int broker) throws Exception {
+        var append = produce(MemoryRecords.withRecords(Compression.NONE,
+                new SimpleRecord("non-idempotent".getBytes(StandardCharsets.UTF_8))));
+        request(cluster, broker, append, false);
+        awaitCondition(() -> log(cluster, broker).logEndOffset() == 4,
+                "disconnected non-idempotent Produce did not reach shared commit");
+        return append;
+    }
+
+    private static void assertProduceOffset(KafkaClusterTestKit cluster, int broker, ProduceRequest append,
+            long offset) throws Exception {
+        var retry = (ProduceResponse) request(cluster, broker, append, true);
+        var result = retry.data().responses().iterator().next().partitionResponses().get(0);
+        assertEquals(Errors.NONE.code(), result.errorCode());
+        assertEquals(offset, result.baseOffset());
+    }
+
     private static ProduceRequest produce(long producerId, short producerEpoch, String value) {
         var raw = MemoryRecords.withIdempotentRecords(
                 Compression.NONE,
@@ -660,6 +681,10 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                 0,
                 new SimpleRecord(
                         "key".getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8)));
+        return produce(raw);
+    }
+
+    private static ProduceRequest produce(MemoryRecords raw) {
         var topic = new ProduceRequestData.TopicProduceData()
                 .setName("native-cold")
                 .setPartitionData(List.of(new ProduceRequestData.PartitionProduceData()

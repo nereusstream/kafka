@@ -54,6 +54,7 @@ import com.nereusstream.kafka.bookkeeper.commit.KafkaBatchDuplicateIdentityV1;
 import com.nereusstream.kafka.bookkeeper.pipeline.KafkaOrderedAppendOutcomeV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaReadIsolationV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadBatchV1;
+import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadCursorV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadOutcomeV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperSequentialReadRequestV1;
 
@@ -82,6 +83,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private final NereusProducerStateManager producers;
     private final ThreadLocal<KafkaBookKeeperPartitionV1.AdmittedAppend> admission = new ThreadLocal<>();
     private KafkaBookKeeperPartitionV1 storage;
+    // One disposable position per log. The reader checks it against a fresh snapshot on every use.
+    private Optional<KafkaBookKeeperReadCursorV1> nextFetchCursor = Optional.empty();
     private int publishedEpoch = -1;
     private java.util.function.BooleanSupplier currentOwner = () -> false;
     private long configMetadataOffset = -1;
@@ -198,6 +201,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         synchronized (guard) {
             if (publishedEpoch == epoch && (expected == null || storage == expected)) {
                 storage = null;
+                nextFetchCursor = Optional.empty();
                 publishedEpoch = -1;
                 m5PolicyWriter = null;
             }
@@ -340,6 +344,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     public FetchDataInfo read(long offset, int maximumBytes, FetchIsolation isolation, boolean minOneMessage) {
         synchronized (guard) {
             var exact = requireStorage(publishedEpoch);
+            var cursor = nextFetchCursor;
+            nextFetchCursor = Optional.empty();
             var mode = readIsolation(isolation);
             var snapshot = exact.capture();
             if (offset < snapshot.root().frontiers().trimStartOffset()
@@ -355,7 +361,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             }
             var result = await(
                     exact.read(new KafkaBookKeeperSequentialReadRequestV1(
-                            offset, mode, Math.min(maximumBytes, hardMaxFetchBytes), Optional.empty())),
+                            offset, mode, Math.min(maximumBytes, hardMaxFetchBytes), cursor)),
                     fetchTimeout);
             if (result.outcome() != KafkaBookKeeperReadOutcomeV1.FOUND) {
                 if (result.outcome() == KafkaBookKeeperReadOutcomeV1.END_OF_SNAPSHOT) {
@@ -382,6 +388,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                                             .setFirstOffset(transaction.firstOffset()))
                             .toList())
                     : Optional.<List<org.apache.kafka.common.message.FetchResponseData.AbortedTransaction>>empty();
+            nextFetchCursor = result.nextCursor();
             return new FetchDataInfo(
                     new LogOffsetMetadata(result.batches().get(0).startOffset(), 0, 0),
                     MemoryRecords.readableRecords(buffer),

@@ -16,6 +16,7 @@
  */
 package kafka.server.nereus;
 
+import kafka.log.nereus.NereusUnifiedLog;
 import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
 import kafka.server.nsip.NativeKafkaRequest;
 
@@ -24,13 +25,18 @@ import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.CompressionType;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.SimpleRecord;
+import org.apache.kafka.common.requests.FetchRequest;
+import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.requests.ProduceRequest;
 import org.apache.kafka.common.requests.ProduceResponse;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -54,7 +60,9 @@ import org.junit.jupiter.api.io.TempDir;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -69,6 +77,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import io.oxia.client.api.AsyncOxiaClient;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -156,6 +165,87 @@ public class KafkaBookKeeperAckRealTest {
         }
     }
 
+    @Test
+    @Timeout(180)
+    public void nativeFetchPreservesCompleteCompressedBatchesAcrossViewChanges(@TempDir Path inputs) throws Exception {
+        try (var cluster = nativeCluster(inputs, new HoldDurability(), 1)) {
+            cluster.format();
+            cluster.startup();
+            cluster.waitForReadyBrokers();
+            var client = new Properties();
+            client.setProperty("bootstrap.servers", cluster.bootstrapServers());
+            Uuid topicId;
+            try (var admin = Admin.create(client)) {
+                topicId = admin.createTopics(List.of(new NewTopic(TOPIC, Map.of(0, List.of(0)))))
+                        .topicId(TOPIC).get(30, TimeUnit.SECONDS);
+            }
+            TestUtils.waitForCondition(() -> {
+                var local = cluster.brokers().get(0).replicaManager().onlinePartition(new TopicPartition(TOPIC, 0));
+                if (local.isEmpty() || local.get().log().isEmpty()) return false;
+                return ((NereusUnifiedLog) local.get().log().get()).nereusWritable(local.get().getLeaderEpoch());
+            }, "Native Owner did not activate");
+            assertWireAppend(cluster, compressed("first-0", "first-1"), 0);
+            assertWireAppend(cluster, compressed("second-0", "second-1"), 2);
+            assertWireAppend(cluster, compressed("third-0", "third-1"), 4);
+
+            // An interior offset and a one-byte budget still return the entire first batch.
+            assertWireBatch(cluster, topicId, 1, 0, 6, List.of("first-0", "first-1"));
+            assertWireBatch(cluster, topicId, 2, 2, 6, List.of("second-0", "second-1"));
+            // Publishing a new root invalidates the position obtained for offset 4.
+            assertWireAppend(cluster, compressed("fourth-0", "fourth-1"), 6);
+            assertWireBatch(cluster, topicId, 4, 4, 8, List.of("third-0", "third-1"));
+            assertWireBatch(cluster, topicId, 6, 6, 8, List.of("fourth-0", "fourth-1"));
+            cluster.fatalFaultHandler().maybeRethrowFirstException();
+            cluster.nonFatalFaultHandler().maybeRethrowFirstException();
+        }
+    }
+
+    private static MemoryRecords compressed(String first, String second) {
+        return MemoryRecords.withRecords(Compression.gzip().build(),
+                new SimpleRecord(first.getBytes(StandardCharsets.UTF_8)),
+                new SimpleRecord(second.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private static void assertWireAppend(KafkaClusterTestKit cluster, MemoryRecords records, long expectedOffset)
+            throws Exception {
+        try (var wire = new NativeKafkaRequest(cluster, 0, produce((short) -1, records))) {
+            var response = (ProduceResponse) wire.receive(30_000);
+            var result = response.data().responses().iterator().next().partitionResponses().get(0);
+            assertEquals(Errors.NONE, Errors.forCode(result.errorCode()));
+            assertEquals(expectedOffset, result.baseOffset());
+        }
+    }
+
+    private static void assertWireBatch(KafkaClusterTestKit cluster, Uuid topicId, long requested, long base,
+            long highWatermark, List<String> values) throws Exception {
+        var partition = new TopicPartition(TOPIC, 0);
+        short version = 16;
+        var fetch = FetchRequest.Builder.forConsumer(version, 0, 0,
+                        Map.of(partition, new FetchRequest.PartitionData(topicId, requested,
+                                FetchRequest.INVALID_LOG_START_OFFSET, 1, Optional.empty())))
+                .setMaxBytes(1).isolationLevel(IsolationLevel.READ_UNCOMMITTED).build(version);
+        try (var wire = new NativeKafkaRequest(cluster, 0, fetch)) {
+            var response = (FetchResponse) wire.receive(30_000);
+            var result = response.responseData(Map.of(topicId, TOPIC), version).get(partition);
+            assertEquals(Errors.NONE, Errors.forCode(result.errorCode()));
+            assertEquals(highWatermark, result.highWatermark());
+            var batches = FetchResponse.recordsOrFail(result).batches().iterator();
+            assertTrue(batches.hasNext(), "Fetch split or dropped an oversized first batch");
+            var batch = batches.next();
+            assertEquals(base, batch.baseOffset());
+            assertEquals(base + values.size() - 1, batch.lastOffset());
+            assertEquals(CompressionType.GZIP, batch.compressionType());
+            batch.ensureValid();
+            var actual = new ArrayList<String>();
+            for (var record : batch) {
+                assertEquals(base + actual.size(), record.offset());
+                actual.add(StandardCharsets.UTF_8.decode(record.value()).toString());
+            }
+            assertEquals(values, actual);
+            assertFalse(batches.hasNext(), "Fetch exceeded its budget after the first batch");
+        }
+    }
+
     private static KafkaClusterTestKit nativeCluster(Path inputs, HoldDurability observer, int brokers) throws Exception {
         KafkaBookKeeperOwnerRelocationRealTest.writeCapability(inputs, Optional.empty());
         var bootstrap = BootstrapMetadata.fromVersion(MetadataVersion.latestTesting(), "nsip-ack")
@@ -205,8 +295,11 @@ public class KafkaBookKeeperAckRealTest {
     }
 
     private static ProduceRequest produce(short acks, String value) {
-        var raw = MemoryRecords.withRecords(Compression.NONE,
-                new SimpleRecord(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        return produce(acks, MemoryRecords.withRecords(Compression.NONE,
+                new SimpleRecord(value.getBytes(StandardCharsets.UTF_8))));
+    }
+
+    private static ProduceRequest produce(short acks, MemoryRecords raw) {
         var topic = new ProduceRequestData.TopicProduceData()
                 .setName(TOPIC)
                 .setPartitionData(List.of(new ProduceRequestData.PartitionProduceData().setIndex(0).setRecords(raw)));
