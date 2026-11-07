@@ -28,13 +28,17 @@ import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.message.InitProducerIdRequestData;
 import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.ControlRecordType;
 import org.apache.kafka.common.record.MemoryRecords;
+import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.record.SimpleRecord;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
+import org.apache.kafka.common.requests.InitProducerIdRequest;
+import org.apache.kafka.common.requests.InitProducerIdResponse;
 import org.apache.kafka.common.requests.ProduceRequest;
 import org.apache.kafka.common.requests.ProduceResponse;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -63,8 +67,7 @@ final class KafkaObjectCompactionRealScenario {
 
     static int seed(KafkaClusterTestKit cluster, Properties client) throws Exception {
         long now = System.currentTimeMillis();
-        append(cluster, 0, row(now, "replace", "old-zero"), row(now, "keep", "middle"),
-                row(now, "replace-2", "old-two"));
+        IdempotentSample.seed(cluster, now);
         append(cluster, 3, row(now + 1, "replace", "new-three"), row(now + 1, "replace-2", "new-four"));
         append(cluster, 5, row(now + 2, "gone", "old-five"));
         append(cluster, 6, row(now + 3, "gone", null));
@@ -104,14 +107,17 @@ final class KafkaObjectCompactionRealScenario {
     }
 
     private static void append(KafkaClusterTestKit cluster, long offset, SimpleRecord... rows) throws Exception {
-        var raw = MemoryRecords.withRecords(Compression.NONE, rows);
+        append(cluster, 0, offset, MemoryRecords.withRecords(Compression.NONE, rows));
+    }
+
+    private static void append(KafkaClusterTestKit cluster, int broker, long offset, MemoryRecords raw) throws Exception {
         var topic = new ProduceRequestData.TopicProduceData().setName(TOPIC)
                 .setPartitionData(List.of(new ProduceRequestData.PartitionProduceData().setIndex(0).setRecords(raw)));
         var topics = new ProduceRequestData.TopicProduceDataCollection();
         topics.add(topic);
         var request = new ProduceRequest(new ProduceRequestData().setAcks((short) -1).setTimeoutMs(10_000).setTopicData(topics),
                 (short) 9);
-        try (var wire = new NativeKafkaRequest(cluster, 0, request)) {
+        try (var wire = new NativeKafkaRequest(cluster, broker, request)) {
             var response = (ProduceResponse) wire.receive(30_000);
             var data = response.data().responses().iterator().next().partitionResponses().get(0);
             assertEquals(Errors.NONE, Errors.forCode(data.errorCode()));
@@ -137,12 +143,16 @@ final class KafkaObjectCompactionRealScenario {
         var offsets = new ArrayList<Long>();
         batch.forEach(record -> offsets.add(record.offset()));
         assertEquals(List.of(1L), offsets, "the rewritten batch did not preserve its original sparse offsets");
+        IdempotentSample.verifyReplay(cluster, broker, batch);
 
         var gap = fetch(cluster, topic, broker, 5);
         assertEquals(Errors.NONE, Errors.forCode(gap.errorCode()));
-        var tombstone = FetchResponse.recordsOrFail(gap).records().iterator().next();
+        assertEquals(end, gap.highWatermark(), "retry of the original producer batch allocated another offset");
+        var tombstoneBatch = FetchResponse.recordsOrFail(gap).batches().iterator().next();
+        var tombstone = tombstoneBatch.iterator().next();
         assertEquals(6, tombstone.offset(), "Fetch did not skip the fully compacted batch");
         assertNull(tombstone.value(), "compaction discarded or rewrote the latest tombstone");
+        assertTrue(tombstoneBatch.deleteHorizonMs().orElseThrow() > tombstone.timestamp());
 
         verifyTransactions(cluster, topic, broker, end, client);
     }
@@ -173,6 +183,33 @@ final class KafkaObjectCompactionRealScenario {
         assertTrue(batch.isControlBatch());
         assertEquals(offset, batch.baseOffset());
         assertEquals(kind, ControlRecordType.parse(batch.iterator().next().key()));
+    }
+
+    private static final class IdempotentSample {
+        private static void seed(KafkaClusterTestKit cluster, long timestamp) throws Exception {
+            var request = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
+                    .setTransactionalId(null).setTransactionTimeoutMs(30_000)).build((short) 4);
+            try (var wire = new NativeKafkaRequest(cluster, 0, request)) {
+                var producer = ((InitProducerIdResponse) wire.receive(30_000)).data();
+                assertEquals(Errors.NONE, Errors.forCode(producer.errorCode()));
+                append(cluster, 0, 0, records(producer.producerId(), producer.producerEpoch(), timestamp));
+            }
+        }
+
+        private static void verifyReplay(KafkaClusterTestKit cluster, int broker, RecordBatch compacted) throws Exception {
+            assertTrue(compacted.hasProducerId());
+            assertEquals(0, compacted.baseSequence());
+            assertEquals(2, compacted.lastSequence());
+            assertEquals(1, compacted.iterator().next().sequence());
+            append(cluster, broker, 0, records(compacted.producerId(), compacted.producerEpoch(),
+                    compacted.iterator().next().timestamp()));
+        }
+
+        private static MemoryRecords records(long producerId, short producerEpoch, long timestamp) {
+            return MemoryRecords.withIdempotentRecords(Compression.NONE, producerId, producerEpoch, 0,
+                    row(timestamp, "replace", "old-zero"), row(timestamp, "keep", "middle"),
+                    row(timestamp, "replace-2", "old-two"));
+        }
     }
 
     static void verifyMissingFailsClosed(KafkaClusterTestKit cluster, Uuid topic, int broker) throws Exception {
