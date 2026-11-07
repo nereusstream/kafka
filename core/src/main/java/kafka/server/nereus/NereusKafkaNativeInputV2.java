@@ -900,8 +900,18 @@ public final class NereusKafkaNativeInputV2 {
                 return NereusKafkaObjectMaterialization.register(prepared, profile, partition, metadata, () -> {
                     requireOpen();
                     requireCurrentLocal();
-                }, () -> proposeCurrentWorker(workers, profile.scopeId().digest(),
-                        Sha256Digest.hash(profile.physicalBinding().encode())));
+                }, () -> {
+                    var namespace = Sha256Digest.hash(profile.physicalBinding().encode());
+                    var plan = prepared.plan();
+                    return workers.resumePlan(plan, nativeWorkerFence(), namespace).orElseGet(() -> {
+                        var proposal = proposeCurrentWorker(workers, profile.scopeId().digest(), namespace);
+                        if (!proposal.identity().equals(plan.sourceCut().identity())) {
+                            throw new IllegalStateException("Kafka Object worker identity changed during registration");
+                        }
+                        return proposal.admitPlan(plan).orElseThrow(
+                                () -> new IllegalStateException("Kafka Object worker predecessor changed"));
+                    });
+                });
             }, control)));
         }
 
@@ -964,14 +974,17 @@ public final class NereusKafkaNativeInputV2 {
         private M5MaterializationWorkerCoordinatorV1.Proposal proposeCurrentWorker(
                 M5MaterializationWorkerCoordinatorV1 workers, Sha256Digest outputProviderScope,
                 Sha256Digest outputNamespaceBinding) {
+            return workers.propose(selector.get(), opened.nativeM5ProtocolCell(), outputProviderScope,
+                    opened.nativeM5StorageFence(), nativeWorkerFence(), outputNamespaceBinding)
+                    .orElseThrow(() -> new IllegalStateException("native M5 worker predecessor changed"));
+        }
+
+        private Sha256Digest nativeWorkerFence() {
             byte[] domain = "NEREUS_M5_KAFKA_NATIVE_WORKER_OWNER_V1".getBytes(StandardCharsets.US_ASCII);
             var bytes = ByteBuffer.allocate(domain.length + 3 * Long.BYTES + 2 * Integer.BYTES)
                     .put(domain).putLong(owner.ownerEpoch()).putInt(owner.kafkaLeaderEpoch())
                     .putInt(owner.brokerId()).putLong(owner.brokerEpoch()).putLong(owner.metadataOffset());
-            return workers.propose(selector.get(), opened.nativeM5ProtocolCell(),
-                    outputProviderScope, opened.nativeM5StorageFence(),
-                    Sha256Digest.hash(CanonicalBytes.copyOf(bytes.array())), outputNamespaceBinding)
-                    .orElseThrow(() -> new IllegalStateException("native M5 worker predecessor changed"));
+            return Sha256Digest.hash(CanonicalBytes.copyOf(bytes.array()));
         }
 
         /** Exact native membership recheck, for use before the separately authorized publication CAS. */

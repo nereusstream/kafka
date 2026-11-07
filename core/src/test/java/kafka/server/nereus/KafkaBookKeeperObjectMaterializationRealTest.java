@@ -411,6 +411,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         var prepared = withCurrentMetadataImage(() -> captured.prepareObjectMaterialization(provider));
         var registered = captured.registerObjectMaterialization(prepared, provider).toCompletableFuture()
                 .get(30, TimeUnit.SECONDS);
+        var resumed = captured.registerObjectMaterialization(prepared, provider).toCompletableFuture()
+                .get(30, TimeUnit.SECONDS);
+        assertEquals(registered.worker().worker(), resumed.worker().worker());
+        assertEquals(registered.pending(), resumed.pending());
         verifyExhaustion(opened, captured, registered, provider, fixture.verifyNoOutputs());
         var verified = captured.storeObjectMaterialization(registered, provider, Duration.ofSeconds(10))
                 .toCompletableFuture().get(30, TimeUnit.SECONDS);

@@ -145,7 +145,7 @@ final class NereusKafkaObjectMaterialization {
     }
 
     static Registered register(Prepared prepared, M5CellProviderProfileV2 provider, int partition,
-            CanonicalControlMetadataStore metadata, Runnable requireCurrent, Supplier<Proposal> currentProposal) {
+            CanonicalControlMetadataStore metadata, Runnable requireCurrent, Supplier<Admission> admitWorker) {
         var plan = prepared.plan();
         var workerIdentity = plan.sourceCut().identity();
         if (!workerIdentity.protocolCellSha256().equals(provider.protocolCellSha256())
@@ -171,12 +171,10 @@ final class NereusKafkaObjectMaterialization {
         requireCurrent.run();
         // Task and Cell writes can advance the Binding revision through their own mutation tickets.
         // Refresh that revision only while the selector and the intended next worker identity are unchanged.
-        var proposal = currentProposal.get();
-        if (!proposal.identity().equals(workerIdentity)) {
-            throw new IllegalStateException("Kafka Object worker identity changed during registration");
+        var worker = admitWorker.get();
+        if (!worker.worker().identity().equals(workerIdentity)) {
+            throw new IllegalStateException("Kafka Object registration did not adopt its original worker");
         }
-        var worker = proposal.admitPlan(plan).orElseThrow(
-                () -> new IllegalStateException("Kafka Object worker predecessor changed"));
         var pending = M5PendingOutputInventoryV2.prepare(plan, provider, worker.worker());
         var key = new M5MaterializationKeysV1(partition, workerIdentity.binding()).pendingOutputs(plan.taskIdSha256());
         var encoded = pending.encode();
