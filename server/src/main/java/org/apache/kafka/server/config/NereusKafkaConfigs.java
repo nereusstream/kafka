@@ -60,6 +60,8 @@ public final class NereusKafkaConfigs {
     public static final String OBJECT_REGION_CONFIG = "nereus.kafka.storage.object.region";
     public static final String OBJECT_PATH_STYLE_ACCESS_CONFIG =
             "nereus.kafka.storage.object.path.style.access";
+    public static final String OBJECT_CAPABILITY_FILE_CONFIG = "nereus.kafka.storage.object.capability.file";
+    public static final String OBJECT_CREDENTIALS_FILE_CONFIG = "nereus.kafka.storage.object.credentials.file";
     public static final String BOOKKEEPER_CAPABILITY_FILE_CONFIG = "nereus.kafka.bookkeeper.capability.file";
     public static final String BOOKKEEPER_METADATA_SERVICE_URI_CONFIG =
             "nereus.kafka.storage.bookkeeper.metadata.service.uri";
@@ -343,6 +345,10 @@ public final class NereusKafkaConfigs {
                     "Optional object-store region.")
             .define(OBJECT_PATH_STYLE_ACCESS_CONFIG, BOOLEAN, false, LOW,
                     "Use provider-specific path-style object-store access.")
+            .define(OBJECT_CAPABILITY_FILE_CONFIG, STRING, null, HIGH,
+                    "Path to the canonical admitted V2 Object provider profile for this Kafka Cell.")
+            .define(OBJECT_CREDENTIALS_FILE_CONFIG, STRING, null, HIGH,
+                    "Path to the AWS credentials file for this Kafka Cell's admitted credential scope.")
             .define(BOOKKEEPER_CAPABILITY_FILE_CONFIG, STRING, null, HIGH,
                     "Path to the admitted V2 BookKeeper capability descriptor, required by the native BK runtime.")
             .define(BOOKKEEPER_METADATA_SERVICE_URI_CONFIG, STRING, null, HIGH,

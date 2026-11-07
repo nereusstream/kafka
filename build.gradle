@@ -1122,8 +1122,23 @@ project(':core') {
     test {
       filter {
         excludeTestsMatching 'kafka.server.nereus.KafkaBookKeeperAckRealTest'
+        excludeTestsMatching 'kafka.server.nereus.KafkaObjectProviderAdmissionRealTest'
         excludeTestsMatching 'kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest'
         excludeTestsMatching 'kafka.server.nsip.KafkaBookKeeperProcessRealTest'
+      }
+    }
+    tasks.register('nereusObjectProviderAdmissionRealTest', Test) {
+      group = 'verification'
+      description = 'Reopens the native Kafka Object provider against explicit real MinIO and Oxia inputs.'
+      testClassesDirs = sourceSets.test.output.classesDirs
+      classpath = sourceSets.test.runtimeClasspath
+      useJUnitPlatform()
+      filter { includeTestsMatching 'kafka.server.nereus.KafkaObjectProviderAdmissionRealTest' }
+      dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain'
+      outputs.upToDateWhen { false }
+      doFirst {
+        systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+        systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
       }
     }
     tasks.register('nereusBookKeeperOwnerRelocationRealTest', Test) {
@@ -1264,7 +1279,7 @@ project(':core') {
 
     // Nereus inject start: exact product-owned adapter boundary
     if (nereusDevelopmentEnabled) {
-      ['nereus-kafka-bookkeeper', 'nereus-storage-bookkeeper', 'nereus-metadata-oxia'].each { moduleName ->
+      ['nereus-kafka-bookkeeper', 'nereus-storage-bookkeeper', 'nereus-storage-object-s3', 'nereus-metadata-oxia'].each { moduleName ->
         implementation("com.nereusstream:${moduleName}:${nereusDevelopmentVersion.get()}") {
           changing = true
           exclude group: 'org.apache.bookkeeper', module: 'circe-checksum'

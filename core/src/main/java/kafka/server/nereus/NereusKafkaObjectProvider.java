@@ -1,0 +1,182 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.server.nereus;
+
+import kafka.server.KafkaConfig;
+
+import org.apache.kafka.server.config.NereusKafkaConfigs;
+import org.apache.kafka.server.config.NereusKafkaStorageConfig;
+
+import com.nereusstream.domain.bytes.CanonicalBytes;
+import com.nereusstream.domain.bytes.Sha256Digest;
+import com.nereusstream.domain.protocol.KafkaProtocolCellIdentity;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaCellProviderScopeRegistryV2;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
+import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
+import com.nereusstream.storage.object.provider.C1ObjectProviderSession;
+import com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport;
+import com.nereusstream.storage.object.s3.S3M5PhysicalNamespaceAuthorityV2;
+
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeUnit;
+
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.profiles.ProfileFile;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+
+/** Reopens one already-admitted S3 namespace and credential scope for one Kafka Cell. */
+final class NereusKafkaObjectProvider implements AutoCloseable {
+    private static final String ACCESS_KEY = "aws_access_key_id";
+    private static final String SECRET_KEY = "aws_secret_access_key";
+    private static final String SESSION_TOKEN = "aws_session_token";
+
+    private final OxiaCellProviderScopeRegistryV2.Admission admission;
+    private final S3C1ObjectProviderTransport transport;
+    private final C1ObjectProviderSession session;
+
+    private NereusKafkaObjectProvider(OxiaCellProviderScopeRegistryV2.Admission admission,
+            S3C1ObjectProviderTransport transport, C1ObjectProviderSession session) {
+        this.admission = admission;
+        this.transport = transport;
+        this.session = session;
+    }
+
+    static M5CellProviderProfileV2 profile(KafkaConfig config, KafkaProtocolCellIdentity cell) throws IOException {
+        var core = config.nereusKafkaStorageConfig().core();
+        if (core.objectProvider().filter("s3"::equals).isEmpty()) {
+            throw new IllegalArgumentException("native Kafka Object requires the qualified s3 provider");
+        }
+        var path = requiredPath(config, NereusKafkaConfigs.OBJECT_CAPABILITY_FILE_CONFIG);
+        M5CellProviderProfileV2 profile;
+        try (var in = Files.newInputStream(path)) {
+            profile = M5CellProviderProfileV2.decode(CanonicalBytes.copyOf(
+                    in.readNBytes(M5CellProviderProfileV2.MAX_BYTES + 1)));
+        }
+        if (!profile.protocolCell().equals(cell)
+                || !profile.adapterVersion().equals(S3C1ObjectProviderTransport.ADAPTER_VERSION)
+                || !profile.providerConfigurationSha256().equals(configurationSha256(core))) {
+            throw new IllegalArgumentException("native Kafka Object capability belongs to another Cell or provider configuration");
+        }
+        return profile;
+    }
+
+    static NereusKafkaObjectProvider open(KafkaConfig config, KafkaProtocolCellIdentity cell,
+            OxiaPhysicalMetadataNamespaceV2 namespace) throws Exception {
+        var profile = profile(config, cell);
+        var core = config.nereusKafkaStorageConfig().core();
+        var timeout = config.nereusKafkaStorageConfig().lifecycle().recoveryTimeout();
+        var credentials = credentials(requiredPath(config, NereusKafkaConfigs.OBJECT_CREDENTIALS_FILE_CONFIG),
+                profile.references().credentialScope());
+        var builder = S3Client.builder().region(Region.of(core.objectRegion().orElseThrow()))
+                .forcePathStyle(core.objectPathStyleAccess())
+                .overrideConfiguration(settings -> settings.apiCallTimeout(timeout))
+                .credentialsProvider(credentials);
+        core.objectEndpoint().ifPresent(builder::endpointOverride);
+        var client = builder.build();
+        try {
+            var bucket = core.objectBucket().orElseThrow();
+            var expected = profile.physicalBinding().physicalNamespace();
+            var physical = S3M5PhysicalNamespaceAuthorityV2.connect(client, bucket, expected);
+            var admission = namespace.openCellProviderScopes(physical)
+                    .thenCompose(registry -> registry.reopen(profile)).toCompletableFuture()
+                    .get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            var transport = S3C1ObjectProviderTransport.admitVersionMatchDeleteV1(
+                    client, bucket, expected.serviceIdentity().value(), true, profile.maximumListPageKeys(),
+                    profile.references().allowedEncryptionScope());
+            var capability = transport.capabilities();
+            if (profile.maximumObjectBytes() > capability.maximumObjectBytes()
+                    || profile.maximumRangeBytes() > capability.maximumRangeBytes()
+                    || profile.maximumVersionTokenBytes() > transport.deleteCapabilities().maximumVersionTokenBytes()) {
+                throw new IllegalArgumentException("native Kafka Object capability exceeds the actual provider limits");
+            }
+            var session = new C1ObjectProviderSession(transport, profile.scopeId(), profile.exclusiveNamespacePrefix(),
+                    profile.maximumObjectBytes(), Math.min(profile.maximumRangeBytes(), 65_536));
+            return new NereusKafkaObjectProvider(admission, transport, session);
+        } catch (Exception | Error failure) {
+            try {
+                client.close();
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            throw failure;
+        }
+    }
+
+    static Sha256Digest configurationSha256(NereusKafkaStorageConfig.Core core) throws IOException {
+        var bytes = new ByteArrayOutputStream();
+        try (var out = new DataOutputStream(bytes)) {
+            out.writeUTF("NEREUS_KAFKA_S3_CONFIG_V1");
+            out.writeUTF(core.objectProvider().orElseThrow());
+            out.writeUTF(core.objectBucket().orElseThrow());
+            out.writeUTF(core.objectRegion().orElseThrow());
+            // The registered physical namespace, rather than an endpoint alias, identifies the bucket instance.
+            out.writeBoolean(core.objectPathStyleAccess());
+            out.writeUTF(S3C1ObjectProviderTransport.ADAPTER_VERSION);
+        }
+        return Sha256Digest.hash(CanonicalBytes.copyOf(bytes.toByteArray()));
+    }
+
+    private static Path requiredPath(KafkaConfig config, String key) {
+        String value = config.getString(key);
+        if (value == null || value.isBlank()) throw new IllegalArgumentException("native Kafka Object requires " + key);
+        return Path.of(value);
+    }
+
+    private static StaticCredentialsProvider credentials(Path file, String scope) {
+        Map<String, String> properties = ProfileFile.builder().content(file)
+                .type(ProfileFile.Type.CREDENTIALS).build().profile(scope).orElseThrow(
+                        () -> new IllegalArgumentException("native Kafka Object credential scope is absent"))
+                .properties();
+        if (properties.keySet().equals(Set.of(ACCESS_KEY, SECRET_KEY))) {
+            return StaticCredentialsProvider.create(AwsBasicCredentials.create(
+                    properties.get(ACCESS_KEY), properties.get(SECRET_KEY)));
+        }
+        if (properties.keySet().equals(Set.of(ACCESS_KEY, SECRET_KEY, SESSION_TOKEN))) {
+            return StaticCredentialsProvider.create(AwsSessionCredentials.create(
+                    properties.get(ACCESS_KEY), properties.get(SECRET_KEY), properties.get(SESSION_TOKEN)));
+        }
+        throw new IllegalArgumentException("native Kafka Object credentials must be explicit for the admitted scope");
+    }
+
+    C1ObjectProviderSession session() {
+        return session;
+    }
+
+    CompletionStage<Void> requireCurrent() {
+        return admission.requireCurrent();
+    }
+
+    void beginDrain() {
+        session.drain();
+    }
+
+    @Override
+    public void close() {
+        session.close();
+        transport.close();
+    }
+}
