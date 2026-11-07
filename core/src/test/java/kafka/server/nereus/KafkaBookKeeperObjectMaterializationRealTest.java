@@ -616,7 +616,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertEquals(selector.selectedViewSha256(), reopened.manifestSha256());
             assertEquals(verified.protections(), reopened.originalFallbackSources());
             if (fault.retireFallback) {
-                retireWhileReadHeld(opened, probe, reads, produced, selector, client, cold);
+                retireWhileReadHeld(opened, probe, reads, produced, selector, provider, client, cold);
                 return;
             }
             if (fault.enabled) {
@@ -672,7 +672,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
 
     private static void retireWhileReadHeld(NereusKafkaOwnedProviderRuntime.Opened owner,
             FetchProbe probe, HeldObjectFetch reads, int produced, BindingReadSelector selected,
-            Properties client, ColdTakeover cold) throws Exception {
+            NereusKafkaObjectProvider provider, Properties client, ColdTakeover cold) throws Exception {
         var route = owner.nativeM5BindingRoute();
         var raw = owner.storage().nativeReadSources();
         var control = Executors.newSingleThreadExecutor();
@@ -716,7 +716,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertEquals(selected.selectedViewSha256(), result.selector().selectedViewSha256());
             assertEquals(selected.readAdmissionEpoch() + 1, result.selector().readAdmissionEpoch());
             assertEquals(result.selector(), route.readSelector().orElseThrow());
-            verifyTransferredCheckpoint(owner, probe, result, client, end, cold);
+            verifyTransferredCheckpoint(owner, probe, result, provider, client, end, cold);
         } finally {
             hold.release().complete(null);
             control.shutdown();
@@ -726,7 +726,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
 
     private static void verifyTransferredCheckpoint(NereusKafkaOwnedProviderRuntime.Opened owner, FetchProbe probe,
             com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperNativeFallbackRetirementV2.Result released,
-            Properties client, int end, ColdTakeover cold) throws Exception {
+            NereusKafkaObjectProvider provider, Properties client, int end, ColdTakeover cold) throws Exception {
         var before = owner.storage().nativeInputSources().recoveryCheckpoint().orElseThrow();
         var transfer = owner.storage().transferRetiredObjectBookKeeperPrefix(released);
         assertEquals(before.components(), transfer.checkpoint().components());
@@ -744,7 +744,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         assertEquals(released.selector().selectedViewSha256(), selector.selectedViewSha256());
         var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
         assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
-        owner.persistNativeObjectReadScope(transfer).toCompletableFuture().get(30, TimeUnit.SECONDS);
+        NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata.persistObjectScope(owner, provider, transfer, Duration.ofSeconds(10))
+                .toCompletableFuture().get(30, TimeUnit.SECONDS);
         probe.held().observeRetainedCheckpoint(transfer);
         verifyColdSelector(selector, cold.relocate(), client, expected, probe.held());
         probe.held().assertRetainedRecovery();
