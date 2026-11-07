@@ -28,6 +28,7 @@ import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
 import org.apache.kafka.server.common.MetadataVersion;
 
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
+import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
 import com.nereusstream.storage.object.gc.M5ObjectBirthCreditV3;
 import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
@@ -212,8 +213,26 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 .toCompletableFuture().get(30, TimeUnit.SECONDS);
         assertEquals(verified.stored().credits(), replay.stored().credits());
         assertEquals(verified.generation(), replay.generation());
+        verifyPrefixRead(captured, prepared, verified, provider);
         assertEquals(captured.predecessorSelector(), opened.nativeM5BindingRoute().readSelector().orElseThrow());
         captured.discard().toCompletableFuture().get(30, TimeUnit.SECONDS);
+    }
+
+    private static void verifyPrefixRead(NereusKafkaNativeInputV2.Captured captured,
+            NereusKafkaObjectMaterialization.Prepared prepared, NereusKafkaObjectMaterialization.Verified verified,
+            NereusKafkaObjectProvider provider) throws Exception {
+        var prefix = new KafkaObjectMaterializedPrefixV1(prepared.plan(), verified.generation(),
+                object -> provider.readVersion(object.identity(), object.immutableProviderVersionToken().orElseThrow())
+                        .value());
+        var coverage = prefix.coverage();
+        var full = prefix.read(coverage.inclusiveStart(), coverage.exclusiveEnd() + 1, BOUNDS.payloadBytes());
+        var original = captured.batches().stream().map(batch -> batch.canonicalBody()).toList();
+        assertEquals(original, full.batches().stream()
+                .map(KafkaObjectMaterializedPrefixV1.SelectedBatch::rawAssignedRecordBatch).toList());
+        assertTrue(full.canReadTail());
+        var first = prefix.read(coverage.inclusiveStart(), coverage.exclusiveEnd(), 1);
+        assertEquals(List.of(full.batches().get(0)), first.batches());
+        assertTrue(!first.canReadTail());
     }
 
     private static void verifyExhaustion(NereusKafkaOwnedProviderRuntime.Opened opened, NereusKafkaNativeInputV2.Captured captured,
