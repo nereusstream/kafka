@@ -30,11 +30,11 @@ import java.nio.ByteBuffer;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** One Kafka protocol exchange with no client retries. */
-final class NativeKafkaRequest implements AutoCloseable {
+public final class NativeKafkaRequest implements AutoCloseable {
     private final Socket socket;
     private final RequestHeader header;
 
-    NativeKafkaRequest(KafkaClusterTestKit cluster, int broker, AbstractRequest request) throws IOException {
+    public NativeKafkaRequest(KafkaClusterTestKit cluster, int broker, AbstractRequest request) throws IOException {
         header = new RequestHeader(request.apiKey(), request.version(), "nsip-native", 1);
         socket = new Socket("127.0.0.1",
                 cluster.brokers().get(broker).socketServer().boundPort(cluster.nodes().brokerListenerName()));
@@ -54,7 +54,7 @@ final class NativeKafkaRequest implements AutoCloseable {
         }
     }
 
-    AbstractResponse receive(int timeoutMs) throws IOException {
+    public AbstractResponse receive(int timeoutMs) throws IOException {
         socket.setSoTimeout(timeoutMs);
         var input = new DataInputStream(socket.getInputStream());
         int length = input.readInt();
