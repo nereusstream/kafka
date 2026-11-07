@@ -46,6 +46,9 @@ final class NereusKafkaObjectReplacementV1 {
 
     static Selection capture(NereusKafkaObjectRecovery.Selected selected, KafkaBookKeeperClosedHistoryRecoveryV1.ObjectPrefix prefix,
             OxiaKafkaBookKeeperM4ReadRouteV2 binding, PhysicalResourceIdV2.Namespace bookKeeper, int partition) {
+        if (!selected.prefix().rawFallbackEquivalent()) {
+            throw new IllegalStateException("semantic Kafka Object replacement needs its own retirement comparison");
+        }
         var plan = selected.plan();
         var cell = plan.sourceCut().identity().protocolCellSha256();
         var keys = new M5MaterializationKeysV1(partition, prefix.selector().binding());

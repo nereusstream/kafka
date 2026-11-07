@@ -108,7 +108,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final String TOPIC = "native-cold";
 
     @ParameterizedTest
-    @ValueSource(strings = {"known", "cold", "hot", "automatic", "retirement", "faults"})
+    @ValueSource(strings = {"known", "cold", "hot", "automatic", "retirement", "faults", "semantic"})
     @Timeout(240)
     public void storesAndVerifiesTheRealNativeSealedPrefix(String outcome, @TempDir Path work) throws Exception {
         writeM6Capability(work);
@@ -145,12 +145,11 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             client.put("bootstrap.servers", cluster.bootstrapServers());
             Uuid topicId;
             try (var admin = Admin.create(client)) {
-                var topic = new NewTopic(TOPIC, Map.of(0, List.of(0)))
-                        .configs(Map.of("nereus.storage.profile", "BOOKKEEPER_WAL_ASYNC_OBJECT"));
+                var topic = nativeTopic(fault.semantic);
                 topicId = admin.createTopics(List.of(topic)).topicId(TOPIC).get(30, TimeUnit.SECONDS);
             }
             var opened = first.get(30, TimeUnit.SECONDS);
-            int produced = 0;
+            int produced = fault.semantic ? KafkaObjectCompactionRealScenario.seed(cluster) : 0;
             while (sealedRuns(opened) < 2 && produced < 32) {
                 KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + produced, produced);
                 produced++;
@@ -167,6 +166,14 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             cluster.fatalFaultHandler().maybeRethrowFirstException();
             cluster.nonFatalFaultHandler().maybeRethrowFirstException();
         }
+    }
+
+    private static NewTopic nativeTopic(boolean semantic) {
+        var settings = semantic
+                ? Map.of("nereus.storage.profile", "BOOKKEEPER_WAL_ASYNC_OBJECT", "cleanup.policy", "compact",
+                        "min.cleanable.dirty.ratio", "0.0")
+                : Map.of("nereus.storage.profile", "BOOKKEEPER_WAL_ASYNC_OBJECT");
+        return new NewTopic(TOPIC, Map.of(0, List.of(0))).configs(settings);
     }
 
     private static NereusKafkaOwnedProviderRuntime.NativeRunResponseObserver observer(
@@ -248,6 +255,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean automatic;
         private final boolean retireFallback;
         private final boolean readFaults;
+        private final boolean semantic;
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
         private final CompletableFuture<M5PendingOutputInventoryV2> pendingApplied = new CompletableFuture<>();
         private final CompletableFuture<Void> pendingReadDenied = new CompletableFuture<>();
@@ -260,6 +268,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             automatic = outcome.equals("automatic");
             retireFallback = outcome.equals("retirement");
             readFaults = outcome.equals("faults");
+            semantic = outcome.equals("semantic");
         }
 
         private AsyncOxiaClient wrap(AsyncOxiaClient client) {
@@ -577,7 +586,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             try (var provider = NereusKafkaObjectProvider.open(objectConfig, cell, namespace)) {
                 Runnable verifyNoOutputs = () -> {
                     var objects = minio.listObjectVersions(list -> list.bucket(bucket)
-                            .prefix(profile.exclusiveNamespacePrefix() + "/m5/materialization/"));
+                            .prefix(profile.exclusiveNamespacePrefix() + "/m5/"));
                     assertTrue(objects.versions().isEmpty(), "an incomplete quota reservation wrote Object data");
                 };
                 // Inject one missing immutable version only in this test's exclusive MinIO bucket.
@@ -613,8 +622,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         verifyExhaustion(opened, captured, registered, provider, fixture.verifyNoOutputs());
         var verified = captured.storeObjectMaterialization(registered, provider, Duration.ofSeconds(10))
                 .toCompletableFuture().get(30, TimeUnit.SECONDS);
-        assertEquals(PayloadKind.KAFKA_BATCH_PRESERVING_V1, verified.generation().generation().payloadKind());
-        assertEquals(captured.extents().size(), verified.generation().generation().payloadObjects().size());
+        assertEquals(probe.fault().semantic ? PayloadKind.KAFKA_SEMANTIC_COMPACTED_V1 : PayloadKind.KAFKA_BATCH_PRESERVING_V1,
+                verified.generation().generation().payloadKind());
+        assertEquals(probe.fault().semantic ? 1 : captured.extents().size(), verified.generation().generation().payloadObjects().size());
         assertEquals(captured.frontiers().candidateEndOffsetExclusive(),
                 verified.generation().generation().coverage().exclusiveEnd());
         assertEquals(registered.pending().outputs().size(), verified.stored().credits().size());
@@ -632,7 +642,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 .toCompletableFuture().get(30, TimeUnit.SECONDS);
         assertEquals(verified.stored().credits(), replay.stored().credits());
         assertEquals(verified.generation(), replay.generation());
-        verifyPrefixRead(captured, prepared, verified, provider);
+        if (!probe.fault().semantic) verifyPrefixRead(captured, prepared, verified, provider);
         assertEquals(captured.predecessorSelector(), opened.nativeM5BindingRoute().readSelector().orElseThrow());
         publishAndRead(opened, captured, verified, fixture, client, produced, probe, cold);
     }
@@ -713,14 +723,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                     provider, Duration.ofSeconds(10)).orElseThrow().prefix();
             assertEquals(selector.selectedViewSha256(), reopened.manifestSha256());
             assertEquals(verified.protections(), reopened.originalFallbackSources());
-            if (fault.readFaults) {
-                HeldFetch.verifyFaultMatrix(opened, fixture, verified, probe, selector, produced);
-                return;
-            }
-            if (fault.retireFallback) {
-                retireWhileReadHeld(opened, probe, reads, produced, selector, provider, client, cold);
-                return;
-            }
+            if (verifySpecialSelection(opened, verified, fixture, client, produced, probe, selector, cold, reads)) return;
             if (fault.enabled) {
                 fault.verifyOriginalWork(opened, fixture, verified, true);
                 if (fault.recoverHot) {
@@ -760,6 +763,41 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertEquals(selector.selectedViewSha256(),
                     recovered.nativeM5BindingRoute().readSelector().orElseThrow().selectedViewSha256());
         }
+    }
+
+    private static boolean verifySpecialSelection(NereusKafkaOwnedProviderRuntime.Opened owner,
+            NereusKafkaObjectMaterialization.Verified verified, Fixture fixture, Properties client,
+            int produced, FetchProbe probe, BindingReadSelector selector, ColdTakeover cold, HeldObjectFetch reads) throws Exception {
+        var fault = probe.fault();
+        if (fault.semantic) {
+            verifySemanticSelection(owner, verified, fixture, client, produced, probe, selector, cold);
+        } else if (fault.readFaults) {
+            HeldFetch.verifyFaultMatrix(owner, fixture, verified, probe, selector, produced);
+        } else if (fault.retireFallback) {
+            retireWhileReadHeld(owner, probe, reads, produced, selector, fixture.provider(), client, cold);
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    private static void verifySemanticSelection(NereusKafkaOwnedProviderRuntime.Opened owner,
+            NereusKafkaObjectMaterialization.Verified verified, Fixture fixture, Properties client,
+            int produced, FetchProbe probe, BindingReadSelector selector, ColdTakeover cold) throws Exception {
+        var cluster = probe.cluster();
+        var topic = probe.topicId();
+        owner.storage().verifySelectedObjectPrefix(selector.selectedViewSha256()).toCompletableFuture().get(30, TimeUnit.SECONDS);
+        int reads = probe.held().originalPrefixReads.get();
+        KafkaObjectCompactionRealScenario.verify(cluster, topic, 0, produced, client);
+        var recovered = cold.relocate();
+        var after = recovered.nativeM5BindingRoute().readSelector().orElseThrow();
+        assertTrue(after.ownerEpoch() > selector.ownerEpoch());
+        assertEquals(selector.selectedViewSha256(), after.selectedViewSha256());
+        KafkaObjectCompactionRealScenario.verify(cluster, topic, 1, produced, client);
+        assertEquals(reads, probe.held().originalPrefixReads.get(), "compacted Fetch used the original raw BK prefix");
+        fixture.removeVersion().accept(verified.generation().generation().payloadObjects().get(0));
+        KafkaObjectCompactionRealScenario.verifyMissingFailsClosed(cluster, topic, 1);
+        assertEquals(reads, probe.held().originalPrefixReads.get(), "missing compacted Object exposed unfiltered BK bytes");
     }
 
     private static int produceThroughRollover(NereusKafkaOwnedProviderRuntime.Opened owner, Properties client, int produced)

@@ -19,6 +19,9 @@ package kafka.server.nereus;
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.domain.bytes.CanonicalUtf8;
 import com.nereusstream.domain.bytes.Sha256Digest;
+import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
+import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Disposition;
+import com.nereusstream.kafka.bookkeeper.compaction.KafkaSemanticCompactorV1;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.InputBatch;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMemberInventoryV2.Member;
 import com.nereusstream.storage.api.lifecycle.PhysicalResourceIdV2;
@@ -49,6 +52,7 @@ import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceExtent;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceKind;
 import com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1;
+import com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1.SemanticValidationProof;
 import com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1.ValidatedGeneration;
 import com.nereusstream.storage.object.materialization.M5PendingOutputInventoryV2;
 import com.nereusstream.storage.object.provider.ObjectIdentity;
@@ -82,8 +86,8 @@ final class NereusKafkaObjectMaterialization {
 
     private NereusKafkaObjectMaterialization() { }
 
-    record Prepared(MaterializationPlan plan, M5BytePreservingMaterializerV1.BuildOutput output,
-            M5BytePreservingMaterializerV1.SourceReader sourceReader) { }
+    record Prepared(MaterializationPlan plan, List<Candidate> candidates,
+            M5BytePreservingMaterializerV1.SourceReader sourceReader, Optional<SemanticValidationProof> semantic) { }
 
     record Registered(Prepared prepared, Admission worker, M5PendingOutputInventoryV2 pending,
             CanonicalControlMetadataStore metadata, String pendingKey, int partition) { }
@@ -102,7 +106,7 @@ final class NereusKafkaObjectMaterialization {
     }
 
     static Prepared prepare(NereusKafkaNativeInputV2.Captured capture, Proposal proposal,
-            M5CellProviderProfileV2 provider) {
+            M5CellProviderProfileV2 provider, Caps caps, long decodedBytes) {
         var worker = proposal.identity();
         if (!worker.protocolCellSha256().equals(provider.protocolCellSha256())
                 || !worker.providerScopeSha256().equals(provider.scopeId().digest())) {
@@ -117,12 +121,6 @@ final class NereusKafkaObjectMaterialization {
                 || source.canonicalLength() >= provider.maximumObjectBytes())) {
             throw new IllegalStateException("Kafka byte-preserving materialization requires complete bounded BK sources");
         }
-        var cut = NereusKafkaCompactionPlanV2.sourceCut(capture, worker, provider.scopeId().digest());
-        var plan = new M5MaterializationPlannerV1().plan(cut, new M5MaterializationPlannerV1.PlanningPolicy(
-                PayloadKind.KAFKA_BATCH_PRESERVING_V1, true, digest(provider.references().allowedEncryptionScope()),
-                KEEP_KAFKA_ENCODING, SHA256_AND_KAFKA_CRC,
-                List.of(IndexKind.OFFSET_OR_POSITION, IndexKind.PAYLOAD_LOCATOR, IndexKind.TIMESTAMP, IndexKind.CHECKSUM_COVERAGE),
-                provider.exclusiveNamespacePrefix()));
         var batches = capture.batches().stream().collect(Collectors.groupingBy(InputBatch::sourceIdentitySha256));
         M5BytePreservingMaterializerV1.SourceReader reader = source -> {
             capture.requireOpen();
@@ -131,17 +129,48 @@ final class NereusKafkaObjectMaterialization {
             }
             return sourceBytes(source, batches.getOrDefault(source.sourceIdentitySha256(), List.of()));
         };
-        M5BytePreservingMaterializerV1.BuildOutput output;
+        var prepared = capture.topicPolicy().config().compact
+                ? prepareSemantic(capture, worker, provider, reader, caps, decodedBytes)
+                : preparePreserving(capture, worker, provider, reader);
+        if (prepared.candidates().stream().anyMatch(candidate ->
+                candidate.descriptor().identity().bodyLength() > provider.maximumObjectBytes())) {
+            throw new IllegalStateException("Kafka materialized Object exceeds the admitted provider limit");
+        }
+        return prepared;
+    }
+
+    private static Prepared preparePreserving(NereusKafkaNativeInputV2.Captured capture,
+            com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IdentityEnvelope worker,
+            M5CellProviderProfileV2 provider, M5BytePreservingMaterializerV1.SourceReader reader) {
+        var cut = NereusKafkaCompactionPlanV2.sourceCut(capture, worker, provider.scopeId().digest());
+        var plan = new M5MaterializationPlannerV1().plan(cut, new M5MaterializationPlannerV1.PlanningPolicy(
+                PayloadKind.KAFKA_BATCH_PRESERVING_V1, true, digest(provider.references().allowedEncryptionScope()),
+                KEEP_KAFKA_ENCODING, SHA256_AND_KAFKA_CRC,
+                List.of(IndexKind.OFFSET_OR_POSITION, IndexKind.PAYLOAD_LOCATOR, IndexKind.TIMESTAMP, IndexKind.CHECKSUM_COVERAGE),
+                provider.exclusiveNamespacePrefix()));
         try {
-            output = new M5BytePreservingMaterializerV1().build(plan, reader);
+            var output = new M5BytePreservingMaterializerV1().build(plan, reader);
+            return new Prepared(plan, Stream.concat(output.payloadCandidates().stream(), output.indexCandidates().stream()).toList(),
+                    reader, Optional.empty());
         } catch (IOException failure) {
             throw new UncheckedIOException("Kafka Object candidate could not read its exact retained source", failure);
         }
-        if (Stream.concat(output.payloadCandidates().stream(), output.indexCandidates().stream())
-                .anyMatch(candidate -> candidate.descriptor().identity().bodyLength() > provider.maximumObjectBytes())) {
-            throw new IllegalStateException("Kafka materialized Object exceeds the admitted provider limit");
+    }
+
+    private static Prepared prepareSemantic(NereusKafkaNativeInputV2.Captured capture,
+            com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IdentityEnvelope worker,
+            M5CellProviderProfileV2 provider, M5BytePreservingMaterializerV1.SourceReader reader, Caps caps, long decodedBytes) {
+        var plan = NereusKafkaCompactionPlanV2.buildForTask(capture, worker, caps, decodedBytes);
+        capture.recoveryState().requirePlan(plan);
+        var result = new KafkaSemanticCompactorV1().compactForObjectCell(plan, provider.exclusiveNamespacePrefix(),
+                digest(provider.references().allowedEncryptionScope()));
+        var candidate = result.candidate();
+        if (candidate.dispositions().stream().anyMatch(row -> row.disposition() == Disposition.DROP_EXPIRED_TOMBSTONE)) {
+            throw new IllegalStateException("native Kafka Object compaction cannot retire an expired tombstone");
         }
-        return new Prepared(plan, output, reader);
+        return new Prepared(candidate.materializationPlan(),
+                Stream.concat(Stream.of(candidate.payloadCandidate()), candidate.indexCandidates().stream()).toList(),
+                reader, Optional.of(result.semanticProof()));
     }
 
     static Registered register(Prepared prepared, M5CellProviderProfileV2 provider, int partition,
@@ -158,7 +187,7 @@ final class NereusKafkaObjectMaterialization {
         if (registered != PublicationOutcome.APPLIED_EXACT && registered != PublicationOutcome.EXISTING_EXACT) {
             throw new IllegalStateException("Kafka Object task registration is unresolved: " + registered);
         }
-        var candidates = candidates(prepared);
+        var candidates = prepared.candidates();
         long bytes = candidates.stream().mapToLong(candidate -> candidate.descriptor().identity().bodyLength())
                 .reduce(0, Math::addExact);
         requireCurrent.run();
@@ -201,7 +230,7 @@ final class NereusKafkaObjectMaterialization {
         var worker = task.worker();
         var scope = await(quota.snapshot(), timeout).head().scope();
         var slots = task.pending().outputs();
-        var candidates = candidates(prepared);
+        var candidates = prepared.candidates();
         if (slots.size() != candidates.size()) {
             throw new IllegalStateException("Kafka Object output does not cover the complete pending inventory");
         }
@@ -300,22 +329,25 @@ final class NereusKafkaObjectMaterialization {
         var indexes = stored.outputs().stream().filter(output -> !output.payload()).toList();
         var exactObjects = stored.outputs().stream().collect(Collectors.toUnmodifiableMap(
                 GenerationObject::identity, value -> value.immutableProviderVersionToken().orElseThrow()));
-        var validated = new M5MaterializationValidatorV1().validate(plan, predecessor, protections, payloads, indexes,
-                new M5MaterializationValidatorV1.MaterializationDataReader() {
-                    @Override
-                    public M5MaterializationValidatorV1.VerifiedObjectRead readObject(ObjectIdentity identity)
-                            throws IOException {
-                        var version = exactObjects.get(identity);
-                        if (version == null) throw new IOException("Kafka materialization validation received another Object");
-                        var read = provider.readVersion(identity, version);
-                        return new M5MaterializationValidatorV1.VerifiedObjectRead(read.value(), read.immutableVersionToken());
-                    }
+        var dataReader = new M5MaterializationValidatorV1.MaterializationDataReader() {
+            @Override
+            public M5MaterializationValidatorV1.VerifiedObjectRead readObject(ObjectIdentity identity)
+                    throws IOException {
+                var version = exactObjects.get(identity);
+                if (version == null) throw new IOException("Kafka materialization validation received another Object");
+                var read = provider.readVersion(identity, version);
+                return new M5MaterializationValidatorV1.VerifiedObjectRead(read.value(), read.immutableVersionToken());
+            }
 
-                    @Override
-                    public CanonicalBytes readSource(SourceExtent source) throws IOException {
-                        return prepared.sourceReader().readExact(source);
-                    }
-                });
+            @Override
+            public CanonicalBytes readSource(SourceExtent source) throws IOException {
+                return prepared.sourceReader().readExact(source);
+            }
+        };
+        var validator = new M5MaterializationValidatorV1();
+        var validated = prepared.semantic().isPresent()
+                ? validator.validateSemantic(plan, predecessor, protections, payloads, indexes, dataReader, prepared.semantic().orElseThrow())
+                : validator.validate(plan, predecessor, protections, payloads, indexes, dataReader);
         requireWriteAuthority(task, provider, requireCurrent, timeout);
         return new Verified(stored, validated, protections);
     }
@@ -361,11 +393,6 @@ final class NereusKafkaObjectMaterialization {
 
     private static <T> T await(CompletionStage<T> operation, Duration timeout) throws Exception {
         return operation.toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
-    }
-
-    private static List<Candidate> candidates(Prepared prepared) {
-        return Stream.concat(prepared.output().payloadCandidates().stream(),
-                prepared.output().indexCandidates().stream()).toList();
     }
 
     private static CanonicalBytes sourceBytes(SourceExtent source, List<InputBatch> batches) throws IOException {

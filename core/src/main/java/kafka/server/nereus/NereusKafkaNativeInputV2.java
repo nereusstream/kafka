@@ -915,7 +915,8 @@ public final class NereusKafkaNativeInputV2 {
                     .thenCompose(ignored -> proposeWorker(workers, profile.scopeId().digest(),
                             Sha256Digest.hash(profile.physicalBinding().encode())))
                     .thenApplyAsync(proposal -> terminatedLocal(() ->
-                            NereusKafkaObjectMaterialization.prepare(this, proposal, profile)), control)));
+                            NereusKafkaObjectMaterialization.prepare(this, proposal, profile,
+                                    reservation.allowance.planCaps(), bounds.decodedBytes())), control)));
         }
 
         CompletionStage<NereusKafkaObjectMaterialization.Registered> registerObjectMaterialization(
