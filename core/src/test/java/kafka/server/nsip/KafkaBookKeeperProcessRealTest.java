@@ -47,6 +47,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /** Boots the production launcher in separate JVMs; no injected runtime or test Controller. */
 public class KafkaBookKeeperProcessRealTest {
@@ -252,7 +253,18 @@ public class KafkaBookKeeperProcessRealTest {
         void stop() throws Exception {
             assertTrue(process != null && process.isAlive(), "Node exited before shutdown: " + config);
             process.destroy();
-            assertTrue(process.waitFor(30, TimeUnit.SECONDS), "Node did not exit: " + config);
+            if (!process.waitFor(30, TimeUnit.SECONDS)) {
+                var dumpPath = directory.resolve("shutdown-threads.log");
+                var dump = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "jcmd").toString(),
+                        Long.toString(process.pid()), "Thread.print", "-l")
+                        .redirectErrorStream(true)
+                        .redirectOutput(dumpPath.toFile())
+                        .start();
+                if (!dump.waitFor(5, TimeUnit.SECONDS)) {
+                    dump.destroyForcibly();
+                }
+                fail("Node did not exit: " + config + "; thread dump: " + dumpPath);
+            }
         }
 
         @Override

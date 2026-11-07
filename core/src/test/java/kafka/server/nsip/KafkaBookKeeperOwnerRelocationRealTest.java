@@ -393,19 +393,14 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
             var client = new Properties();
             client.put("bootstrap.servers", cluster.bootstrapServers());
             try (Admin admin = Admin.create(client)) {
-                admin.createTopics(List.of(
+                var topics = admin.createTopics(List.of(
                                 new NewTopic("native-cold", Map.of(0, List.of(0))),
                                 new NewTopic("__transaction_state", Map.of(0, List.of(0)))
                                         .configs(Map.of("cleanup.policy", "compact")),
                                 new NewTopic("__consumer_offsets", Map.of(0, List.of(0)))
-                                        .configs(Map.of("cleanup.policy", "compact"))))
-                        .all()
-                        .get(30, TimeUnit.SECONDS);
-                var topicId = admin.describeTopics(List.of("native-cold"))
-                        .allTopicNames()
-                        .get()
-                        .get("native-cold")
-                        .topicId();
+                                        .configs(Map.of("cleanup.policy", "compact"))));
+                topics.all().get(30, TimeUnit.SECONDS);
+                var topicId = topics.topicId("native-cold").get(30, TimeUnit.SECONDS);
                 var controller = (org.apache.kafka.controller.QuorumController)
                         cluster.controllers().values().iterator().next().controller();
                 org.apache.kafka.controller.NereusNativeLeaderEpochTestBridge.advance(controller, topicId, 255)
