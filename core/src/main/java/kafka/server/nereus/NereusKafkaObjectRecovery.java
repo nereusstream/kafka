@@ -19,7 +19,10 @@ package kafka.server.nereus;
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.domain.bytes.CanonicalUtf8;
 import com.nereusstream.domain.bytes.Sha256Digest;
+import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1;
+import com.nereusstream.kafka.bookkeeper.compaction.KafkaBookKeeperObjectReadScopeV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
+import com.nereusstream.kafka.bookkeeper.recovery.KafkaBookKeeperClosedHistoryRecoveryV1;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMemberInventoryV2.Member;
 import com.nereusstream.storage.api.lifecycle.PhysicalResourceIdV2;
@@ -94,6 +97,76 @@ final class NereusKafkaObjectRecovery {
             throw new IllegalStateException("Kafka Object selector changed during exact recovery");
         }
         return Optional.of(new Selected(prefix, plan, validated, inventory, versions));
+    }
+
+    static Optional<KafkaBookKeeperClosedHistoryRecoveryV1.ObjectPrefix> nativeScope(Optional<Selected> selected,
+            OxiaKafkaBookKeeperM4ReadRouteV2 binding, CanonicalControlMetadataStore metadata,
+            BindingReadSelector selector, Duration timeout) throws Exception {
+        var bytes = metadata.get(KafkaBookKeeperObjectReadScopeV1.key(selector.selectedViewSha256()));
+        if (bytes.isEmpty()) return Optional.empty();
+        var scope = KafkaBookKeeperObjectReadScopeV1.decode(bytes.orElseThrow());
+        var manifest = selected.orElseThrow(
+                () -> new IllegalStateException("Kafka Object native scope has no original selected manifest"));
+        var prefix = new KafkaBookKeeperClosedHistoryRecoveryV1.ObjectPrefix(selector, manifest.prefix(), scope);
+        if (!releasedHead(binding, manifest.prefix(), scope.retirementBatch(), timeout).equals(scope.releaseProofHead())) {
+            throw new IllegalStateException("Kafka Object recovery has another BK fallback release proof");
+        }
+        if (!binding.readSelector().equals(Optional.of(selector))) {
+            throw new IllegalStateException("Kafka Object selector changed during native scope recovery");
+        }
+        return Optional.of(prefix);
+    }
+
+    static void persistNativeScope(Selected selected, OxiaKafkaBookKeeperM4ReadRouteV2 binding,
+            CanonicalControlMetadataStore metadata, BindingReadSelector selector,
+            KafkaBookKeeperPartitionV1.ObjectBookKeeperSourceTransfer transfer, Runnable requireCurrent,
+            Duration timeout) throws Exception {
+        var prefix = selected.prefix();
+        var release = transfer.release();
+        var checkpoint = transfer.durableCheckpoint().orElseThrow(
+                () -> new IllegalStateException("Kafka Object reference transfer has no retained durable BK checkpoint"));
+        var carrier = checkpoint.sealedCarrier();
+        if (selector.ownerEpoch() != release.selector().ownerEpoch()
+                || selector.readAdmissionEpoch() != release.selector().readAdmissionEpoch()
+                || !selector.selectedViewSha256().equals(release.selector().selectedViewSha256())
+                || !prefix.originalFallbackSources().equals(release.batch().sources())) {
+            throw new IllegalStateException("Kafka Object native scope does not name the actual drained fallback");
+        }
+        var batch = release.batch().batchIdSha256();
+        var scope = new KafkaBookKeeperObjectReadScopeV1(selector.binding(), prefix.manifestSha256(),
+                M5MaterializationCodecV1.sourceCutSha256(prefix.sourceCut()), selector.ownerEpoch(),
+                release.batch().sharedLastFallbackCapableReadAdmissionEpoch(), batch,
+                releasedHead(binding, prefix, batch, timeout), prefix.coverage().exclusiveEnd(), carrier.runId(),
+                carrier.ledgerIdentity().ledgerId(), checkpoint.checkpointEntry(), checkpoint.checkpointSha256(),
+                checkpoint.footerSha256());
+        scope.requireSelection(prefix, selector);
+        if (!scope.namesRetainedCarrier(carrier)) {
+            throw new IllegalStateException("Kafka Object checkpoint does not belong to its retained BK suffix");
+        }
+        requireCurrent.run();
+        var bytes = scope.encode();
+        metadata.putIfAbsent(scope.key(), bytes);
+        if (!metadata.get(scope.key()).equals(Optional.of(bytes))) {
+            throw new IllegalStateException("Kafka Object native scope publication lacks its exact stored bytes");
+        }
+        requireCurrent.run();
+    }
+
+    private static Sha256Digest releasedHead(OxiaKafkaBookKeeperM4ReadRouteV2 binding, KafkaObjectMaterializedPrefixV1 prefix,
+            Sha256Digest batch, Duration timeout) throws Exception {
+        var proof = Optional.<Sha256Digest>empty();
+        for (var source : prefix.originalFallbackSources()) {
+            var fact = await(binding.readProtectionFact(source.sourceIdentitySha256(), source.protectionGeneration()),
+                    timeout).orElseThrow();
+            var release = M4ReadControlCodecV1.decodeProtection(fact.canonicalStoredBytes());
+            if (!release.identity().equals(source) || release.state() != ProtectionState.RELEASED
+                    || !release.releasedByBatchSha256().equals(Optional.of(batch))
+                    || proof.isPresent() && !proof.equals(release.releaseProofHeadSha256())) {
+                throw new IllegalStateException("Kafka Object native scope lacks its exact released BK fallback");
+            }
+            proof = release.releaseProofHeadSha256();
+        }
+        return proof.orElseThrow();
     }
 
     private static void requireOriginalTask(CanonicalControlMetadataStore metadata, M5MaterializationKeysV1 keys,

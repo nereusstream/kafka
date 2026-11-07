@@ -401,6 +401,9 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                         var recoveryOwner = opened;
                         var predecessorSelector = m4.readSelector();
                         var recoveredObject = recoverObjectView(aggregate, m4, scope.partition(), predecessorSelector);
+                        var objectScope = NereusBookKeeperCapability.usesAsyncObject(aggregate)
+                                ? recoverObjectNativeScope(opened, predecessorSelector, recoveredObject) : Optional
+                                        .<KafkaBookKeeperClosedHistoryRecoveryV1.ObjectPrefix>empty();
                         var selected = recoveredObject.isPresent() ? Optional.<KafkaBookKeeperClosedHistoryRecoveryV1.SelectedPrefix>empty()
                                 : opened.recoverNativeSelectedPrefix(predecessorSelector, closedOwner);
                         opened.storage = await(KafkaBookKeeperPartitionV1.openSelected(
@@ -434,7 +437,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                                 openings,
                                 unselectedFence(recoveryOwner, owner),
                                 recoveryOwner.historyReads(owner), selected,
-                                Topic.GROUP_METADATA_TOPIC_NAME.equals(identity.topic())));
+                                Topic.GROUP_METADATA_TOPIC_NAME.equals(identity.topic()), objectScope));
                         opened.requireRecoveredBirthSelection();
                         await(namespace.requireCurrent());
                         installRecoveredReadOwner(opened, predecessorSelector, selected,
@@ -660,6 +663,11 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
 
         OxiaKafkaBookKeeperM4ReadRouteV2 nativeM5BindingRoute() {
             return m4Route;
+        }
+
+        CompletionStage<Void> persistNativeObjectReadScope(KafkaBookKeeperPartitionV1.ObjectBookKeeperSourceTransfer transfer) {
+            return ownInputOperation(() -> CompletableFuture.runAsync(
+                    () -> persistObjectNativeScope(this, transfer), nativeM5TaskControl()));
         }
 
         synchronized CompletionStage<Boolean> nativeM5GcAdmissionOpen() {
@@ -1699,6 +1707,38 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         if (selector.isEmpty()) return Optional.empty();
         return NereusKafkaObjectRecovery.recover(binding, partition, selector.orElseThrow(), asyncObject,
                 context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout());
+    }
+
+    private Optional<KafkaBookKeeperClosedHistoryRecoveryV1.ObjectPrefix> recoverObjectNativeScope(Opened opened,
+            Optional<BindingReadSelector> predecessor, Optional<NereusKafkaObjectRecovery.Selected> recovered)
+            throws Exception {
+        if (predecessor.isEmpty()) return Optional.empty();
+        var selector = predecessor.orElseThrow();
+        return NereusKafkaObjectRecovery.nativeScope(recovered, opened.m4Route,
+                SelectedRecoveryMetadata.open(opened, selector, capability), selector,
+                context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout());
+    }
+
+    private void persistObjectNativeScope(Opened opened, KafkaBookKeeperPartitionV1.ObjectBookKeeperSourceTransfer transfer) {
+        try {
+            var selector = opened.m4Route.readSelector().orElseThrow();
+            var timeout = context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout();
+            var checkpoint = transfer.durableCheckpoint().orElseThrow();
+            Runnable requireCurrent = () -> {
+                opened.requireNativeM5PolicyOwner();
+                if (!opened.m4Route.readSelector().equals(Optional.of(selector))
+                        || !opened.storage.nativeReadSources().sealedRoots().contains(checkpoint.sealedCarrier())) {
+                    throw new IllegalStateException("Kafka Object native scope lost its current selector or BK carrier");
+                }
+            };
+            requireCurrent.run();
+            var selected = NereusKafkaObjectRecovery.recover(
+                    opened.m4Route, opened.nativeScope.partition(), selector, asyncObject, timeout).orElseThrow();
+            NereusKafkaObjectRecovery.persistNativeScope(selected, opened.m4Route,
+                    SelectedRecoveryMetadata.open(opened, selector, capability), selector, transfer, requireCurrent, timeout);
+        } catch (Exception failure) {
+            throw new CompletionException(failure);
+        }
     }
 
     private Optional<NereusKafkaObjectRecovery.Selected> reconcileRecoveredObject(Opened opened,

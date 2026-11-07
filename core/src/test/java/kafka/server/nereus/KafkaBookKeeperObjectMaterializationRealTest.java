@@ -335,6 +335,25 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final class HeldFetch {
         private final AtomicReference<Hold> next = new AtomicReference<>();
         private final AtomicInteger originalPrefixReads = new AtomicInteger();
+        private final AtomicReference<List<Long>> releasedLedgers = new AtomicReference<>(List.of());
+        private final AtomicInteger releasedLedgerReads = new AtomicInteger();
+        private final AtomicInteger retainedCheckpointReads = new AtomicInteger();
+        private volatile long retainedLedger = -1;
+
+        private void observeRetainedCheckpoint(
+                com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1.ObjectBookKeeperSourceTransfer transfer) {
+            var tail = transfer.retained().sealedRoots();
+            retainedLedger = transfer.durableCheckpoint().orElseThrow().sealedCarrier().ledgerIdentity().ledgerId();
+            releasedLedgers.set(transfer.original().sealedRoots().stream().filter(root -> !tail.contains(root))
+                    .map(root -> root.ledgerIdentity().ledgerId()).toList());
+            assertFalse(releasedLedgers.get().isEmpty());
+        }
+
+        private void assertRetainedRecovery() {
+            assertEquals(0, releasedLedgerReads.get(), "cold recovery opened an original released BK ledger");
+            assertTrue(retainedCheckpointReads.get() > 0, "cold recovery did not read the retained BK checkpoint");
+        }
+
 
         private Hold arm() {
             var hold = new Hold(new CompletableFuture<>(), new CompletableFuture<>());
@@ -344,6 +363,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
 
         private CompletionStage<Void> afterClose(
                 KafkaRunRootRecordV2 record, ReadPhase phase, CompletionStage<Void> response) {
+            long ledger = record.root().ledgerIdentity().ledgerId();
+            if (releasedLedgers.get().contains(ledger)) releasedLedgerReads.incrementAndGet();
+            if (ledger == retainedLedger && phase == ReadPhase.CHECKPOINT) retainedCheckpointReads.incrementAndGet();
             if (phase == ReadPhase.FETCH && record.root().kafkaStartOffset() == 0) originalPrefixReads.incrementAndGet();
             if (phase != ReadPhase.FETCH) return response;
             var hold = next.getAndSet(null);
@@ -722,7 +744,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         assertEquals(released.selector().selectedViewSha256(), selector.selectedViewSha256());
         var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
         assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
+        owner.persistNativeObjectReadScope(transfer).toCompletableFuture().get(30, TimeUnit.SECONDS);
+        probe.held().observeRetainedCheckpoint(transfer);
         verifyColdSelector(selector, cold.relocate(), client, expected, probe.held());
+        probe.held().assertRetainedRecovery();
     }
 
     private static void verifyColdSelector(
