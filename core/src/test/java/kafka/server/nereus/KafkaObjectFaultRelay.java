@@ -46,6 +46,10 @@ final class KafkaObjectFaultRelay implements AutoCloseable {
         return URI.create(required("NEREUS_M6_TEST_FAULT_PROXY"));
     }
 
+    static KafkaObjectFaultRelay wholeBucket(String bucket) {
+        return new KafkaObjectFaultRelay(bucket, "", "*");
+    }
+
     void arm(String mode) throws Exception {
         byte[] body = Json.encodeAsBytes(Map.of("path", path, "version", version, "mode", mode));
         send(request().POST(HttpRequest.BodyPublishers.ofByteArray(body)).build());

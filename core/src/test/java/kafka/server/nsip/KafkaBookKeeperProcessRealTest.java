@@ -165,26 +165,28 @@ public class KafkaBookKeeperProcessRealTest {
         }
     }
 
-    private static void copyProcessLogs(Path work) throws Exception {
+    public static void copyProcessLogs(Path work) throws Exception {
         String evidence = System.getProperty("nereus.nsip.processEvidenceDir");
         if (evidence == null) return;
         Path destination = Files.createDirectory(Path.of(evidence));
-        var capability = work.resolve("capability.properties");
-        if (Files.isRegularFile(capability)) Files.copy(capability, destination.resolve(capability.getFileName()));
+        for (String input : List.of("capability.properties", "object-capability", "m5-audit-policy.properties")) {
+            var capability = work.resolve(input);
+            if (Files.isRegularFile(capability)) Files.copy(capability, destination.resolve(input));
+        }
         for (int id = 0; id < 5; id++) {
             Path source = work.resolve("node-" + id);
             if (!Files.isDirectory(source)) continue;
             Path node = Files.createDirectory(destination.resolve(source.getFileName()));
             for (String name : List.of("server.log", "launcher.log", "controller.log", "format.log", "server.properties",
                     "implicit-format.log", "disabled-restart.log", "disabled.properties", "shutdown-threads.log",
-                    "foreign-scope.log", "foreign-scope.properties")) {
+                    "foreign-scope.log", "foreign-scope.properties", "foreign-object.log", "foreign-object.properties")) {
                 var file = source.resolve(name);
                 if (Files.isRegularFile(file)) Files.copy(file, node.resolve(name));
             }
         }
     }
 
-    private static int[] allocatePorts() throws Exception {
+    public static int[] allocatePorts() throws Exception {
         var loopback = InetAddress.getByName("127.0.0.1");
         try (var first = new ServerSocket(0, 1, loopback);
                 var next = new ServerSocket(0, 1, loopback);
@@ -196,7 +198,7 @@ public class KafkaBookKeeperProcessRealTest {
         }
     }
 
-    private static void waitForBroker(Admin admin, int id) throws Exception {
+    public static void waitForBroker(Admin admin, int id) throws Exception {
         TestUtils.waitForCondition(() -> admin.describeCluster().nodes().get(5, TimeUnit.SECONDS).stream()
                 .anyMatch(node -> node.id() == id), "Broker did not register: " + id);
     }
@@ -237,7 +239,7 @@ public class KafkaBookKeeperProcessRealTest {
         }
     }
 
-    private static Properties client(int port) {
+    public static Properties client(int port) {
         var props = new Properties();
         props.setProperty("bootstrap.servers", "127.0.0.1:" + port);
         props.setProperty("key.serializer", StringSerializer.class.getName());
@@ -253,12 +255,12 @@ public class KafkaBookKeeperProcessRealTest {
         }
     }
 
-    private static final class NativeNode implements AutoCloseable {
+    public static final class NativeNode implements AutoCloseable {
         private final Path directory;
         private final Path config;
         private Process process;
 
-        NativeNode(Path work, Map<String, Object> common, int id, int port, String voters, boolean controller)
+        public NativeNode(Path work, Map<String, Object> common, int id, int port, String voters, boolean controller)
                 throws Exception {
             directory = Files.createDirectory(work.resolve("node-" + id));
             config = directory.resolve("server.properties");
@@ -297,7 +299,7 @@ public class KafkaBookKeeperProcessRealTest {
             return launched;
         }
 
-        void format(String clusterId) throws Exception {
+        public void format(String clusterId) throws Exception {
             assertExit(0, "format.log", "kafka.tools.StorageTool", "format", "--config",
                     config.toString(), "--cluster-id", clusterId, "--feature", "nereus.storage.version=2");
         }
@@ -322,6 +324,14 @@ public class KafkaBookKeeperProcessRealTest {
             String log = "foreign-scope.log";
             assertExit(1, log, "kafka.server.nereus.NereusKafka", foreign.toString());
             assertTrue(Files.readString(directory.resolve(log)).contains("native BK scope or quorum differs from the admitted capability"));
+        }
+
+        public void assertRejectsForeignObjectBucket(String bucket) throws Exception {
+            Path foreign = withProperty("foreign-object.properties", "nereus.kafka.storage.object.bucket", bucket);
+            String log = "foreign-object.log";
+            assertExit(1, log, "kafka.server.nereus.NereusKafka", foreign.toString());
+            assertTrue(Files.readString(directory.resolve(log)).contains(
+                    "native Kafka Object capability belongs to another Cell or provider configuration"));
         }
 
         private Path withProperty(String file, String key, String value) throws Exception {
@@ -349,7 +359,7 @@ public class KafkaBookKeeperProcessRealTest {
             }
         }
 
-        void start() throws Exception {
+        public void start() throws Exception {
             process = launch("launcher.log", "kafka.server.nereus.NereusKafka", config.toString());
         }
 
@@ -366,7 +376,7 @@ public class KafkaBookKeeperProcessRealTest {
             }
         }
 
-        void stop() throws Exception {
+        public void stop() throws Exception {
             assertTrue(process != null && process.isAlive(), "Node exited before shutdown: " + config);
             process.destroy();
             if (!process.waitFor(30, TimeUnit.SECONDS)) {

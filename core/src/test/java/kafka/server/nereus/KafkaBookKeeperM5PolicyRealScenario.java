@@ -20,6 +20,7 @@ import org.apache.kafka.common.test.KafkaClusterTestKit;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -39,9 +40,14 @@ final class KafkaBookKeeperM5PolicyRealScenario {
 
     static void configure(KafkaClusterTestKit.Builder builder, Path inputs, Map<String, Object> nativeConfig,
             boolean sealedGcProfile, String mode) throws Exception {
-        nativeConfig.forEach(builder::setConfigProp);
-        builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.reads.inflight", "3");
-        builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.entries.per.ledger", "8");
+        nativeSettings(inputs, nativeConfig, sealedGcProfile, mode).forEach(builder::setConfigProp);
+    }
+
+    static Map<String, Object> nativeSettings(Path inputs, Map<String, Object> nativeConfig,
+            boolean sealedGcProfile, String mode) throws Exception {
+        var settings = new HashMap<>(nativeConfig);
+        settings.put("nereus.kafka.storage.bookkeeper.max.reads.inflight", "3");
+        settings.put("nereus.kafka.storage.bookkeeper.max.entries.per.ledger", "8");
         if (sealedGcProfile) {
             var descriptor = NereusBookKeeperCapability.descriptor(inputs.resolve("capability.properties"));
             var audit = inputs.resolve("m5-audit-policy.properties");
@@ -52,12 +58,13 @@ final class KafkaBookKeeperM5PolicyRealScenario {
                     + "provider.configuration.sha256=" + descriptor.getProperty("configurationDigest") + "\n"
                     + "policy.catalog.sha256=" + descriptor.getProperty("policyCatalogDigest") + "\n"
                     + "business.audit.domain=FIRST_ADMISSION_EMPTY_V1\nminimum.grace.ms=10\n");
-            builder.setConfigProp("nereus.kafka.storage.bookkeeper.gc.enabled", Boolean.toString(!mode.endsWith("_DISABLED")));
-            builder.setConfigProp("nereus.kafka.storage.bookkeeper.gc.dry.run", Boolean.toString(mode.endsWith("_DRY_RUN") || mode.endsWith("_DISABLED")));
-            builder.setConfigProp("nereus.kafka.storage.bookkeeper.m5.gc.profile", "M5_SEALED_TARGET_CONFIRMED_DRAIN_V1");
-            builder.setConfigProp("nereus.kafka.storage.bookkeeper.m5.gc.grace.ms", "25");
-            builder.setConfigProp("nereus.kafka.storage.bookkeeper.m5.gc.audit.policy.file", audit.toString());
+            settings.put("nereus.kafka.storage.bookkeeper.gc.enabled", Boolean.toString(!mode.endsWith("_DISABLED")));
+            settings.put("nereus.kafka.storage.bookkeeper.gc.dry.run", Boolean.toString(mode.endsWith("_DRY_RUN") || mode.endsWith("_DISABLED")));
+            settings.put("nereus.kafka.storage.bookkeeper.m5.gc.profile", "M5_SEALED_TARGET_CONFIRMED_DRAIN_V1");
+            settings.put("nereus.kafka.storage.bookkeeper.m5.gc.grace.ms", "25");
+            settings.put("nereus.kafka.storage.bookkeeper.m5.gc.audit.policy.file", audit.toString());
         }
+        return settings;
     }
 
     static void recoveryFailure(org.apache.kafka.common.TopicIdPartition partition, Throwable failure, int broker,

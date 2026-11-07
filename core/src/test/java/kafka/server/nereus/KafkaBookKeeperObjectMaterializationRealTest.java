@@ -606,7 +606,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         }
     }
 
-    private static void writeM6Capability(Path work) throws Exception {
+    static void writeM6Capability(Path work) throws Exception {
         var summary = Path.of(System.getProperty("nereus.nsip.m4RunSummary")).toRealPath();
         var source = Path.of(System.getProperty("nereus.nsip.m4SourceRoot")).toRealPath();
         KafkaBookKeeperOwnerRelocationRealTest.writeCapability(work, Optional.empty());
@@ -621,12 +621,13 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 .filter(root -> root.kafkaEndOffsetExclusive().orElseThrow() > root.kafkaStartOffset()).count();
     }
 
-    private record Fixture(Map<String, Object> settings, NereusKafkaObjectProvider provider,
+    record Fixture(Map<String, Object> settings, NereusKafkaObjectProvider provider,
             M5CellProviderProfileV2 profile, String bucket, Runnable verifyNoOutputs,
-            Consumer<M5PendingOutputInventoryV2> verifyNoOriginalOutputs, Consumer<GenerationObject> removeVersion) { }
+            Consumer<M5PendingOutputInventoryV2> verifyNoOriginalOutputs, Consumer<GenerationObject> removeVersion,
+            KafkaConfig config, AsyncOxiaClient control, OxiaPhysicalMetadataNamespaceV2 namespace) { }
 
     @FunctionalInterface
-    private interface FixtureWork {
+    interface FixtureWork {
         void run(Fixture fixture) throws Exception;
     }
 
@@ -635,7 +636,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         NereusKafkaOwnedProviderRuntime.Opened relocate() throws Exception;
     }
 
-    private static void withObjectFixture(Path work, Map<String, Object> settings, boolean readFaults,
+    static void withObjectFixture(Path work, Map<String, Object> settings, boolean readFaults,
             FixtureWork action) throws Exception {
         var endpoint = URI.create(System.getProperty("nereus.nsip.s3Endpoint"));
         var configInput = new HashMap<>(settings);
@@ -688,7 +689,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 Consumer<GenerationObject> removeVersion = object -> minio.deleteObject(request -> request.bucket(bucket)
                         .key(object.identity().key()).versionId(new String(object.immutableProviderVersionToken()
                                 .orElseThrow().toByteArray(), StandardCharsets.UTF_8)));
-                action.run(new Fixture(Map.copyOf(inputs), provider, profile, bucket, verifyNoOutputs, verifyNoOriginalOutputs, removeVersion));
+                action.run(new Fixture(Map.copyOf(inputs), provider, profile, bucket, verifyNoOutputs, verifyNoOriginalOutputs,
+                        removeVersion, objectConfig, control, namespace));
             }
         }
     }

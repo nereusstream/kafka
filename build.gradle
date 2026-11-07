@@ -1122,6 +1122,7 @@ project(':core') {
     test {
       filter {
         excludeTestsMatching 'kafka.server.nereus.KafkaBookKeeperAckRealTest'
+        excludeTestsMatching 'kafka.server.nereus.KafkaAsyncObjectProcessRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaObjectProviderAdmissionRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaBookKeeperObjectMaterializationRealTest'
         excludeTestsMatching 'kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest'
@@ -1189,6 +1190,25 @@ project(':core') {
         systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
         systemProperty 'nereus.nsip.m4RunSummary', providers.gradleProperty('v2M5KafkaRunSourceSummary').get()
         systemProperty 'nereus.nsip.m4SourceRoot', providers.gradleProperty('v2M5KafkaRunSourceRoot').get()
+      }
+    }
+    tasks.register('nereusKafkaAsyncObjectProcessRealTest', Test) {
+      group = 'verification'
+      description = 'Runs the native Kafka Controller and Brokers as separate JVMs over real BK, Oxia and MinIO.'
+      testClassesDirs = sourceSets.test.output.classesDirs
+      classpath = sourceSets.test.runtimeClasspath
+      useJUnitPlatform()
+      filter { includeTestsMatching 'kafka.server.nereus.KafkaAsyncObjectProcessRealTest' }
+      dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain'
+      outputs.upToDateWhen { false }
+      doFirst {
+        systemProperty 'nereus.nsip.bkUri', providers.gradleProperty('v2M2BookKeeperMetadataServiceUri').get()
+        systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+        systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
+        systemProperty 'nereus.nsip.m4RunSummary', providers.gradleProperty('v2M5KafkaRunSourceSummary').get()
+        systemProperty 'nereus.nsip.m4SourceRoot', providers.gradleProperty('v2M5KafkaRunSourceRoot').get()
+        systemProperty 'nereus.nsip.processClasspath', (sourceSets.main.runtimeClasspath + configurations.releaseOnly).asPath
+        systemProperty 'nereus.nsip.processLogConfig', rootProject.file('config/log4j2.yaml').absolutePath
       }
     }
     tasks.register('nereusBookKeeperM4AdmissionRealTest', Test) {
