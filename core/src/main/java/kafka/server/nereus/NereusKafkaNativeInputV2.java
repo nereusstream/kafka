@@ -999,8 +999,9 @@ public final class NereusKafkaNativeInputV2 {
             if (!current.getAsBoolean()) return false;
             var original = selector.get();
             var now = m4.readSelector().orElseThrow();
-            return now.binding().equals(original.binding()) && now.ownerEpoch() == original.ownerEpoch()
-                    && now.capability().equals(original.capability()) && now.mode() == SelectorMode.PREFERRED_ONLY
+            if (!now.binding().equals(original.binding()) || now.ownerEpoch() != original.ownerEpoch()
+                    || !now.capability().equals(original.capability())) return false;
+            return now.mode() == SelectorMode.PREFERRED_ONLY
                     && now.admissionState() == AdmissionState.ADMITTING
                     && now.sourceGeneration() > original.sourceGeneration()
                     && now.selectedViewSha256().equals(opened.storage().nativeReadSources().selectedViewSha256());
