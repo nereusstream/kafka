@@ -32,13 +32,10 @@ import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
-import org.apache.kafka.common.utils.LogCaptureAppender;
 import org.apache.kafka.metadata.BrokerState;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
 import org.apache.kafka.server.common.MetadataVersion;
-import org.apache.kafka.server.util.KafkaScheduler;
 import org.apache.kafka.test.TestUtils;
-import org.apache.logging.log4j.Level;
 
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionAdmissionV1;
@@ -89,12 +86,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RunnableScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -183,7 +183,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             builder.setConfigProp("nereus.kafka.storage.materialization.source.retirement.grace.ms", "5000");
         }
         if (fault.shutdownRetirement) {
-            builder.setConfigProp("nereus.kafka.storage.bookkeeper.m5.gc.grace.ms", "90000");
+            builder.setConfigProp("nereus.kafka.storage.bookkeeper.m5.gc.grace.ms", Long.toString(GraceShutdown.GRACE_MS));
         }
     }
 
@@ -588,6 +588,18 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             return true;
         }
 
+        boolean graceMarked() throws Exception {
+            for (var handle : handles) {
+                var resource = new PhysicalResourceIdV2.BookKeeperLedger(client.spec().namespace(), handle.ledgerIdentity().ledgerId());
+                var value = metadata.read(resource.authorityKey()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+                if (value.flatMap(fact -> com.nereusstream.storage.object.gc.M5TargetDeleteStoredValueV2.decode(fact).fullAuthority())
+                        .flatMap(authority -> authority.epochGrace()).isPresent()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         void requirePhysicallyAbsent() throws Exception {
             for (var handle : handles) {
                 assertEquals(com.nereusstream.storage.bookkeeper.M5BookKeeperDeleteAdapterV1.CaptureOutcome.DEFINITIVELY_ABSENT,
@@ -889,7 +901,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         long carrier = owner.storage().nativeReadSources().activeRoot().ledgerIdentity().ledgerId();
         deletion.requirePresent("BK deletion preceded the independent retained checkpoint");
         if (fault.shutdownRetirement) {
-            GraceShutdown.verify(probe.cluster(), () -> produceThroughRollover(owner, client, afterRollover));
+            GraceShutdown.verify(probe.cluster(), deletion, () -> produceThroughRollover(owner, client, afterRollover));
             return;
         }
         int end = produceThroughRollover(owner, client, afterRollover);
@@ -921,22 +933,30 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     }
 
     private static final class GraceShutdown {
+        private static final long GRACE_MS = 90_000;
+
         @FunctionalInterface
         private interface Rollover {
             int appendThroughSeal() throws Exception;
         }
 
-        static void verify(KafkaClusterTestKit cluster, Rollover rollover) throws Exception {
-            try (var logs = LogCaptureAppender.createAndRegister(KafkaScheduler.class)) {
-                logs.setClassLogger(KafkaScheduler.class, Level.DEBUG);
-                rollover.appendThroughSeal();
-                TestUtils.waitForCondition(() -> logs.getMessages().stream().anyMatch(message ->
-                                message.startsWith("Scheduling task nereus-m5-gc-grace-") && message.contains("90000 ms")),
-                        30_000, "native GC did not schedule its real pending grace task");
-                var broker = cluster.brokers().get(0);
-                broker.shutdown();
-                assertEquals(BrokerState.NOT_RUNNING, broker.brokerState());
-            }
+        static void verify(KafkaClusterTestKit cluster, ScheduledDeletion deletion, Rollover rollover) throws Exception {
+            var broker = cluster.brokers().get(0);
+            var scheduler = (ScheduledThreadPoolExecutor) broker.kafkaScheduler().scheduledExecutorService();
+            var existing = Set.copyOf(scheduler.getQueue());
+            rollover.appendThroughSeal();
+            TestUtils.waitForCondition(() -> deletion.graceMarked() && scheduler.getQueue().stream()
+                            .filter(task -> !existing.contains(task))
+                            .anyMatch(GraceShutdown::awaitingGrace),
+                    30_000, "native GC did not persist its mark and schedule its grace task");
+            broker.shutdown();
+            assertEquals(BrokerState.NOT_RUNNING, broker.brokerState());
+        }
+
+        private static boolean awaitingGrace(Runnable task) {
+            if (!(task instanceof RunnableScheduledFuture<?> scheduled) || scheduled.isPeriodic()) return false;
+            long remaining = scheduled.getDelay(TimeUnit.MILLISECONDS);
+            return remaining > 60_000 && remaining <= GRACE_MS;
         }
     }
 
