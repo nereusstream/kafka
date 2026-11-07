@@ -906,13 +906,14 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertEquals(original, source.formatRootSha256());
             assertEquals(firstCoverage, source.coverage());
             assertEquals(firstPayload.immutableProviderVersionToken(), source.immutableProviderVersionToken());
-            assertTrue(selected.prefix().coverage().exclusiveEnd() > latest);
+            long compactedEnd = selected.prefix().coverage().exclusiveEnd();
+            assertTrue(compactedEnd > latest && compactedEnd < end);
             assertTrue(selected.plan().sourceCut().sources().size() > 1);
-            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 0, end, client, latest);
+            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 0, end, client, latest, compactedEnd);
             KafkaObjectCompactionRealScenario.verifyReplacement(probe.cluster(), probe.topicId(), 0, latest);
             var recovered = takeover.relocate();
             assertEquals(next.selectedViewSha256(), recovered.nativeM5BindingRoute().readSelector().orElseThrow().selectedViewSha256());
-            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 1, end, client, latest);
+            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 1, end, client, latest, compactedEnd);
             KafkaObjectCompactionRealScenario.verifyReplacement(probe.cluster(), probe.topicId(), 1, latest);
         }
     }

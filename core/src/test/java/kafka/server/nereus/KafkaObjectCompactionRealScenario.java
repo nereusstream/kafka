@@ -146,11 +146,11 @@ final class KafkaObjectCompactionRealScenario {
     }
 
     static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client) throws Exception {
-        verify(cluster, topic, broker, end, client, -1);
+        verify(cluster, topic, broker, end, client, -1, -1);
     }
 
-    static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client, long replacement)
-            throws Exception {
+    static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client,
+            long replacement, long compactedEnd) throws Exception {
         // The provider can finish before the Controller acknowledges RECOVERED. The official Admin client
         // retries the broker's recovery response; the wire Fetches below then inspect the exact ready owner.
         try (var admin = Admin.create(client)) {
@@ -179,11 +179,11 @@ final class KafkaObjectCompactionRealScenario {
         assertNull(tombstone.value(), "compaction discarded or rewrote the latest tombstone");
         assertTrue(tombstoneBatch.deleteHorizonMs().orElseThrow() > tombstone.timestamp());
 
-        verifyTransactions(cluster, topic, broker, end, client, replacement);
+        verifyTransactions(cluster, topic, broker, end, client, replacement, compactedEnd);
     }
 
     private static void verifyTransactions(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client,
-            long replacement)
+            long replacement, long compactedEnd)
             throws Exception {
         verifyMarker(cluster, topic, broker, 8, ControlRecordType.COMMIT);
         verifyMarker(cluster, topic, broker, 10, ControlRecordType.ABORT);
@@ -198,8 +198,12 @@ final class KafkaObjectCompactionRealScenario {
 
         var visible = new ArrayList<>(Arrays.asList("middle", "new-three", "new-four", null, "committed-seven"));
         if (replacement >= 0) visible.remove("new-three");
-        for (int offset = SEALED_TRANSACTION_END; offset < end; offset++)
-            visible.add(offset == replacement ? "new-successor" : "input-" + offset);
+        // Each helper input has the same key; only the last one inside the sealed cut survives.
+        long lastRepeatedKey = compactedEnd - 1 == replacement ? compactedEnd - 2 : compactedEnd - 1;
+        for (int offset = SEALED_TRANSACTION_END; offset < end; offset++) {
+            if (offset == replacement) visible.add("new-successor");
+            else if (offset >= compactedEnd || offset == lastRepeatedKey) visible.add("input-" + offset);
+        }
         assertEquals(visible, KafkaBookKeeperOwnerRelocationRealTest.consume(client, visible.size()));
     }
 
