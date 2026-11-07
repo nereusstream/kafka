@@ -64,6 +64,7 @@ import com.nereusstream.storage.object.retention.M5MaterializationWorkerCoordina
 import com.nereusstream.domain.bytes.CanonicalBytes;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -346,6 +347,12 @@ public final class NereusKafkaNativeInputV2 {
             throw new IllegalStateException("native M5 " + operation + " is unresolved: " + result);
     }
 
+    private enum ObjectPhase {
+        REGISTER,
+        VERIFY,
+        PUBLISH
+    }
+
     /** Kept by the actual Owner until all native readers and ticket cleanup have confirmed drain. */
     static final class CellReservation {
         private final KafkaCompactionAdmissionV1 admission;
@@ -358,7 +365,9 @@ public final class NereusKafkaNativeInputV2 {
         private int pending;
         private boolean discarded;
         private boolean unresolved;
-        private boolean unsettledObjectPublication;
+        private Sha256Digest objectTask;
+        private final EnumSet<ObjectPhase> unsettledObjectPhases = EnumSet.noneOf(ObjectPhase.class);
+        private final EnumSet<ObjectPhase> activeObjectPhases = EnumSet.noneOf(ObjectPhase.class);
         private boolean releasing;
         private boolean ownerCache;
         private Sha256Digest selectedView;
@@ -435,17 +444,28 @@ public final class NereusKafkaNativeInputV2 {
             return own(operation, true);
         }
 
-        CompletionStage<Void> ownObjectPublication(java.util.function.Supplier<CompletionStage<Void>> operation) {
+        <T> CompletionStage<T> ownObjectPhase(ObjectPhase phase, Sha256Digest task,
+                java.util.function.Supplier<CompletionStage<T>> operation) {
             return ownOutput(() -> {
                 synchronized (this) {
-                    unsettledObjectPublication = true;
-                }
-                return operation.get().thenRun(() -> {
-                    synchronized (this) {
-                        unsettledObjectPublication = false;
+                    if (objectTask == null) objectTask = task;
+                    if (!objectTask.equals(task) || !activeObjectPhases.add(phase)) {
+                        throw new IllegalStateException("native Kafka Object phase does not own the original task");
                     }
-                });
+                    unsettledObjectPhases.add(phase);
+                }
+                try {
+                    return operation.get().whenComplete((ignored, failure) -> finishObjectPhase(phase, failure == null));
+                } catch (Throwable failure) {
+                    finishObjectPhase(phase, false);
+                    throw failure;
+                }
             });
+        }
+
+        private synchronized void finishObjectPhase(ObjectPhase phase, boolean exact) {
+            activeObjectPhases.remove(phase);
+            if (exact) unsettledObjectPhases.remove(phase);
         }
 
         private <T> CompletionStage<T> own(java.util.function.Supplier<CompletionStage<T>> operation, boolean outputOwned) {
@@ -531,7 +551,7 @@ public final class NereusKafkaNativeInputV2 {
             if (release.isDone() || releasing) return;
             // The selected cache remains owned by the Broker. A discarded observer cannot discharge its charge.
             if (ownerCache || prepared != null && prepared.requiresOwnerCacheDrain()) return;
-            if (unresolved || unsettledObjectPublication) {
+            if (unresolved || !unsettledObjectPhases.isEmpty()) {
                 release.completeExceptionally(new IllegalStateException("native M5 capture failure retains its Cell reservation until Owner drain"));
                 return;
             }
@@ -904,32 +924,36 @@ public final class NereusKafkaNativeInputV2 {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("native Kafka Object registration requires retained Cell capacity"));
             }
-            return opened.ownInputOperation(() -> reservation.own(() -> provider.requireCurrent().thenApplyAsync(ignored -> {
-                requireOpen();
-                var cut = prepared.plan().sourceCut();
-                if (!cut.sources().equals(extents) || !cut.predecessorSelector().equals(selector.get())) {
-                    throw new IllegalStateException("Kafka Object task no longer matches the retained BK source cut");
-                }
-                var profile = provider.profile();
-                int partition = nativeCut.sources().activeRoot().partitionId();
-                var metadata = m4.materializationMetadata(profile.protocolCellSha256());
-                var workers = new M5MaterializationWorkerCoordinatorV1(metadata, partition, binding);
-                return NereusKafkaObjectMaterialization.register(prepared, profile, partition, metadata, () -> {
-                    requireOpen();
-                    requireCurrentLocal();
-                }, () -> {
-                    var namespace = Sha256Digest.hash(profile.physicalBinding().encode());
-                    var plan = prepared.plan();
-                    return workers.resumePlan(plan, nativeWorkerFence(), namespace).orElseGet(() -> {
-                        var proposal = proposeCurrentWorker(workers, profile.scopeId().digest(), namespace);
-                        if (!proposal.identity().equals(plan.sourceCut().identity())) {
-                            throw new IllegalStateException("Kafka Object worker identity changed during registration");
+            return opened.ownInputOperation(() -> reservation.ownObjectPhase(ObjectPhase.REGISTER,
+                    prepared.plan().taskIdSha256(), () -> provider.requireCurrent().thenApplyAsync(ignored -> {
+                        requireOpen();
+                        var cut = prepared.plan().sourceCut();
+                        if (!cut.sources().equals(extents) || !cut.predecessorSelector().equals(selector.get())) {
+                            throw new IllegalStateException("Kafka Object task no longer matches the retained BK source cut");
                         }
-                        return proposal.admitPlan(plan).orElseThrow(
-                                () -> new IllegalStateException("Kafka Object worker predecessor changed"));
-                    });
-                });
-            }, control)));
+                        var profile = provider.profile();
+                        int partition = nativeCut.sources().activeRoot().partitionId();
+                        var metadata = m4.materializationMetadata(profile.protocolCellSha256());
+                        var workers = new M5MaterializationWorkerCoordinatorV1(metadata, partition, binding);
+                        var registered = NereusKafkaObjectMaterialization.register(prepared, profile, partition, metadata, () -> {
+                            requireOpen();
+                            requireCurrentLocal();
+                        }, () -> {
+                            var namespace = Sha256Digest.hash(profile.physicalBinding().encode());
+                            var plan = prepared.plan();
+                            return workers.resumePlan(plan, nativeWorkerFence(), namespace).orElseGet(() -> {
+                                var proposal = proposeCurrentWorker(workers, profile.scopeId().digest(), namespace);
+                                if (!proposal.identity().equals(plan.sourceCut().identity())) {
+                                    throw new IllegalStateException("Kafka Object worker identity changed during registration");
+                                }
+                                return proposal.admitPlan(plan).orElseThrow(
+                                        () -> new IllegalStateException("Kafka Object worker predecessor changed"));
+                            });
+                        });
+                        m4.reconcileMaterializationPendingOutput(profile.protocolCellSha256(), registered.pending())
+                                .toCompletableFuture().join();
+                        return registered;
+                    }, control)));
         }
 
         CompletionStage<NereusKafkaObjectMaterialization.Verified> storeObjectMaterialization(
@@ -939,18 +963,19 @@ public final class NereusKafkaNativeInputV2 {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("native Kafka Object output requires retained Cell capacity"));
             }
-            return opened.ownInputOperation(() -> reservation.own(() -> CompletableFuture.supplyAsync(() -> {
-                try {
-                    Runnable requireCurrent = () -> {
-                        requireOpen();
-                        requireCurrentLocal();
-                    };
-                    var stored = NereusKafkaObjectMaterialization.store(task, provider, requireCurrent, timeout);
-                    return NereusKafkaObjectMaterialization.protectAndVerify(stored, provider, requireCurrent, timeout);
-                } catch (Exception failure) {
-                    throw new CompletionException(failure);
-                }
-            }, control)));
+            return opened.ownInputOperation(() -> reservation.ownObjectPhase(ObjectPhase.VERIFY,
+                    task.prepared().plan().taskIdSha256(), () -> CompletableFuture.supplyAsync(() -> {
+                        try {
+                            Runnable requireCurrent = () -> {
+                                requireOpen();
+                                requireCurrentLocal();
+                            };
+                            var stored = NereusKafkaObjectMaterialization.store(task, provider, requireCurrent, timeout);
+                            return NereusKafkaObjectMaterialization.protectAndVerify(stored, provider, requireCurrent, timeout);
+                        } catch (Exception failure) {
+                            throw new CompletionException(failure);
+                        }
+                    }, control)));
         }
 
         synchronized CompletionStage<Void> publishObjectMaterialization(NereusKafkaObjectMaterialization.Verified verified,
@@ -978,8 +1003,9 @@ public final class NereusKafkaNativeInputV2 {
         private CompletionStage<Void> dispatchObjectPublication(NereusKafkaObjectMaterialization.Verified verified,
                 NereusKafkaObjectProvider provider, Executor providerReads, java.time.Duration timeout) {
             return opened.ownInputOperation(() -> verifyInputs(extents, batches)
-                    .thenComposeAsync(membership -> reservation.ownObjectPublication(() ->
-                            publishVerifiedObject(verified, provider, membership, providerReads, timeout)), control));
+                    .thenComposeAsync(membership -> reservation.ownObjectPhase(ObjectPhase.PUBLISH,
+                            verified.stored().task().prepared().plan().taskIdSha256(), () ->
+                                    publishVerifiedObject(verified, provider, membership, providerReads, timeout)), control));
         }
 
         private CompletionStage<Void> publishVerifiedObject(NereusKafkaObjectMaterialization.Verified verified,
@@ -999,17 +1025,18 @@ public final class NereusKafkaNativeInputV2 {
 
         private CompletionStage<Void> reconcileObjectPublication(NereusKafkaObjectMaterialization.Verified verified,
                 NereusKafkaObjectProvider provider, java.time.Duration timeout) {
-            return opened.ownInputOperation(() -> reservation.ownObjectPublication(() -> CompletableFuture.runAsync(() -> {
-                try {
-                    NereusKafkaObjectPublication.reconcileOriginal(verified, provider, opened.storage(),
-                            bookKeeperPhysical, nativeClient.spec().namespace(), m4, () -> {
-                                requireOpen();
-                                if (!current.getAsBoolean()) throw new IllegalStateException("Kafka Object publication Owner changed");
-                            }, timeout);
-                } catch (Exception failure) {
-                    throw new CompletionException(failure);
-                }
-            }, control)));
+            return opened.ownInputOperation(() -> reservation.ownObjectPhase(ObjectPhase.PUBLISH,
+                    verified.stored().task().prepared().plan().taskIdSha256(), () -> CompletableFuture.runAsync(() -> {
+                        try {
+                            NereusKafkaObjectPublication.reconcileOriginal(verified, provider, opened.storage(),
+                                    bookKeeperPhysical, nativeClient.spec().namespace(), m4, () -> {
+                                        requireOpen();
+                                        if (!current.getAsBoolean()) throw new IllegalStateException("Kafka Object publication Owner changed");
+                                    }, timeout);
+                        } catch (Exception failure) {
+                            throw new CompletionException(failure);
+                        }
+                    }, control)));
         }
 
         private CompletionStage<M5MaterializationWorkerCoordinatorV1.Proposal> proposeWorker(

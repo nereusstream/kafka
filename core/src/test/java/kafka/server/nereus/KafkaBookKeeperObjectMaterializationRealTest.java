@@ -52,6 +52,7 @@ import com.nereusstream.storage.object.materialization.M5MaterializationCoordina
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PayloadKind;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.GenerationObject;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.TaskState;
+import com.nereusstream.storage.object.materialization.M5PendingOutputInventoryV2;
 import com.nereusstream.storage.object.retention.M5BindingAuthorityCodecV1;
 import com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport;
 
@@ -150,7 +151,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             produced++;
             ColdTakeover takeover = () -> relocate(cluster, client, cold);
             if (fault.automatic) {
-                verifyAutomatic(opened, fixture, client, produced, heldFetch, takeover);
+                verifyAutomatic(opened, fixture, client, produced, heldFetch, takeover, fault);
             } else {
                 verifyOutputs(opened, fixture, client, produced, new FetchProbe(cluster, topicId, heldFetch, fault), takeover);
             }
@@ -237,6 +238,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean recoverHot;
         private final boolean automatic;
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
+        private final CompletableFuture<M5PendingOutputInventoryV2> pendingApplied = new CompletableFuture<>();
+        private final CompletableFuture<Void> pendingReadDenied = new CompletableFuture<>();
+        private volatile String pendingBlocked;
         private volatile String blocked;
 
         private PublicationFault(String outcome) {
@@ -246,12 +250,16 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         }
 
         private AsyncOxiaClient wrap(AsyncOxiaClient client) {
-            if (!enabled) return client;
+            if (!enabled && !automatic) return client;
             return (AsyncOxiaClient) Proxy.newProxyInstance(getClass().getClassLoader(),
                     new Class<?>[] {AsyncOxiaClient.class}, (proxy, method, args) -> {
                         String key = args != null && args.length > 0 && args[0] instanceof String value ? value : "";
                         if (method.getName().equals("get") && key.equals(blocked)) {
                             return CompletableFuture.failedFuture(new TimeoutException("original selector reread hidden"));
+                        }
+                        if (method.getName().equals("get") && key.equals(pendingBlocked)) {
+                            pendingReadDenied.complete(null);
+                            return CompletableFuture.failedFuture(new TimeoutException("original pending inventory reread hidden"));
                         }
                         Object response;
                         try {
@@ -259,14 +267,27 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                         } catch (InvocationTargetException failure) {
                             throw failure.getCause();
                         }
-                        if (method.getName().equals("put") && selected(key, args)) {
+                        if (!method.getName().equals("put")) return response;
+                        if (selected(key, args)) {
                             return ((CompletionStage<?>) response).thenCompose(applied -> {
                                 blocked = key;
                                 return CompletableFuture.failedFuture(new TimeoutException("applied Object selector response lost"));
                             }).toCompletableFuture();
                         }
-                        return response;
+                        return pendingResponse(key, args, response);
                     });
+        }
+
+        private Object pendingResponse(String key, Object[] args, Object response) {
+            if (!automatic || pendingApplied.isDone() || !key.contains("/read-m5/") || !key.contains("/pending-outputs/")) {
+                return response;
+            }
+            var original = M5PendingOutputInventoryV2.decode(CanonicalBytes.copyOf((byte[]) args[1]));
+            return ((CompletionStage<?>) response).thenCompose(applied -> {
+                pendingBlocked = key;
+                pendingApplied.complete(original);
+                return CompletableFuture.failedFuture(new TimeoutException("applied pending inventory response lost"));
+            }).toCompletableFuture();
         }
 
         private void verifyOriginalWork(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture,
@@ -453,7 +474,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     }
 
     private static void verifyAutomatic(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture,
-            Properties client, int produced, HeldFetch fetch, ColdTakeover takeover) throws Exception {
+            Properties client, int produced, HeldFetch fetch, ColdTakeover takeover, PublicationFault fault) throws Exception {
         var provider = fixture.provider();
         assertTrue(provider.physicalQuota().quota().expand(64L << 20).toCompletableFuture().get(30, TimeUnit.SECONDS));
         var cell = fixture.profile().protocolCellSha256();
@@ -466,6 +487,13 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         var preparation = owner.nativeM5CompactionAdmission();
         assertEquals(com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionAdmissionV1.Outcome.APPLIED_EXACT,
                 preparation.install(KafkaBookKeeperSelectedInputRealScenario.caps(limits, 1)));
+        var original = fault.pendingApplied.get(30, TimeUnit.SECONDS);
+        try {
+            fault.pendingReadDenied.get(30, TimeUnit.SECONDS);
+            fixture.verifyNoOutputs().run();
+        } finally {
+            fault.pendingBlocked = null;
+        }
         TestUtils.waitForCondition(() -> owner.nativeM5BindingRoute().readSelector().orElseThrow().fallbackSetSha256().isPresent()
                         && admission.read().orElseThrow().reservations().isEmpty()
                         && preparation.read().orElseThrow().reservations().isEmpty(),
@@ -473,6 +501,11 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         var selector = owner.nativeM5BindingRoute().readSelector().orElseThrow();
         var selected = NereusKafkaObjectRecovery.recover(owner.nativeM5BindingRoute(), 0, selector, provider,
                 Duration.ofSeconds(10)).orElseThrow();
+        assertEquals(original, selected.inventory(), "the scheduler changed the original admitted worker or inventory");
+        var authority = owner.nativeM5BindingRoute().readBindingAuthority().toCompletableFuture()
+                .get(30, TimeUnit.SECONDS).orElseThrow();
+        assertTrue(M5BindingAuthorityCodecV1.decodeAuthority(authority.canonicalStoredBytes()).trimMutationTickets().stream()
+                .noneMatch(ticket -> ticket.key().endsWith("/pending-outputs/" + original.worker().taskIdSha256().toHex())));
         assertEquals(PayloadKind.KAFKA_BATCH_PRESERVING_V1, selected.validated().generation().payloadKind());
         assertTrue(selected.prefix().coverage().exclusiveEnd() > 0);
         var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();

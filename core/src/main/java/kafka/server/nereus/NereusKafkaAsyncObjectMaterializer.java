@@ -104,6 +104,7 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
 
     private CompletionStage<Void> finish(NereusKafkaOwnedProviderRuntime.Opened owner, Job job) {
         return job.advance(provider, config.lifecycle().recoveryTimeout())
+                .exceptionallyCompose(job::discardUnprepared)
                 .thenRun(() -> remember(owner, null));
     }
 
@@ -182,12 +183,14 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
         private NereusKafkaObjectMaterialization.Prepared prepared;
         private NereusKafkaObjectMaterialization.Registered registered;
         private NereusKafkaObjectMaterialization.Verified verified;
+        private boolean discarding;
 
         private Job(NereusKafkaNativeInputV2.Captured input) {
             this.input = input;
         }
 
         private CompletionStage<Void> advance(NereusKafkaObjectProvider provider, Duration timeout) {
+            if (discarding) return input.discard();
             var preparation = prepared == null ? input.prepareObjectMaterialization(provider).thenAccept(value -> prepared = value)
                     : CompletableFuture.<Void>completedFuture(null);
             return preparation.thenCompose(ignored -> registered == null
@@ -197,7 +200,18 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
                             ? input.storeObjectMaterialization(registered, provider, timeout).thenAccept(value -> verified = value)
                             : CompletableFuture.completedFuture(null))
                     .thenCompose(ignored -> input.publishObjectMaterialization(verified, provider, provider.fetchExecutor(), timeout))
-                    .thenCompose(ignored -> input.discard());
+                    .thenCompose(ignored -> discardInput());
+        }
+
+        private CompletionStage<Void> discardUnprepared(Throwable failure) {
+            if (prepared != null || discarding) return CompletableFuture.failedFuture(failure);
+            LOG.warn("Native Kafka Object preparation did not produce a plan", failure);
+            return discardInput();
+        }
+
+        private CompletionStage<Void> discardInput() {
+            discarding = true;
+            return input.discard();
         }
     }
 }
