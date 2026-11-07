@@ -37,6 +37,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 
 import scala.Function1;
@@ -53,6 +54,7 @@ final class KafkaBookKeeperFetchProbe {
     private static final int MAX_WAIT_MS = 20_000;
 
     private final CompletableFuture<LogReadResult> firstRead = new CompletableFuture<>();
+    private final ConcurrentLinkedQueue<String> observedWaves = new ConcurrentLinkedQueue<>();
 
     BrokerStorageFetchExecutor observe(BrokerStorageFetchExecutor nativeExecutor) {
         return new BrokerStorageFetchExecutor() {
@@ -62,9 +64,13 @@ final class KafkaBookKeeperFetchProbe {
                     Seq<Tuple2<TopicIdPartition, FetchRequest.PartitionData>> partitions,
                     Function1<Object, Seq<Tuple2<TopicIdPartition, LogReadResult>>> read) {
                 return nativeExecutor.submit(params, partitions, initial -> {
+                    if (params.maxWaitMs == MAX_WAIT_MS) observedWaves.add("read started");
                     var response = read.apply(initial);
-                    if (Boolean.TRUE.equals(initial) && params.maxWaitMs == MAX_WAIT_MS) {
-                        firstRead.complete(response.head()._2());
+                    if (params.maxWaitMs == MAX_WAIT_MS) {
+                        var result = response.head()._2();
+                        observedWaves.add("HW=" + result.highWatermark() + " LSO=" + result.lastStableOffset()
+                                + " bytes=" + result.info().records.sizeInBytes() + " " + result.error());
+                        if (Boolean.TRUE.equals(initial)) firstRead.complete(result);
                     }
                     return response;
                 });
@@ -105,7 +111,12 @@ final class KafkaBookKeeperFetchProbe {
                     "read_committed Fetch returned while the transaction was open");
             producer.commitTransaction();
             // The first and only request must return before Kafka's delayed Fetch timer fires.
-            var response = (FetchResponse) wire.receive(5_000);
+            final FetchResponse response;
+            try {
+                response = (FetchResponse) wire.receive(5_000);
+            } catch (SocketTimeoutException timeout) {
+                throw new AssertionError("Fetch did not wake after transaction commit: " + observedWaves, timeout);
+            }
             assertTrue(System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(MAX_WAIT_MS),
                     "Fetch returned only when its wait expired");
             var result = response.responseData(Map.of(topicId, partition.topic()), FETCH_VERSION).get(partition);
