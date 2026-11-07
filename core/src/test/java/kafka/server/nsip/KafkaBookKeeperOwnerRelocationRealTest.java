@@ -41,7 +41,6 @@ import org.apache.kafka.common.requests.InitProducerIdRequest;
 import org.apache.kafka.common.requests.InitProducerIdResponse;
 import org.apache.kafka.common.requests.ProduceRequest;
 import org.apache.kafka.common.requests.ProduceResponse;
-import org.apache.kafka.common.requests.RequestHeader;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
@@ -53,12 +52,9 @@ import org.apache.kafka.server.common.MetadataVersion;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -443,7 +439,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                     assertEquals(0, log(cluster, 0).lastStableOffset());
                     TopicPartition topicPartition = new TopicPartition("native-cold", 0);
                     producer.sendOffsetsToTransaction(Map.of(topicPartition, new OffsetAndMetadata(40)), group.groupMetadata());
-                    producer.commitTransaction();
+                    KafkaBookKeeperFetchProbe.commitAndVerifyFetch(cluster, 0, topicId, topicPartition, producer, expected);
                     assertEquals(expected, consume(client, 40));
                     assertEquals(40, readGroupOffset(client));
                     producer.beginTransaction();
@@ -668,26 +664,8 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
 
     private static AbstractResponse request(
             KafkaClusterTestKit cluster, int broker, AbstractRequest request, boolean receive) throws Exception {
-        var header = new RequestHeader(request.apiKey(), request.version(), "nsip-disconnect", 1);
-        try (var socket = new Socket(
-                "127.0.0.1",
-                cluster.brokers()
-                        .get(broker)
-                        .socketServer()
-                        .boundPort(cluster.nodes().brokerListenerName()))) {
-            socket.setSoTimeout(30000);
-            var bytes = request.serializeWithHeader(header);
-            var output = new DataOutputStream(socket.getOutputStream());
-            output.writeInt(bytes.remaining());
-            output.write(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining());
-            output.flush();
-            if (!receive) return null;
-            var input = new DataInputStream(socket.getInputStream());
-            int length = input.readInt();
-            assertTrue(length > 0 && length < 1048576);
-            byte[] response = new byte[length];
-            input.readFully(response);
-            return AbstractResponse.parseResponse(ByteBuffer.wrap(response), header);
+        try (var wire = new NativeKafkaRequest(cluster, broker, request)) {
+            return receive ? wire.receive(30_000) : null;
         }
     }
 
