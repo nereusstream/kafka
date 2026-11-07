@@ -211,6 +211,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
     private BookKeeperCapabilitySnapshotV1 capability;
     private Optional<NereusKafkaM4AdmissionV2> m4Admission = Optional.empty();
     private volatile NereusKafkaObjectProvider asyncObject;
+    private volatile NereusKafkaAsyncObjectMaterializer objectMaterializer;
     private volatile boolean asyncObjectReleased;
     private Optional<NereusKafkaM5PolicyInputV1> m5PolicyInput = Optional.empty();
     private ExecutorService m4ReadOwnerLoop;
@@ -296,6 +297,8 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                         if (wantsAsyncObject) {
                             var cell = NereusBookKeeperCapability.metadataPolicy(context.config()).cellIdentity();
                             asyncObject = NereusKafkaObjectProvider.open(context.config(), cell, namespace);
+                            objectMaterializer = new NereusKafkaAsyncObjectMaterializer(
+                                    asyncObject, config, context.scheduler(), context.config().brokerId());
                         }
                         if (m5PolicyInput.isPresent()) {
                             // Native epoch capacity must precede the first permanent ledger reservation.
@@ -455,9 +458,22 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                     }
                 },
                 openings).whenComplete((opened, failure) -> {
-                    if (failure == null) runResponses.afterReady(identity, opened);
+                    if (failure == null) {
+                        ownObjectMaterialization(aggregate, opened);
+                        runResponses.afterReady(identity, opened);
+                    }
                     runResponses.afterRecovery(identity, failure);
                 });
+    }
+
+    private void ownObjectMaterialization(TopicBindingAggregateRecord binding, Opened owner) {
+        if (objectMaterializer != null && NereusBookKeeperCapability.usesAsyncObject(binding)) {
+            objectMaterializer.own(owner);
+        }
+    }
+
+    private void forgetObjectMaterialization(Opened owner) {
+        if (objectMaterializer != null) objectMaterializer.forget(owner);
     }
 
     private synchronized Opened ownSource(
@@ -604,6 +620,13 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         public CompletionStage<NereusKafkaNativeInputV2.Captured> captureM5Inputs(
                 KafkaBookKeeperReadCellBudgetV2 budget, KafkaBookKeeperRunSourceV2.Bounds bounds,
                 KafkaCompactionAdmissionV1.CellCaps caps, NereusKafkaNativeInputV2.CaptureAllowance allowance) {
+            return captureM5Inputs(budget, bounds, caps, allowance, openings);
+        }
+
+        CompletionStage<NereusKafkaNativeInputV2.Captured> captureM5Inputs(
+                KafkaBookKeeperReadCellBudgetV2 budget, KafkaBookKeeperRunSourceV2.Bounds bounds,
+                KafkaCompactionAdmissionV1.CellCaps caps, NereusKafkaNativeInputV2.CaptureAllowance allowance,
+                java.util.concurrent.Executor control) {
             return ownInputOperation(() -> {
                 if (!m5PreparationSlots.tryAcquire())
                     throw new IllegalStateException("native M5 local preparation capacity exhausted");
@@ -611,7 +634,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                 try {
                     var capture = new NereusKafkaNativeInputV2(this, nativeM5InputCut(),
                             nativeOwner, rootsAuthority, m4Route, currentAssignment, source, writerAdmission.inputReadGuard(),
-                            route, budget, bounds, openings).capture(caps, allowance);
+                            route, budget, bounds, control).capture(caps, allowance);
                     handedOff = true;
                     return capture;
                 } catch (Throwable failure) {
@@ -620,6 +643,10 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                     if (!handedOff) m5PreparationSlots.release();
                 }
             });
+        }
+
+        synchronized boolean asyncMaterializationReady() {
+            return !draining && nativeLog != null && storage != null && currentAssignment.getAsBoolean();
         }
 
         KafkaBookKeeperRunSourceV2.OwnedReadSession openSelectedInputSession() {
@@ -766,8 +793,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                 Optional<KafkaOwnerAdmissionV1> closedOwner) throws Exception {
             if (observed.isEmpty()) return Optional.empty();
             var selector = observed.orElseThrow();
-            var metadata = new KafkaBookKeeperControlMetadataStoreV2(m4Route.compactionRecords(), m4Route.rawBindingControl(),
-                    nativeScope.partition(), selector.binding(), source.spec().namespace(), capability.providerScopeId());
+            var metadata = SelectedRecoveryMetadata.open(this, selector, capability);
             var bytes = metadata.get(KafkaBookKeeperCompactionPublicationV2.descriptorKey(selector.selectedViewSha256()));
             if (bytes.isEmpty()) {
                 if (selector.mode() != SelectorMode.PREFERRED_ONLY)
@@ -1524,6 +1550,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                         nativeLog = null;
                         released = true;
                     }
+                    forgetObjectMaterialization(this);
                     attempt.complete(null);
                 } catch (Throwable failure) {
                     attempt.completeExceptionally(failure);
@@ -1568,6 +1595,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
 
     public synchronized void fence() {
         closed = true;
+        if (objectMaterializer != null) objectMaterializer.beginDrain();
         owned.forEach(Opened::fence);
         if (asyncObject != null && !asyncObjectReleased) asyncObject.beginDrain();
     }
@@ -1655,8 +1683,9 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
         if (asyncObject != null && !asyncObjectReleased) asyncObject.drainFetches();
     }
 
-    private void closeObjectProvider() {
+    private void closeObjectProvider() throws Exception {
         if (asyncObject != null && !asyncObjectReleased) {
+            if (objectMaterializer != null) objectMaterializer.close();
             asyncObject.close();
             asyncObjectReleased = true;
         }
@@ -1707,6 +1736,13 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
     }
 
     private static final class SelectedRecoveryMetadata {
+        static KafkaBookKeeperControlMetadataStoreV2 open(
+                Opened owner, BindingReadSelector selector, BookKeeperCapabilitySnapshotV1 capability) {
+            return new KafkaBookKeeperControlMetadataStoreV2(owner.m4Route.compactionRecords(),
+                    owner.m4Route.rawBindingControl(), owner.nativeScope.partition(), selector.binding(),
+                    owner.source.spec().namespace(), capability.providerScopeId());
+        }
+
         static KafkaBookKeeperSelectedCacheBudgetV1 require(
                 Opened opened, KafkaBookKeeperControlMetadataStoreV2 metadata, BindingReadSelector selector,
                 com.nereusstream.kafka.bookkeeper.compaction.KafkaSealedBookKeeperDescriptorV2 descriptor,

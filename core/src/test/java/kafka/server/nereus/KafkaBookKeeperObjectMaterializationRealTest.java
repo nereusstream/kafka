@@ -34,6 +34,7 @@ import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.test.TestUtils;
 
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
 import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
@@ -99,7 +100,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final String TOPIC = "native-cold";
 
     @ParameterizedTest
-    @ValueSource(strings = {"known", "cold", "hot"})
+    @ValueSource(strings = {"known", "cold", "hot", "automatic"})
     @Timeout(240)
     public void storesAndVerifiesTheRealNativeSealedPrefix(String outcome, @TempDir Path work) throws Exception {
         writeM6Capability(work);
@@ -125,6 +126,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         KafkaBookKeeperM5PolicyRealScenario.configure(builder, work, fixture.settings(), true, "OBJECT_BYTES_DISABLED");
         builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.bytes.per.ledger", "1048576");
         builder.setConfigProp("message.max.bytes", "4096");
+        if (fault.automatic) builder.setConfigProp("nereus.kafka.storage.retention.check.interval.ms", "1000");
         try (var cluster = builder.build()) {
             cluster.format();
             cluster.startup();
@@ -146,8 +148,12 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertTrue(sealedRuns(opened) >= 2, "native Produce did not seal two real BK sources");
             assertAppendWhileFetchHeld(cluster, client, topicId, heldFetch, produced);
             produced++;
-            verifyOutputs(opened, fixture, client, produced, new FetchProbe(cluster, topicId, heldFetch, fault),
-                    () -> relocate(cluster, client, cold));
+            ColdTakeover takeover = () -> relocate(cluster, client, cold);
+            if (fault.automatic) {
+                verifyAutomatic(opened, fixture, client, produced, heldFetch, takeover);
+            } else {
+                verifyOutputs(opened, fixture, client, produced, new FetchProbe(cluster, topicId, heldFetch, fault), takeover);
+            }
             cluster.fatalFaultHandler().maybeRethrowFirstException();
             cluster.nonFatalFaultHandler().maybeRethrowFirstException();
         }
@@ -229,12 +235,14 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final class PublicationFault {
         private final boolean enabled;
         private final boolean recoverHot;
+        private final boolean automatic;
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
         private volatile String blocked;
 
         private PublicationFault(String outcome) {
-            enabled = !outcome.equals("known");
             recoverHot = outcome.equals("hot");
+            enabled = recoverHot || outcome.equals("cold");
+            automatic = outcome.equals("automatic");
         }
 
         private AsyncOxiaClient wrap(AsyncOxiaClient client) {
@@ -442,6 +450,34 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         verifyPrefixRead(captured, prepared, verified, provider);
         assertEquals(captured.predecessorSelector(), opened.nativeM5BindingRoute().readSelector().orElseThrow());
         publishAndRead(opened, captured, verified, fixture, client, produced, probe, cold);
+    }
+
+    private static void verifyAutomatic(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture,
+            Properties client, int produced, HeldFetch fetch, ColdTakeover takeover) throws Exception {
+        var provider = fixture.provider();
+        assertTrue(provider.physicalQuota().quota().expand(64L << 20).toCompletableFuture().get(30, TimeUnit.SECONDS));
+        var cell = fixture.profile().protocolCellSha256();
+        var metadata = owner.nativeM5BindingRoute().materializationMetadata(cell);
+        var admission = new M5MaterializationAdmissionV1(metadata, cell);
+        assertEquals(M5MaterializationAdmissionV1.Outcome.APPLIED_EXACT,
+                admission.install(new M5MaterializationAdmissionV1.Caps(1, 4L << 20, 4L << 20, 32, 32, 16, 48)));
+        var limits = new Caps(BOUNDS.payloadBytes(), BOUNDS.batches(), BOUNDS.records(), BOUNDS.records(),
+                BOUNDS.decodedBytes(), BOUNDS.decodedBytes(), BOUNDS.decodedBytes(), BOUNDS.records(), BOUNDS.records());
+        var preparation = owner.nativeM5CompactionAdmission();
+        assertEquals(com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionAdmissionV1.Outcome.APPLIED_EXACT,
+                preparation.install(KafkaBookKeeperSelectedInputRealScenario.caps(limits, 1)));
+        TestUtils.waitForCondition(() -> owner.nativeM5BindingRoute().readSelector().orElseThrow().fallbackSetSha256().isPresent()
+                        && admission.read().orElseThrow().reservations().isEmpty()
+                        && preparation.read().orElseThrow().reservations().isEmpty(),
+                45_000, "native Broker background task did not select and settle its Object generation");
+        var selector = owner.nativeM5BindingRoute().readSelector().orElseThrow();
+        var selected = NereusKafkaObjectRecovery.recover(owner.nativeM5BindingRoute(), 0, selector, provider,
+                Duration.ofSeconds(10)).orElseThrow();
+        assertEquals(PayloadKind.KAFKA_BATCH_PRESERVING_V1, selected.validated().generation().payloadKind());
+        assertTrue(selected.prefix().coverage().exclusiveEnd() > 0);
+        var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
+        assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
+        verifyColdSelector(selector, takeover.relocate(), client, expected, fetch);
     }
 
     private static void publishAndRead(NereusKafkaOwnedProviderRuntime.Opened opened,
