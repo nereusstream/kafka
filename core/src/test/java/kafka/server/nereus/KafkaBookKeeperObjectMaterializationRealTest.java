@@ -42,7 +42,12 @@ import com.nereusstream.kafka.bookkeeper.recovery.KafkaBookKeeperClosedHistoryRe
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaQuotaTargetDeleteStoreV2;
+import com.nereusstream.storage.api.bookkeeper.RunLedgerHandleV1;
 import com.nereusstream.storage.api.kafka.KafkaRunRootRecordV2;
+import com.nereusstream.storage.api.kafka.KafkaRunRootSnapshotV1;
+import com.nereusstream.storage.api.lifecycle.PhysicalResourceIdV2;
+import com.nereusstream.storage.bookkeeper.M5BookKeeperNativeCreateClientV2;
 import com.nereusstream.storage.object.gc.M5ObjectBirthCreditV3;
 import com.nereusstream.storage.object.gc.M5TargetDeleteAuthorityCoordinatorV1;
 import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
@@ -478,14 +483,14 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertFalse(retired.isEmpty());
         }
 
-        private void verifyReleasedSources(NereusKafkaOwnedProviderRuntime.Opened owner, boolean requestReclaim) throws Exception {
+        private void reclaimReleasedSources(NereusKafkaOwnedProviderRuntime.Opened owner) throws Exception {
             assertTrue(owner.nativeM5GcAdmissionOpen().toCompletableFuture().get(30, TimeUnit.SECONDS));
             try (var scan = owner.openNativeM5SourceScan().toCompletableFuture().get(30, TimeUnit.SECONDS)) {
                 var inputs = NereusKafkaM5GcInputsV1.captureReplacement(scan).toCompletableFuture().get(30, TimeUnit.SECONDS);
                 var targets = inputs.resources().stream().map(resource -> inputs.handle(resource).ledgerIdentity().ledgerId()).sorted().toList();
                 assertEquals(releasedLedgers.get().stream().sorted().toList(), targets);
                 assertFalse(targets.contains(retainedLedger));
-                if (requestReclaim) scan.reclaimReplacedSources().toCompletableFuture().get(60, TimeUnit.SECONDS);
+                scan.reclaimReplacedSources().toCompletableFuture().get(60, TimeUnit.SECONDS);
                 for (var resource : inputs.resources()) {
                     var done = scan.physical().read(resource.authorityKey()).toCompletableFuture().get(30, TimeUnit.SECONDS).orElseThrow();
                     assertTrue(com.nereusstream.storage.object.gc.M5TargetDeleteStoredValueV2.decode(done).compactDone().isPresent());
@@ -493,15 +498,6 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                     assertEquals(com.nereusstream.storage.bookkeeper.M5BookKeeperDeleteAdapterV1.CaptureOutcome.DEFINITIVELY_ABSENT,
                             scan.nativeClient().captureExactTarget(inputs.handle(resource)).toCompletableFuture().get(30, TimeUnit.SECONDS).outcome());
                 }
-            }
-        }
-
-        private boolean scheduledDeletionSettled(NereusKafkaOwnedProviderRuntime.Opened owner) {
-            try {
-                verifyReleasedSources(owner, false);
-                return true;
-            } catch (Exception failure) {
-                throw new java.util.concurrent.CompletionException(failure);
             }
         }
 
@@ -535,6 +531,43 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 hold.entered().complete(null);
                 return hold.release();
             });
+        }
+    }
+
+    /** Observe the actual targets without holding the background actor's exclusive source scan. */
+    private record ScheduledDeletion(OxiaQuotaTargetDeleteStoreV2 metadata, M5BookKeeperNativeCreateClientV2 client,
+            List<RunLedgerHandleV1> handles) {
+        static ScheduledDeletion observe(NereusKafkaOwnedProviderRuntime.Opened owner, List<KafkaRunRootSnapshotV1> roots)
+                throws Exception {
+            try (var scan = owner.openNativeM5SourceScan().toCompletableFuture().get(30, TimeUnit.SECONDS)) {
+                var client = scan.nativeClient();
+                var config = client.capabilitySnapshot().configurationDigest();
+                return new ScheduledDeletion(scan.physical(), client, roots.stream().map(root ->
+                        new RunLedgerHandleV1(root.providerScopeId(), root.runId(), root.ledgerIdentity(), config)).toList());
+            }
+        }
+
+        boolean settled() throws Exception {
+            for (var handle : handles) {
+                var resource = new PhysicalResourceIdV2.BookKeeperLedger(client.spec().namespace(), handle.ledgerIdentity().ledgerId());
+                var fact = metadata.read(resource.authorityKey()).toCompletableFuture().get(5, TimeUnit.SECONDS);
+                if (fact.filter(value -> com.nereusstream.storage.object.gc.M5TargetDeleteStoredValueV2.decode(value)
+                        .compactDone().isPresent()).isEmpty()
+                        || !metadata.quota().requireExistingReservation(resource).toCompletableFuture().get(5, TimeUnit.SECONDS).settled()) {
+                    return false;
+                }
+                assertEquals(com.nereusstream.storage.bookkeeper.M5BookKeeperDeleteAdapterV1.CaptureOutcome.DEFINITIVELY_ABSENT,
+                        client.captureExactTarget(handle).toCompletableFuture().get(5, TimeUnit.SECONDS).outcome());
+            }
+            return true;
+        }
+
+        void requirePresentBeforeCheckpoint() throws Exception {
+            for (var handle : handles) {
+                assertEquals(com.nereusstream.storage.bookkeeper.M5BookKeeperDeleteAdapterV1.CaptureOutcome.EXACT_TARGET,
+                        client.captureExactTarget(handle).toCompletableFuture().get(5, TimeUnit.SECONDS).outcome(),
+                        "BK deletion preceded the independent retained checkpoint");
+            }
         }
     }
 
@@ -758,15 +791,17 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             long coveredEnd, Properties client, int produced, HeldFetch fetch, ColdTakeover takeover) throws Exception {
         var raw = owner.storage().nativeReadSources().sealedRoots().stream().filter(root -> root.kafkaStartOffset() < coveredEnd).toList();
         assertFalse(raw.isEmpty());
+        var deletion = ScheduledDeletion.observe(owner, raw);
         TestUtils.waitForCondition(() -> owner.nativeM5BindingRoute().readSelector().orElseThrow().mode() == SelectorMode.PREFERRED_ONLY,
                 30_000, "background retirement did not close old fallback admission");
         int afterRollover = produceThroughRollover(owner, client, produced);
         TestUtils.waitForCondition(() -> owner.storage().nativeReadSources().sealedRoots().stream().noneMatch(raw::contains),
                 30_000, "background retirement did not transfer the drained raw prefix");
         long carrier = owner.storage().nativeReadSources().activeRoot().ledgerIdentity().ledgerId();
+        deletion.requirePresentBeforeCheckpoint();
         int end = produceThroughRollover(owner, client, afterRollover);
         fetch.observeRetainedCheckpoint(carrier, raw.stream().map(root -> root.ledgerIdentity().ledgerId()).toList());
-        TestUtils.waitForCondition(() -> fetch.scheduledDeletionSettled(owner),
+        TestUtils.waitForCondition(deletion::settled,
                 45_000, "background retirement did not settle exact native BK deletion and quota");
         var selected = owner.nativeM5BindingRoute().readSelector().orElseThrow();
         assertEquals(original.selectedViewSha256(), selected.selectedViewSha256());
@@ -982,7 +1017,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata.persistObjectScope(owner, provider, transfer, Duration.ofSeconds(10))
                 .toCompletableFuture().get(30, TimeUnit.SECONDS);
         probe.held().observeRetainedCheckpoint(transfer);
-        probe.held().verifyReleasedSources(owner, true);
+        probe.held().reclaimReleasedSources(owner);
         assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
         probe.held().beginColdRecoveryObservation();
         verifyColdSelector(selector, cold.relocate(), client, expected, probe.held());
