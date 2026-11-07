@@ -77,6 +77,8 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 /** Actual Kafka protocol, Controller and Brokers, over the admitted real BK/Oxia backend. */
 public class KafkaBookKeeperOwnerRelocationRealTest {
+    private static final String GROUP_ID = "durable-native-group";
+
     @Test
     @Timeout(value = 180)
     public void liveMetadataDeltaHandoffPreservesGroupAndTransactionCoordinators() throws Exception {
@@ -300,6 +302,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
                         assertTrue(recoveryError == Errors.NOT_LEADER_OR_FOLLOWER
                                         || recoveryError == Errors.KAFKA_STORAGE_ERROR,
                                 "Pending Owner returned " + recoveryError);
+                        assertPendingCoordinators(cluster, admin, pending, pendingPartition.topicPartition());
                         admin.alterPartitionReassignments(Map.of(
                                         new TopicPartition("native-cold", 0),
                                                 java.util.Optional.of(
@@ -613,7 +616,7 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
         config.putAll(client);
         config.put("key.deserializer", StringDeserializer.class.getName());
         config.put("value.deserializer", StringDeserializer.class.getName());
-        config.put("group.id", "durable-native-group");
+        config.put("group.id", GROUP_ID);
         config.put("enable.auto.commit", "false");
         return config;
     }
@@ -791,6 +794,19 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
             Thread.sleep(50);
         }
         return fail("Controller did not relocate the sole native replica");
+    }
+
+    private static void assertPendingCoordinators(
+            KafkaClusterTestKit cluster, Admin admin, int pending, TopicPartition topic) throws Exception {
+        for (var coordinatorTopic : List.of("__consumer_offsets", "__transaction_state")) {
+            awaitTopicLeader(admin, coordinatorTopic, pending);
+            var coordinatorPartition = new TopicPartition(coordinatorTopic, 0);
+            awaitCondition(() -> {
+                var local = cluster.brokers().get(pending).replicaManager().onlinePartition(coordinatorPartition);
+                return local.isDefined() && local.get().isLeader();
+            }, "pending coordinator partition was not published: " + coordinatorTopic);
+        }
+        KafkaBookKeeperCoordinatorProbe.assertNotReady(cluster, pending, topic, GROUP_ID);
     }
 
     private static void awaitTopicLeader(Admin admin, String topic, int expected) throws Exception {
