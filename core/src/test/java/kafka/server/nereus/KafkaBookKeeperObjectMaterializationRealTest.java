@@ -32,9 +32,13 @@ import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
+import org.apache.kafka.common.utils.LogCaptureAppender;
+import org.apache.kafka.metadata.BrokerState;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.util.KafkaScheduler;
 import org.apache.kafka.test.TestUtils;
+import org.apache.logging.log4j.Level;
 
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionAdmissionV1;
@@ -116,7 +120,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"known", "cold", "hot", "automatic", "stale-registration", "retirement",
-        "background-retirement", "cold-retirement", "faults", "put-unknown", "semantic"})
+        "background-retirement", "cold-retirement", "shutdown-retirement", "faults", "put-unknown", "semantic"})
     @Timeout(240)
     public void storesAndVerifiesTheRealNativeSealedPrefix(String outcome, @TempDir Path work) throws Exception {
         writeM6Capability(work);
@@ -157,10 +161,11 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             assertAppendWhileFetchHeld(cluster, client, topicId, heldFetch, produced);
             produced++;
             ColdTakeover takeover = () -> relocate(cluster, client, cold);
+            var probe = new FetchProbe(cluster, topicId, heldFetch, fault);
             if (fault.automatic) {
-                verifyAutomatic(opened, fixture, client, produced, heldFetch, takeover, fault);
+                verifyAutomatic(opened, fixture, client, produced, probe, takeover);
             } else {
-                verifyOutputs(opened, fixture, client, produced, new FetchProbe(cluster, topicId, heldFetch, fault), takeover);
+                verifyOutputs(opened, fixture, client, produced, probe, takeover);
             }
             cluster.fatalFaultHandler().maybeRethrowFirstException();
             cluster.nonFatalFaultHandler().maybeRethrowFirstException();
@@ -176,6 +181,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         if (fault.automatic) builder.setConfigProp("nereus.kafka.storage.retention.check.interval.ms", "1000");
         if (fault.backgroundRetirement) {
             builder.setConfigProp("nereus.kafka.storage.materialization.source.retirement.grace.ms", "5000");
+        }
+        if (fault.shutdownRetirement) {
+            builder.setConfigProp("nereus.kafka.storage.bookkeeper.m5.gc.grace.ms", "90000");
         }
     }
 
@@ -281,6 +289,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean retireFallback;
         private final boolean backgroundRetirement;
         private final boolean coldRetirement;
+        private final boolean shutdownRetirement;
         private final boolean readFaults;
         private final boolean unknownPut;
         private final boolean semantic;
@@ -296,7 +305,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             recoverHot = outcome.equals("hot");
             enabled = recoverHot || outcome.equals("cold");
             coldRetirement = outcome.equals("cold-retirement");
-            backgroundRetirement = coldRetirement || outcome.equals("background-retirement");
+            shutdownRetirement = outcome.equals("shutdown-retirement");
+            backgroundRetirement = coldRetirement || shutdownRetirement || outcome.equals("background-retirement");
             staleRegistration = outcome.equals("stale-registration");
             automatic = outcome.equals("automatic") || backgroundRetirement || staleRegistration;
             retireFallback = outcome.equals("retirement");
@@ -809,7 +819,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     }
 
     private static void verifyAutomatic(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture,
-            Properties client, int produced, HeldFetch fetch, ColdTakeover takeover, PublicationFault fault) throws Exception {
+            Properties client, int produced, FetchProbe probe, ColdTakeover takeover) throws Exception {
+        var fault = probe.fault();
         var provider = fixture.provider();
         assertTrue(provider.physicalQuota().quota().expand(64L << 20).toCompletableFuture().get(30, TimeUnit.SECONDS));
         var cell = fixture.profile().protocolCellSha256();
@@ -837,12 +848,12 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         assertTrue(selected.prefix().coverage().exclusiveEnd() > 0);
         if (fault.backgroundRetirement) {
             verifyScheduledRetirement(owner, selector, selected.prefix().coverage().exclusiveEnd(),
-                    client, produced, fetch, takeover, fault);
+                    client, produced, probe, takeover);
             return;
         }
         var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
         assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
-        verifyColdSelector(selector, takeover.relocate(), client, expected, fetch);
+        verifyColdSelector(selector, takeover.relocate(), client, expected, probe.held());
     }
 
     record ScheduledLimits(M5MaterializationAdmissionV1 outputs, KafkaCompactionAdmissionV1 inputs) {
@@ -864,7 +875,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     }
 
     private static void verifyScheduledRetirement(NereusKafkaOwnedProviderRuntime.Opened owner, BindingReadSelector original,
-            long coveredEnd, Properties client, int produced, HeldFetch fetch, ColdTakeover takeover, PublicationFault fault) throws Exception {
+            long coveredEnd, Properties client, int produced, FetchProbe probe, ColdTakeover takeover) throws Exception {
+        var fetch = probe.held();
+        var fault = probe.fault();
         var raw = owner.storage().nativeReadSources().sealedRoots().stream().filter(root -> root.kafkaStartOffset() < coveredEnd).toList();
         assertFalse(raw.isEmpty());
         var deletion = ScheduledDeletion.observe(owner, raw);
@@ -875,6 +888,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 30_000, "background retirement did not transfer the drained raw prefix");
         long carrier = owner.storage().nativeReadSources().activeRoot().ledgerIdentity().ledgerId();
         deletion.requirePresent("BK deletion preceded the independent retained checkpoint");
+        if (fault.shutdownRetirement) {
+            GraceShutdown.verify(probe.cluster(), () -> produceThroughRollover(owner, client, afterRollover));
+            return;
+        }
         int end = produceThroughRollover(owner, client, afterRollover);
         fetch.observeRetainedCheckpoint(carrier, raw.stream().map(root -> root.ledgerIdentity().ledgerId()).toList());
         var selected = owner.nativeM5BindingRoute().readSelector().orElseThrow();
@@ -901,6 +918,26 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         fetch.beginColdRecoveryObservation();
         verifyColdSelector(selected, takeover.relocate(), client, expected, fetch);
         fetch.assertRetainedRecovery();
+    }
+
+    private static final class GraceShutdown {
+        @FunctionalInterface
+        private interface Rollover {
+            int appendThroughSeal() throws Exception;
+        }
+
+        static void verify(KafkaClusterTestKit cluster, Rollover rollover) throws Exception {
+            try (var logs = LogCaptureAppender.createAndRegister(KafkaScheduler.class)) {
+                logs.setClassLogger(KafkaScheduler.class, Level.DEBUG);
+                rollover.appendThroughSeal();
+                TestUtils.waitForCondition(() -> logs.getMessages().stream().anyMatch(message ->
+                                message.startsWith("Scheduling task nereus-m5-gc-grace-") && message.contains("90000 ms")),
+                        30_000, "native GC did not schedule its real pending grace task");
+                var broker = cluster.brokers().get(0);
+                broker.shutdown();
+                assertEquals(BrokerState.NOT_RUNNING, broker.brokerState());
+            }
+        }
     }
 
     private static void publishAndRead(NereusKafkaOwnedProviderRuntime.Opened opened,

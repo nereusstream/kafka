@@ -703,6 +703,13 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                     .map(NereusKafkaM5SourceScanV1::closeAsync).toArray(CompletableFuture[]::new));
         }
 
+        private CompletableFuture<Void> stopNativeM5SourceScans() {
+            synchronized (this) {
+                draining = true;
+            }
+            return closeNativeM5SourceScans();
+        }
+
         /** Capture actual per-resource replacement facts on the owned control path; this grants no deletion. */
         CompletionStage<NereusKafkaReadScopeV2.ReplacementEvidence> captureNativeM5ReplacementEvidence() {
             return captureNativeM5ReplacementEvidence(null);
@@ -1655,8 +1662,12 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
     @Override
     public void close() throws Exception {
         fence();
-        // Accepted Object retirement can still close a source-scan client on openings after provider drain.
+        // Kafka has stopped its scheduler. Close native scans to cancel their pending grace waits
+        // while accepted operations can still close their provider clients on openings.
+        var scans = CompletableFuture.allOf(List.copyOf(owned).stream()
+                .map(Opened::stopNativeM5SourceScans).toArray(CompletableFuture[]::new));
         drainObjectReads();
+        scans.get(context.config().nereusKafkaStorageConfig().rollout().shutdownDrainTimeout().toMillis(), TimeUnit.MILLISECONDS);
         if (objectMaterializer != null) objectMaterializer.close();
         openings.shutdown();
         if (!openings.awaitTermination(
