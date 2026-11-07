@@ -63,8 +63,7 @@ final class NereusKafkaObjectPublication {
         var task = verified.stored().task();
         var plan = task.prepared().plan();
         var profile = provider.profile();
-        var prefix = new KafkaObjectMaterializedPrefixV1(plan, verified.generation(),
-                object -> provider.readVersion(object.identity(), object.immutableProviderVersionToken().orElseThrow()).value());
+        var prefix = new KafkaObjectMaterializedPrefixV1(plan, verified.generation(), provider::readForFetch);
         if (!prefix.originalFallbackSources().equals(verified.protections())) {
             throw new IllegalArgumentException("Kafka Object publication lost its exact original fallback set");
         }

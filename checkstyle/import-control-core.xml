@@ -158,14 +158,19 @@
       <allow pkg="io.oxia.client.api" />
       <allow pkg="org.apache.bookkeeper" />
       <file name="(NereusKafkaObjectProvider|KafkaObjectProviderAdmissionRealTest)(\.java)?" regex="true">
+        <allow class="com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1.ReadFailure" />
+        <allow class="com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1.UnresolvedRead" />
         <allow class="com.nereusstream.storage.object.materialization.M5CellProviderProfileV2" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.GenerationObject" />
         <allow class="com.nereusstream.storage.object.provider.C1ObjectProviderSession" />
         <allow class="com.nereusstream.storage.object.provider.C1ObjectProviderSession.VerifiedObjectConsumption" />
         <allow class="com.nereusstream.storage.object.provider.C1ObjectProviderSession.VerifiedReadCleanupException" />
         <allow class="com.nereusstream.storage.object.provider.ObjectIdentity" />
         <allow class="com.nereusstream.storage.object.provider.ProviderObjectOutcome" />
         <allow class="com.nereusstream.storage.object.provider.RepeatableObjectBody" />
+        <allow class="com.nereusstream.storage.object.read.BindingReadRouteV1.FailureClass" />
         <allow class="com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport" />
+        <allow class="com.nereusstream.storage.object.s3.S3C1ProviderException" />
         <allow class="com.nereusstream.storage.object.s3.S3M5PhysicalNamespaceAuthorityV2" />
         <allow class="software.amazon.awssdk.auth.credentials.AwsBasicCredentials" />
         <allow class="software.amazon.awssdk.auth.credentials.AwsSessionCredentials" />

@@ -24,15 +24,20 @@ import org.apache.kafka.server.config.NereusKafkaStorageConfig;
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.domain.protocol.KafkaProtocolCellIdentity;
+import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1.ReadFailure;
+import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1.UnresolvedRead;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaCellProviderScopeRegistryV2;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaQuotaTargetDeleteStoreV2;
 import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
+import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.GenerationObject;
 import com.nereusstream.storage.object.provider.C1ObjectProviderSession;
 import com.nereusstream.storage.object.provider.C1ObjectProviderSession.VerifiedObjectConsumption;
 import com.nereusstream.storage.object.provider.C1ObjectProviderSession.VerifiedReadCleanupException;
 import com.nereusstream.storage.object.provider.ObjectIdentity;
+import com.nereusstream.storage.object.read.BindingReadRouteV1.FailureClass;
 import com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport;
+import com.nereusstream.storage.object.s3.S3C1ProviderException;
 import com.nereusstream.storage.object.s3.S3M5PhysicalNamespaceAuthorityV2;
 
 import java.io.ByteArrayOutputStream;
@@ -45,6 +50,7 @@ import java.util.Map;
 import java.util.ArrayDeque;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 
@@ -65,7 +71,9 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
     private final S3C1ObjectProviderTransport transport;
     private final C1ObjectProviderSession session;
     private final OxiaQuotaTargetDeleteStoreV2 physicalQuota;
-    private final ArrayDeque<VerifiedReadCleanupException> readCleanup = new ArrayDeque<>();
+    private final ArrayDeque<PendingRead> readCleanup = new ArrayDeque<>();
+
+    private record PendingRead(VerifiedReadCleanupException failure, CompletableFuture<Void> drain) { }
 
     private NereusKafkaObjectProvider(OxiaCellProviderScopeRegistryV2.Admission admission,
             S3C1ObjectProviderTransport transport, C1ObjectProviderSession session,
@@ -187,10 +195,29 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
             return session.consumeVerifiedObject(identity, Optional.of(version),
                     input -> CanonicalBytes.copyOf(input.readNBytes(length)));
         } catch (VerifiedReadCleanupException failure) {
+            var drain = new CompletableFuture<Void>();
             synchronized (this) {
-                readCleanup.addLast(failure);
+                readCleanup.addLast(new PendingRead(failure, drain));
             }
+            throw new UnresolvedRead(failure, drain.thenApply(ignored -> null));
+        }
+    }
+
+    CanonicalBytes readForFetch(GenerationObject object) throws IOException {
+        try {
+            return readVersion(object.identity(), object.immutableProviderVersionToken().orElseThrow()).value();
+        } catch (UnresolvedRead failure) {
             throw failure;
+        } catch (S3C1ProviderException failure) {
+            var kind = switch (failure.kind()) {
+                case NOT_FOUND -> FailureClass.MISSING;
+                case OUTCOME_UNKNOWN, RETRYABLE -> FailureClass.UNAVAILABLE;
+                case INTEGRITY -> FailureClass.CORRUPT_OR_FORMAT;
+                case CAPACITY, DEFINITIVE_CONFLICT, UNSUPPORTED_OPERATION -> FailureClass.NOT_ELIGIBLE;
+            };
+            throw new ReadFailure(kind, "exact Kafka Object Fetch failed", failure);
+        } catch (IOException failure) {
+            throw new ReadFailure(FailureClass.CORRUPT_OR_FORMAT, "exact Kafka Object Fetch response failed validation", failure);
         }
     }
 
@@ -210,17 +237,24 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
         session.drain();
     }
 
-    @Override
-    public synchronized void close() {
-        session.drain();
+    /** Reconcile only the original SDK response; no subsequent GET can prove the former one closed. */
+    synchronized void reconcileOriginalReads() {
         while (!readCleanup.isEmpty()) {
+            var pending = readCleanup.getFirst();
             try {
-                readCleanup.getFirst().reconcileCleanup();
+                pending.failure().reconcileCleanup();
                 readCleanup.removeFirst();
+                pending.drain().complete(null);
             } catch (IOException failure) {
                 throw new UncheckedIOException("Kafka Object still owns an original GET response", failure);
             }
         }
+    }
+
+    @Override
+    public synchronized void close() {
+        session.drain();
+        reconcileOriginalReads();
         session.close();
         transport.close();
     }
