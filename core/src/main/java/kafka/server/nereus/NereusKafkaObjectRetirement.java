@@ -30,6 +30,7 @@ import java.util.function.Supplier;
 /** One actual Owner's original Object selection, until the old reads, checkpoint, and native GC settle. */
 final class NereusKafkaObjectRetirement {
     private final BindingReadSelector original;
+    private final long coveredEnd;
     private final long observedAt = System.nanoTime();
     private KafkaBookKeeperNativeFallbackRetirementV2 actor;
     private boolean admissionClosed;
@@ -47,6 +48,7 @@ final class NereusKafkaObjectRetirement {
             throw new IllegalArgumentException("native Object retirement lacks one exact owned fallback epoch");
         }
         this.original = original;
+        coveredEnd = verified.prefix().coverage().exclusiveEnd();
     }
 
     boolean sameSelection(BindingReadSelector observed) {
@@ -76,7 +78,7 @@ final class NereusKafkaObjectRetirement {
             start(owner, () -> storage.finishNativeObjectFallbackRetirement(actor, control)
                     .thenAcceptAsync(result -> released = result, control));
         } else if (transfer == null) {
-            transfer = storage.transferRetiredObjectBookKeeperPrefix(released);
+            if (retainedCheckpointAvailable(storage)) transfer = storage.transferRetiredObjectBookKeeperPrefix(released);
         } else if (transfer.durableCheckpoint().isPresent() && !persisted) {
             start(owner, () -> NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata
                     .persistObjectScope(owner, provider, transfer, timeout).thenRunAsync(() -> persisted = true, control));
@@ -88,6 +90,15 @@ final class NereusKafkaObjectRetirement {
                 transfer = null;
             }, control));
         }
+    }
+
+    private boolean retainedCheckpointAvailable(KafkaBookKeeperPartitionV1 storage) {
+        var input = storage.nativeInputSources();
+        return input.recoveryCheckpoint().filter(checkpoint -> {
+            var run = checkpoint.vector().runBinding().runId();
+            return input.sources().sealedRoots().stream().noneMatch(root ->
+                    root.kafkaStartOffset() < coveredEnd && root.runId().equals(run));
+        }).isPresent();
     }
 
     CompletionStage<Void> drain() {
