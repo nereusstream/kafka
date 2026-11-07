@@ -108,7 +108,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final String TOPIC = "native-cold";
 
     @ParameterizedTest
-    @ValueSource(strings = {"known", "cold", "hot", "automatic", "retirement", "faults", "semantic"})
+    @ValueSource(strings = {"known", "cold", "hot", "automatic", "retirement", "background-retirement", "faults", "semantic"})
     @Timeout(240)
     public void storesAndVerifiesTheRealNativeSealedPrefix(String outcome, @TempDir Path work) throws Exception {
         writeM6Capability(work);
@@ -133,10 +133,13 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                             context, observer(ready, heldFetch, ready == first ? fault : new PublicationFault("known"))));
                 });
         KafkaBookKeeperM5PolicyRealScenario.configure(builder, work, fixture.settings(), true,
-                fault.retireFallback ? "OBJECT_GC_ENABLED" : "OBJECT_BYTES_DISABLED");
+                fault.retireFallback || fault.backgroundRetirement ? "OBJECT_GC_ENABLED" : "OBJECT_BYTES_DISABLED");
         builder.setConfigProp("nereus.kafka.storage.bookkeeper.max.bytes.per.ledger", "1048576");
         builder.setConfigProp("message.max.bytes", "4096");
         if (fault.automatic) builder.setConfigProp("nereus.kafka.storage.retention.check.interval.ms", "1000");
+        if (fault.backgroundRetirement) {
+            builder.setConfigProp("nereus.kafka.storage.materialization.source.retirement.grace.ms", "5000");
+        }
         try (var cluster = builder.build()) {
             cluster.format();
             cluster.startup();
@@ -149,8 +152,9 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 topicId = admin.createTopics(List.of(topic)).topicId(TOPIC).get(30, TimeUnit.SECONDS);
             }
             var opened = first.get(30, TimeUnit.SECONDS);
-            int produced = fault.semantic ? KafkaObjectCompactionRealScenario.seed(cluster) : 0;
-            while (sealedRuns(opened) < 2 && produced < 32) {
+            int produced = fault.semantic ? KafkaObjectCompactionRealScenario.seed(cluster, client) : 0;
+            while ((sealedRuns(opened) < 2 || fault.semantic && opened.storage().nativeReadSources().activeRoot().kafkaStartOffset()
+                    < KafkaObjectCompactionRealScenario.SEALED_TRANSACTION_END) && produced < 32) {
                 KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + produced, produced);
                 produced++;
             }
@@ -254,6 +258,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean recoverHot;
         private final boolean automatic;
         private final boolean retireFallback;
+        private final boolean backgroundRetirement;
         private final boolean readFaults;
         private final boolean semantic;
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
@@ -265,7 +270,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private PublicationFault(String outcome) {
             recoverHot = outcome.equals("hot");
             enabled = recoverHot || outcome.equals("cold");
-            automatic = outcome.equals("automatic");
+            backgroundRetirement = outcome.equals("background-retirement");
+            automatic = outcome.equals("automatic") || backgroundRetirement;
             retireFallback = outcome.equals("retirement");
             readFaults = outcome.equals("faults");
             semantic = outcome.equals("semantic");
@@ -425,20 +431,25 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private void observeRetainedCheckpoint(
                 com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1.ObjectBookKeeperSourceTransfer transfer) {
             var tail = transfer.retained().sealedRoots();
-            retainedLedger = transfer.durableCheckpoint().orElseThrow().sealedCarrier().ledgerIdentity().ledgerId();
-            releasedLedgers.set(transfer.original().sealedRoots().stream().filter(root -> !tail.contains(root))
-                    .map(root -> root.ledgerIdentity().ledgerId()).toList());
-            assertFalse(releasedLedgers.get().isEmpty());
+            observeRetainedCheckpoint(transfer.durableCheckpoint().orElseThrow().sealedCarrier().ledgerIdentity().ledgerId(),
+                    transfer.original().sealedRoots().stream().filter(root -> !tail.contains(root))
+                            .map(root -> root.ledgerIdentity().ledgerId()).toList());
         }
 
-        private void reclaimReleasedSources(NereusKafkaOwnedProviderRuntime.Opened owner) throws Exception {
+        private void observeRetainedCheckpoint(long ledger, List<Long> retired) {
+            retainedLedger = ledger;
+            releasedLedgers.set(List.copyOf(retired));
+            assertFalse(retired.isEmpty());
+        }
+
+        private void verifyReleasedSources(NereusKafkaOwnedProviderRuntime.Opened owner, boolean requestReclaim) throws Exception {
             assertTrue(owner.nativeM5GcAdmissionOpen().toCompletableFuture().get(30, TimeUnit.SECONDS));
             try (var scan = owner.openNativeM5SourceScan().toCompletableFuture().get(30, TimeUnit.SECONDS)) {
                 var inputs = NereusKafkaM5GcInputsV1.captureReplacement(scan).toCompletableFuture().get(30, TimeUnit.SECONDS);
                 var targets = inputs.resources().stream().map(resource -> inputs.handle(resource).ledgerIdentity().ledgerId()).sorted().toList();
                 assertEquals(releasedLedgers.get().stream().sorted().toList(), targets);
                 assertFalse(targets.contains(retainedLedger));
-                scan.reclaimReplacedSources().toCompletableFuture().get(60, TimeUnit.SECONDS);
+                if (requestReclaim) scan.reclaimReplacedSources().toCompletableFuture().get(60, TimeUnit.SECONDS);
                 for (var resource : inputs.resources()) {
                     var done = scan.physical().read(resource.authorityKey()).toCompletableFuture().get(30, TimeUnit.SECONDS).orElseThrow();
                     assertTrue(com.nereusstream.storage.object.gc.M5TargetDeleteStoredValueV2.decode(done).compactDone().isPresent());
@@ -682,9 +693,40 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 .noneMatch(ticket -> ticket.key().endsWith("/pending-outputs/" + original.worker().taskIdSha256().toHex())));
         assertEquals(PayloadKind.KAFKA_BATCH_PRESERVING_V1, selected.validated().generation().payloadKind());
         assertTrue(selected.prefix().coverage().exclusiveEnd() > 0);
+        if (fault.backgroundRetirement) {
+            verifyScheduledRetirement(owner, selector, selected.prefix().coverage().exclusiveEnd(), client, produced, fetch, takeover);
+            return;
+        }
         var expected = IntStream.range(0, produced).mapToObj(offset -> "input-" + offset).toList();
         assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
         verifyColdSelector(selector, takeover.relocate(), client, expected, fetch);
+    }
+
+    private static void verifyScheduledRetirement(NereusKafkaOwnedProviderRuntime.Opened owner, BindingReadSelector original,
+            long coveredEnd, Properties client, int produced, HeldFetch fetch, ColdTakeover takeover) throws Exception {
+        var raw = owner.storage().nativeReadSources().sealedRoots().stream().filter(root -> root.kafkaStartOffset() < coveredEnd).toList();
+        assertFalse(raw.isEmpty());
+        TestUtils.waitForCondition(() -> owner.nativeM5BindingRoute().readSelector().orElseThrow().mode() == SelectorMode.PREFERRED_ONLY
+                        && owner.storage().nativeReadSources().sealedRoots().stream().noneMatch(raw::contains),
+                30_000, "background retirement did not transfer the drained raw prefix");
+        long carrier = owner.storage().nativeReadSources().activeRoot().ledgerIdentity().ledgerId();
+        int end = produceThroughRollover(owner, client, produced);
+        fetch.observeRetainedCheckpoint(carrier, raw.stream().map(root -> root.ledgerIdentity().ledgerId()).toList());
+        TestUtils.waitForCondition(() -> {
+            try {
+                fetch.verifyReleasedSources(owner, false);
+                return true;
+            } catch (Exception failure) {
+                throw new java.util.concurrent.CompletionException(failure);
+            }
+        }, 45_000, "background retirement did not settle exact native BK deletion and quota");
+        var selected = owner.nativeM5BindingRoute().readSelector().orElseThrow();
+        assertEquals(original.selectedViewSha256(), selected.selectedViewSha256());
+        var expected = IntStream.range(0, end).mapToObj(offset -> "input-" + offset).toList();
+        assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, end));
+        fetch.beginColdRecoveryObservation();
+        verifyColdSelector(selected, takeover.relocate(), client, expected, fetch);
+        fetch.assertRetainedRecovery();
     }
 
     private static void publishAndRead(NereusKafkaOwnedProviderRuntime.Opened opened,
@@ -786,6 +828,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             int produced, FetchProbe probe, BindingReadSelector selector, ColdTakeover cold) throws Exception {
         var cluster = probe.cluster();
         var topic = probe.topicId();
+        assertTrue(verified.generation().generation().coverage().exclusiveEnd() >= KafkaObjectCompactionRealScenario.SEALED_TRANSACTION_END,
+                "transaction control batches were left on the BK tail instead of the semantic Object output");
         owner.storage().verifySelectedObjectPrefix(selector.selectedViewSha256()).toCompletableFuture().get(30, TimeUnit.SECONDS);
         int reads = probe.held().originalPrefixReads.get();
         KafkaObjectCompactionRealScenario.verify(cluster, topic, 0, produced, client);
@@ -890,7 +934,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         NereusKafkaOwnedProviderRuntime.SelectedRecoveryMetadata.persistObjectScope(owner, provider, transfer, Duration.ofSeconds(10))
                 .toCompletableFuture().get(30, TimeUnit.SECONDS);
         probe.held().observeRetainedCheckpoint(transfer);
-        probe.held().reclaimReleasedSources(owner);
+        probe.held().verifyReleasedSources(owner, true);
         assertEquals(expected, KafkaBookKeeperOwnerRelocationRealTest.consume(client, produced));
         probe.held().beginColdRecoveryObservation();
         verifyColdSelector(selector, cold.relocate(), client, expected, probe.held());
