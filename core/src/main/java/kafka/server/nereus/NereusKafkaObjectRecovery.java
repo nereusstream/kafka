@@ -119,8 +119,8 @@ final class NereusKafkaObjectRecovery {
 
     static void persistNativeScope(Selected selected, OxiaKafkaBookKeeperM4ReadRouteV2 binding,
             CanonicalControlMetadataStore metadata, BindingReadSelector selector,
-            KafkaBookKeeperPartitionV1.ObjectBookKeeperSourceTransfer transfer, Runnable requireCurrent,
-            Duration timeout) throws Exception {
+            KafkaBookKeeperPartitionV1 storage, KafkaBookKeeperPartitionV1.ObjectBookKeeperSourceTransfer transfer,
+            Runnable requireCurrent, Duration timeout) throws Exception {
         var prefix = selected.prefix();
         var release = transfer.release();
         var checkpoint = transfer.durableCheckpoint().orElseThrow(
@@ -144,11 +144,13 @@ final class NereusKafkaObjectRecovery {
             throw new IllegalStateException("Kafka Object checkpoint does not belong to its retained BK suffix");
         }
         requireCurrent.run();
+        storage.nativeObjectRetainedInputSources(selector, scope);
         var bytes = scope.encode();
         metadata.putIfAbsent(scope.key(), bytes);
         if (!metadata.get(scope.key()).equals(Optional.of(bytes))) {
             throw new IllegalStateException("Kafka Object native scope publication lacks its exact stored bytes");
         }
+        storage.nativeObjectRetainedInputSources(selector, scope);
         requireCurrent.run();
     }
 

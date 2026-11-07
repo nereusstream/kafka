@@ -1765,7 +1765,8 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                     var selected = NereusKafkaObjectRecovery.recover(
                             opened.m4Route, opened.nativeScope.partition(), selector, provider, timeout).orElseThrow();
                     NereusKafkaObjectRecovery.persistNativeScope(selected, opened.m4Route,
-                            open(opened, selector, opened.session.capabilitySnapshot()), selector, transfer, requireCurrent, timeout);
+                            open(opened, selector, opened.session.capabilitySnapshot()), selector,
+                            opened.storage, transfer, requireCurrent, timeout);
                 } catch (Exception failure) {
                     throw new CompletionException(failure);
                 }

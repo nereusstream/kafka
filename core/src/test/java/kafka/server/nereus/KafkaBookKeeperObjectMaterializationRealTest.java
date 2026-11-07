@@ -647,6 +647,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             verifyColdSelector(selector, recovered, client, expected, heldFetch);
             var payloads = verified.generation().generation().payloadObjects();
             fixture.removeVersion().accept(payloads.get(payloads.size() - 1));
+            assertThrows(ExecutionException.class, () -> recovered.storage()
+                    .verifySelectedObjectPrefix(selector.selectedViewSha256()).toCompletableFuture().get(30, TimeUnit.SECONDS));
             var afterLoss = new java.util.ArrayList<>(expected);
             afterLoss.add("input-" + end);
             KafkaBookKeeperRootVerifierRealScenario.produce(client, afterLoss.get(end), end);
@@ -676,6 +678,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         var route = owner.nativeM5BindingRoute();
         var raw = owner.storage().nativeReadSources();
         var control = Executors.newSingleThreadExecutor();
+        owner.storage().verifySelectedObjectPrefix(selected.selectedViewSha256()).toCompletableFuture().get(30, TimeUnit.SECONDS);
         var hold = reads.arm();
         try (var wire = fetch(probe.cluster(), probe.topicId())) {
             hold.entered().get(30, TimeUnit.SECONDS);
