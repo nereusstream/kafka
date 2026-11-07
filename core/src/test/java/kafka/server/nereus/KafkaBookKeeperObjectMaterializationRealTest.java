@@ -108,13 +108,14 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final String TOPIC = "native-cold";
 
     @ParameterizedTest
-    @ValueSource(strings = {"known", "cold", "hot", "automatic", "retirement"})
+    @ValueSource(strings = {"known", "cold", "hot", "automatic", "retirement", "faults"})
     @Timeout(240)
     public void storesAndVerifiesTheRealNativeSealedPrefix(String outcome, @TempDir Path work) throws Exception {
         writeM6Capability(work);
         var nativeConfig = KafkaBookKeeperOwnerRelocationRealTest.nativeConfig(work,
                 System.getProperty("nereus.nsip.bkUri"), System.getProperty("nereus.nsip.oxia"));
-        withObjectFixture(work, nativeConfig, fixture -> runColdCluster(work, fixture, new PublicationFault(outcome)));
+        var fault = new PublicationFault(outcome);
+        withObjectFixture(work, nativeConfig, fault.readFaults, fixture -> runColdCluster(work, fixture, fault));
     }
 
     private static void runColdCluster(Path work, Fixture fixture, PublicationFault fault) throws Exception {
@@ -246,6 +247,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean recoverHot;
         private final boolean automatic;
         private final boolean retireFallback;
+        private final boolean readFaults;
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
         private final CompletableFuture<M5PendingOutputInventoryV2> pendingApplied = new CompletableFuture<>();
         private final CompletableFuture<Void> pendingReadDenied = new CompletableFuture<>();
@@ -257,6 +259,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             enabled = recoverHot || outcome.equals("cold");
             automatic = outcome.equals("automatic");
             retireFallback = outcome.equals("retirement");
+            readFaults = outcome.equals("faults");
         }
 
         private AsyncOxiaClient wrap(AsyncOxiaClient client) {
@@ -334,6 +337,75 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private record Hold(CompletableFuture<Void> entered, CompletableFuture<Void> release) { }
 
     private static final class HeldFetch {
+        private static void verifyFaultMatrix(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture,
+                NereusKafkaObjectMaterialization.Verified verified, FetchProbe probe, BindingReadSelector selector, int produced)
+                throws Exception {
+            var object = verified.generation().generation().payloadObjects().get(0);
+            var version = new String(object.immutableProviderVersionToken().orElseThrow().toByteArray(), StandardCharsets.UTF_8);
+            try (var relay = new KafkaObjectFaultRelay(fixture.bucket(), object.identity().key(), version)) {
+                assertFaultFetch(owner, relay, probe, selector, "unavailable", "UNAVAILABLE", produced);
+                assertFaultFetch(owner, relay, probe, selector, "corrupt", "CORRUPT_OR_FORMAT", produced);
+                assertFaultFetch(owner, relay, probe, selector, "denied", "NOT_ELIGIBLE", produced);
+                assertEquals(selector, owner.nativeM5BindingRoute().readSelector().orElseThrow());
+                cancelWireWithObjectResponseHeld(owner, probe, relay, selector);
+            }
+        }
+
+        private static void assertFaultFetch(NereusKafkaOwnedProviderRuntime.Opened owner, KafkaObjectFaultRelay relay,
+                FetchProbe probe, BindingReadSelector selector, String mode, String expected, int produced) throws Exception {
+            int before = probe.held().originalPrefixReads.get();
+            relay.arm(mode);
+            var failure = assertThrows(ExecutionException.class, () -> owner.storage().verifySelectedObjectPrefix(
+                    selector.selectedViewSha256()).toCompletableFuture().get(30, TimeUnit.SECONDS));
+            var qualified = assertInstanceOf(KafkaObjectMaterializedPrefixV1.ReadFailure.class, failure.getCause());
+            assertEquals(expected, qualified.failureClass().name());
+            assertEquals(before, probe.held().originalPrefixReads.get());
+            try (var wire = fetch(probe.cluster(), probe.topicId())) {
+                if (!expected.equals("NOT_ELIGIBLE")) {
+                    assertPinnedFetch(wire, probe.topicId(), produced);
+                    assertTrue(probe.held().originalPrefixReads.get() > before, "qualified Object failure did not use protected BK");
+                } else {
+                    var response = (FetchResponse) wire.receive(30_000);
+                    var data = response.responseData(Map.of(probe.topicId(), TOPIC), (short) 16).get(new TopicPartition(TOPIC, 0));
+                    assertEquals(Errors.KAFKA_STORAGE_ERROR, Errors.forCode(data.errorCode()));
+                    assertEquals(before, probe.held().originalPrefixReads.get(), "Object authorization failure used BK fallback");
+                }
+                relay.awaitRequest();
+            }
+        }
+
+        private static void cancelWireWithObjectResponseHeld(NereusKafkaOwnedProviderRuntime.Opened owner,
+                FetchProbe probe, KafkaObjectFaultRelay relay, BindingReadSelector selector) throws Exception {
+            var control = Executors.newSingleThreadExecutor();
+            try {
+                relay.arm("held");
+                try (var wire = fetch(probe.cluster(), probe.topicId())) {
+                    relay.awaitRequest();
+                } // The client disappears before the accepted Object SDK response can finish.
+                var retirement = owner.storage().beginNativeObjectFallbackRetirement(selector.selectedViewSha256());
+                owner.storage().closeNativeObjectFallbackAdmission(retirement, control).toCompletableFuture().get(30, TimeUnit.SECONDS);
+                var retiring = owner.storage().finishNativeObjectFallbackRetirement(retirement, control).toCompletableFuture();
+                try {
+                    assertFalse(retiring.isDone(), "a cancelled client released the accepted Object response's pin");
+                    var binding = owner.nativeM5BindingRoute();
+                    var closed = binding.readSelector().orElseThrow();
+                    var batch = closed.activeBatches().stream().filter(row ->
+                            row.sharedLastFallbackCapableReadAdmissionEpoch() == selector.readAdmissionEpoch()).findFirst().orElseThrow();
+                    for (var source : batch.sources()) {
+                        var fact = binding.readProtectionFact(source.sourceIdentitySha256(), source.protectionGeneration())
+                                .toCompletableFuture().get(30, TimeUnit.SECONDS).orElseThrow();
+                        assertEquals(ProtectionState.PROTECTED, M4ReadControlCodecV1.decodeProtection(fact.canonicalStoredBytes()).state());
+                    }
+                } finally {
+                    relay.release();
+                }
+                retiring.get(30, TimeUnit.SECONDS);
+            } finally {
+                control.shutdown();
+                assertTrue(control.awaitTermination(30, TimeUnit.SECONDS));
+            }
+        }
+
         private final AtomicReference<Hold> next = new AtomicReference<>();
         private final AtomicInteger originalPrefixReads = new AtomicInteger();
         private final AtomicReference<List<Long>> releasedLedgers = new AtomicReference<>(List.of());
@@ -452,7 +524,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     }
 
     private record Fixture(Map<String, Object> settings, NereusKafkaObjectProvider provider,
-            M5CellProviderProfileV2 profile, Runnable verifyNoOutputs, Consumer<GenerationObject> removeVersion) { }
+            M5CellProviderProfileV2 profile, String bucket, Runnable verifyNoOutputs, Consumer<GenerationObject> removeVersion) { }
 
     @FunctionalInterface
     private interface FixtureWork {
@@ -464,7 +536,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         NereusKafkaOwnedProviderRuntime.Opened relocate() throws Exception;
     }
 
-    private static void withObjectFixture(Path work, Map<String, Object> settings, FixtureWork action) throws Exception {
+    private static void withObjectFixture(Path work, Map<String, Object> settings, boolean readFaults,
+            FixtureWork action) throws Exception {
         var endpoint = URI.create(System.getProperty("nereus.nsip.s3Endpoint"));
         var configInput = new HashMap<>(settings);
         configInput.put("node.id", "0");
@@ -483,7 +556,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             var physical = com.nereusstream.storage.object.s3.S3M5PhysicalNamespaceAuthorityV2.provision(
                     minio, bucket, namespace.identity());
             var inputs = new HashMap<>(settings);
-            KafkaObjectProviderAdmissionRealTest.configureObject(inputs, work, endpoint, bucket);
+            KafkaObjectProviderAdmissionRealTest.configureObject(inputs, work,
+                    readFaults ? KafkaObjectFaultRelay.endpoint() : endpoint, bucket);
             configInput.putAll(inputs);
             var objectConfig = new KafkaConfig(configInput, false);
             var cell = NereusBookKeeperCapability.metadataPolicy(objectConfig).cellIdentity();
@@ -510,7 +584,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 Consumer<GenerationObject> removeVersion = object -> minio.deleteObject(request -> request.bucket(bucket)
                         .key(object.identity().key()).versionId(new String(object.immutableProviderVersionToken()
                                 .orElseThrow().toByteArray(), StandardCharsets.UTF_8)));
-                action.run(new Fixture(Map.copyOf(inputs), provider, profile, verifyNoOutputs, removeVersion));
+                action.run(new Fixture(Map.copyOf(inputs), provider, profile, bucket, verifyNoOutputs, removeVersion));
             }
         }
     }
@@ -639,6 +713,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                     provider, Duration.ofSeconds(10)).orElseThrow().prefix();
             assertEquals(selector.selectedViewSha256(), reopened.manifestSha256());
             assertEquals(verified.protections(), reopened.originalFallbackSources());
+            if (fault.readFaults) {
+                HeldFetch.verifyFaultMatrix(opened, fixture, verified, probe, selector, produced);
+                return;
+            }
             if (fault.retireFallback) {
                 retireWhileReadHeld(opened, probe, reads, produced, selector, provider, client, cold);
                 return;
