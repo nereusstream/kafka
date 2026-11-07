@@ -108,7 +108,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     private static final String TOPIC = "native-cold";
 
     @ParameterizedTest
-    @ValueSource(strings = {"known", "cold", "hot", "automatic", "retirement", "background-retirement", "faults", "semantic"})
+    @ValueSource(strings = {"known", "cold", "hot", "automatic", "stale-registration", "retirement", "background-retirement", "faults", "semantic"})
     @Timeout(240)
     public void storesAndVerifiesTheRealNativeSealedPrefix(String outcome, @TempDir Path work) throws Exception {
         writeM6Capability(work);
@@ -269,6 +269,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean enabled;
         private final boolean recoverHot;
         private final boolean automatic;
+        private final boolean staleRegistration;
         private final boolean retireFallback;
         private final boolean backgroundRetirement;
         private final boolean readFaults;
@@ -283,7 +284,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             recoverHot = outcome.equals("hot");
             enabled = recoverHot || outcome.equals("cold");
             backgroundRetirement = outcome.equals("background-retirement");
-            automatic = outcome.equals("automatic") || backgroundRetirement;
+            staleRegistration = outcome.equals("stale-registration");
+            automatic = outcome.equals("automatic") || backgroundRetirement || staleRegistration;
             retireFallback = outcome.equals("retirement");
             readFaults = outcome.equals("faults");
             semantic = outcome.equals("semantic");
@@ -328,6 +330,28 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 pendingApplied.complete(original);
                 return CompletableFuture.failedFuture(new TimeoutException("applied pending inventory response lost"));
             }).toCompletableFuture();
+        }
+
+        private void verifyScheduledInventory(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture,
+                M5PendingOutputInventoryV2 original, M5PendingOutputInventoryV2 selected) throws Exception {
+            if (!staleRegistration) {
+                assertEquals(original, selected, "the scheduler changed the original admitted worker or inventory");
+                return;
+            }
+            var old = original.worker().taskIdSha256();
+            var cell = fixture.profile().protocolCellSha256();
+            var coordinator = new M5MaterializationCoordinatorV1(owner.nativeM5BindingRoute().materializationMetadata(cell),
+                    0, original.worker().identity().binding());
+            assertFalse(old.equals(selected.worker().taskIdSha256()), "the stale worker was selected");
+            assertEquals(original.cancelUnstarted(), coordinator.readPendingOutputs(old).orElseThrow());
+            assertEquals(TaskState.CANCELLED_STALE, coordinator.readTask(old).orElseThrow().state());
+            fixture.verifyNoOriginalOutputs().accept(original);
+            var quota = fixture.provider().physicalQuota().quota();
+            var scope = quota.snapshot().toCompletableFuture().get(30, TimeUnit.SECONDS).head().scope();
+            for (var slot : original.outputs()) {
+                assertTrue(quota.readBirth(M5ObjectBirthCreditV3.key(scope, original.worker(), slot))
+                        .toCompletableFuture().get(30, TimeUnit.SECONDS).isEmpty());
+            }
         }
 
         private void verifyOriginalWork(NereusKafkaOwnedProviderRuntime.Opened owner, Fixture fixture,
@@ -565,7 +589,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     }
 
     private record Fixture(Map<String, Object> settings, NereusKafkaObjectProvider provider,
-            M5CellProviderProfileV2 profile, String bucket, Runnable verifyNoOutputs, Consumer<GenerationObject> removeVersion) { }
+            M5CellProviderProfileV2 profile, String bucket, Runnable verifyNoOutputs,
+            Consumer<M5PendingOutputInventoryV2> verifyNoOriginalOutputs, Consumer<GenerationObject> removeVersion) { }
 
     @FunctionalInterface
     private interface FixtureWork {
@@ -621,11 +646,16 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                             .prefix(profile.exclusiveNamespacePrefix() + "/m5/"));
                     assertTrue(objects.versions().isEmpty(), "an incomplete quota reservation wrote Object data");
                 };
+                Consumer<M5PendingOutputInventoryV2> verifyNoOriginalOutputs = original -> {
+                    var prefix = profile.exclusiveNamespacePrefix() + "/m5/materialization/" + original.worker().taskIdSha256().toHex() + "/";
+                    var versions = minio.listObjectVersions(list -> list.bucket(bucket).prefix(prefix));
+                    assertTrue(versions.versions().isEmpty(), "the cancelled original task reached the Object store");
+                };
                 // Inject one missing immutable version only in this test's exclusive MinIO bucket.
                 Consumer<GenerationObject> removeVersion = object -> minio.deleteObject(request -> request.bucket(bucket)
                         .key(object.identity().key()).versionId(new String(object.immutableProviderVersionToken()
                                 .orElseThrow().toByteArray(), StandardCharsets.UTF_8)));
-                action.run(new Fixture(Map.copyOf(inputs), provider, profile, bucket, verifyNoOutputs, removeVersion));
+                action.run(new Fixture(Map.copyOf(inputs), provider, profile, bucket, verifyNoOutputs, verifyNoOriginalOutputs, removeVersion));
             }
         }
     }
@@ -697,6 +727,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         try {
             fault.pendingReadDenied.get(30, TimeUnit.SECONDS);
             fixture.verifyNoOutputs().run();
+            if (fault.staleRegistration) produced = produceThroughRollover(owner, client, produced);
         } finally {
             fault.pendingBlocked = null;
         }
@@ -707,7 +738,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         var selector = owner.nativeM5BindingRoute().readSelector().orElseThrow();
         var selected = NereusKafkaObjectRecovery.recover(owner.nativeM5BindingRoute(), 0, selector, provider,
                 Duration.ofSeconds(10)).orElseThrow();
-        assertEquals(original, selected.inventory(), "the scheduler changed the original admitted worker or inventory");
+        fault.verifyScheduledInventory(owner, fixture, original, selected.inventory());
         var authority = owner.nativeM5BindingRoute().readBindingAuthority().toCompletableFuture()
                 .get(30, TimeUnit.SECONDS).orElseThrow();
         assertTrue(M5BindingAuthorityCodecV1.decodeAuthority(authority.canonicalStoredBytes()).trimMutationTickets().stream()
@@ -727,11 +758,13 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             long coveredEnd, Properties client, int produced, HeldFetch fetch, ColdTakeover takeover) throws Exception {
         var raw = owner.storage().nativeReadSources().sealedRoots().stream().filter(root -> root.kafkaStartOffset() < coveredEnd).toList();
         assertFalse(raw.isEmpty());
-        TestUtils.waitForCondition(() -> owner.nativeM5BindingRoute().readSelector().orElseThrow().mode() == SelectorMode.PREFERRED_ONLY
-                        && owner.storage().nativeReadSources().sealedRoots().stream().noneMatch(raw::contains),
+        TestUtils.waitForCondition(() -> owner.nativeM5BindingRoute().readSelector().orElseThrow().mode() == SelectorMode.PREFERRED_ONLY,
+                30_000, "background retirement did not close old fallback admission");
+        int afterRollover = produceThroughRollover(owner, client, produced);
+        TestUtils.waitForCondition(() -> owner.storage().nativeReadSources().sealedRoots().stream().noneMatch(raw::contains),
                 30_000, "background retirement did not transfer the drained raw prefix");
         long carrier = owner.storage().nativeReadSources().activeRoot().ledgerIdentity().ledgerId();
-        int end = produceThroughRollover(owner, client, produced);
+        int end = produceThroughRollover(owner, client, afterRollover);
         fetch.observeRetainedCheckpoint(carrier, raw.stream().map(root -> root.ledgerIdentity().ledgerId()).toList());
         TestUtils.waitForCondition(() -> fetch.scheduledDeletionSettled(owner),
                 45_000, "background retirement did not settle exact native BK deletion and quota");

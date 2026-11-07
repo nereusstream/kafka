@@ -23,6 +23,7 @@ import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Cap
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Disposition;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaSemanticCompactorV1;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.InputBatch;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMemberInventoryV2.Member;
 import com.nereusstream.storage.api.lifecycle.PhysicalResourceIdV2;
 import com.nereusstream.storage.object.control.CanonicalControlMetadataStore;
@@ -51,6 +52,7 @@ import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PublicationOutcome;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceExtent;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceKind;
+import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.TaskState;
 import com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1.SemanticValidationProof;
 import com.nereusstream.storage.object.materialization.M5MaterializationValidatorV1.ValidatedGeneration;
@@ -214,6 +216,44 @@ final class NereusKafkaObjectMaterialization {
         worker.requireCurrentPlan(plan);
         requireCurrent.run();
         return new Registered(prepared, worker, pending, metadata, key, partition);
+    }
+
+    /** Called only by the stopped live worker that never entered the output phase. */
+    static void cancelUnstarted(MaterializationPlan plan, M5CellProviderProfileV2 profile, int partition,
+            OxiaKafkaBookKeeperM4ReadRouteV2 route, Sha256Digest nativeWorker, Runnable requireCurrent) {
+        var cell = profile.protocolCellSha256();
+        var metadata = route.materializationMetadata(cell);
+        var task = plan.taskIdSha256();
+        var coordinator = new M5MaterializationCoordinatorV1(metadata, partition, plan.sourceCut().identity().binding());
+        requireCurrent.run();
+        var original = coordinator.readPendingOutputs(task).orElseThrow(
+                () -> new IllegalStateException("native Kafka cancellation lacks the original pending inventory"));
+        original.requirePlan(plan);
+        var state = coordinator.readTask(task).orElseThrow().state();
+        if (!original.profile().equals(profile) || !original.worker().nativeWorkerIdentitySha256().equals(nativeWorker)
+                || state != TaskState.PLANNED && state != TaskState.CANCELLED_STALE) {
+            throw new IllegalStateException("native Kafka cancellation differs from the original unstarted task");
+        }
+        route.reconcileMaterializationPendingOutput(cell, original).toCompletableFuture().join();
+        requireCurrent.run();
+        if (original.state() == M5PendingOutputInventoryV2.State.PREPARED) {
+            requireExactCancellation(coordinator.cancelUnstartedOutputs(plan, original));
+        }
+        route.reconcileMaterializationPendingOutput(cell, original.cancelUnstarted()).toCompletableFuture().join();
+        requireCurrent.run();
+        requireExactCancellation(coordinator.cancelUnstarted(plan));
+        requireCurrent.run();
+        var released = new M5MaterializationAdmissionV1(metadata, cell).release(task);
+        if (released != M5MaterializationAdmissionV1.Outcome.APPLIED_EXACT
+                && released != M5MaterializationAdmissionV1.Outcome.EXISTING_EXACT) {
+            throw new IllegalStateException("native Kafka unstarted output Cell release remains unresolved: " + released);
+        }
+    }
+
+    private static void requireExactCancellation(PublicationOutcome outcome) {
+        if (outcome != PublicationOutcome.APPLIED_EXACT && outcome != PublicationOutcome.EXISTING_EXACT) {
+            throw new IllegalStateException("native Kafka unstarted Object cancellation remains unresolved: " + outcome);
+        }
     }
 
     /** Writes only original inventoried candidates. Any unresolved result leaves the original birth and Cell charges. */

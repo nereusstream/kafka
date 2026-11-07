@@ -241,6 +241,8 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
         private NereusKafkaObjectMaterialization.Prepared prepared;
         private NereusKafkaObjectMaterialization.Registered registered;
         private NereusKafkaObjectMaterialization.Verified verified;
+        private boolean registrationStarted;
+        private boolean storeStarted;
         private boolean discarding;
 
         private Job(NereusKafkaNativeInputV2.Captured input) {
@@ -249,16 +251,27 @@ final class NereusKafkaAsyncObjectMaterializer implements AutoCloseable {
 
         private CompletionStage<Void> advance(NereusKafkaObjectProvider provider, Duration timeout) {
             if (discarding) return input.discard();
+            if (registrationStarted && !storeStarted && input.originalRawObjectSourceAdvanced()) {
+                return input.cancelUnstartedObjectMaterialization(prepared, provider).thenCompose(ignored -> discardInput());
+            }
             var preparation = prepared == null ? input.prepareObjectMaterialization(provider).thenAccept(value -> prepared = value)
                     : CompletableFuture.<Void>completedFuture(null);
-            return preparation.thenCompose(ignored -> registered == null
-                    ? input.registerObjectMaterialization(prepared, provider).thenAccept(value -> registered = value)
-                    : CompletableFuture.completedFuture(null))
-                    .thenCompose(ignored -> verified == null
-                            ? input.storeObjectMaterialization(registered, provider, timeout).thenAccept(value -> verified = value)
-                            : CompletableFuture.completedFuture(null))
+            return preparation.thenCompose(ignored -> register(provider))
+                    .thenCompose(ignored -> store(provider, timeout))
                     .thenCompose(ignored -> input.publishObjectMaterialization(verified, provider, provider.fetchExecutor(), timeout))
                     .thenCompose(ignored -> discardInput());
+        }
+
+        private CompletionStage<Void> register(NereusKafkaObjectProvider provider) {
+            if (registered != null) return CompletableFuture.completedFuture(null);
+            registrationStarted = true;
+            return input.registerObjectMaterialization(prepared, provider).thenAccept(value -> registered = value);
+        }
+
+        private CompletionStage<Void> store(NereusKafkaObjectProvider provider, Duration timeout) {
+            if (verified != null) return CompletableFuture.completedFuture(null);
+            storeStarted = true;
+            return input.storeObjectMaterialization(registered, provider, timeout).thenAccept(value -> verified = value);
         }
 
         private CompletionStage<Void> discardUnprepared(Throwable failure) {

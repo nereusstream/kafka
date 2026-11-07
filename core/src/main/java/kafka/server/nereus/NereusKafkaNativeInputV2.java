@@ -349,6 +349,7 @@ public final class NereusKafkaNativeInputV2 {
 
     private enum ObjectPhase {
         REGISTER,
+        CANCEL_UNSTARTED,
         VERIFY,
         PUBLISH
     }
@@ -366,6 +367,8 @@ public final class NereusKafkaNativeInputV2 {
         private boolean discarded;
         private boolean unresolved;
         private Sha256Digest objectTask;
+        private boolean objectOutputStarted;
+        private boolean objectCancellationStarted;
         private final EnumSet<ObjectPhase> unsettledObjectPhases = EnumSet.noneOf(ObjectPhase.class);
         private final EnumSet<ObjectPhase> activeObjectPhases = EnumSet.noneOf(ObjectPhase.class);
         private boolean releasing;
@@ -449,6 +452,16 @@ public final class NereusKafkaNativeInputV2 {
             return ownOutput(() -> {
                 synchronized (this) {
                     if (objectTask == null) objectTask = task;
+                    if (phase == ObjectPhase.CANCEL_UNSTARTED) {
+                        if (objectOutputStarted || !activeObjectPhases.isEmpty()) {
+                            throw new IllegalStateException("native Kafka Object cancellation lacks a stopped unstarted task");
+                        }
+                        objectCancellationStarted = true;
+                    } else if (objectCancellationStarted) {
+                        throw new IllegalStateException("native Kafka Object task is being cancelled");
+                    } else if (phase == ObjectPhase.VERIFY || phase == ObjectPhase.PUBLISH) {
+                        objectOutputStarted = true;
+                    }
                     if (!objectTask.equals(task) || !activeObjectPhases.add(phase)) {
                         throw new IllegalStateException("native Kafka Object phase does not own the original task");
                     }
@@ -465,7 +478,10 @@ public final class NereusKafkaNativeInputV2 {
 
         private synchronized void finishObjectPhase(ObjectPhase phase, boolean exact) {
             activeObjectPhases.remove(phase);
-            if (exact) unsettledObjectPhases.remove(phase);
+            if (exact) {
+                unsettledObjectPhases.remove(phase);
+                if (phase == ObjectPhase.CANCEL_UNSTARTED) unsettledObjectPhases.remove(ObjectPhase.REGISTER);
+            }
         }
 
         private <T> CompletionStage<T> own(java.util.function.Supplier<CompletionStage<T>> operation, boolean outputOwned) {
@@ -976,6 +992,34 @@ public final class NereusKafkaNativeInputV2 {
                         } catch (Exception failure) {
                             throw new CompletionException(failure);
                         }
+                    }, control)));
+        }
+
+        boolean originalRawObjectSourceAdvanced() {
+            if (!current.getAsBoolean()) return false;
+            var original = selector.get();
+            var now = m4.readSelector().orElseThrow();
+            return now.binding().equals(original.binding()) && now.ownerEpoch() == original.ownerEpoch()
+                    && now.capability().equals(original.capability()) && now.mode() == SelectorMode.PREFERRED_ONLY
+                    && now.admissionState() == AdmissionState.ADMITTING
+                    && now.sourceGeneration() > original.sourceGeneration()
+                    && now.selectedViewSha256().equals(opened.storage().nativeReadSources().selectedViewSha256());
+        }
+
+        CompletionStage<Void> cancelUnstartedObjectMaterialization(NereusKafkaObjectMaterialization.Prepared prepared,
+                NereusKafkaObjectProvider provider) {
+            var task = prepared.plan();
+            return opened.ownInputOperation(() -> reservation.ownObjectPhase(ObjectPhase.CANCEL_UNSTARTED,
+                    task.taskIdSha256(), () -> provider.requireCurrent().thenRunAsync(() -> {
+                        if (!task.sourceCut().predecessorSelector().equals(selector.get())) {
+                            throw new IllegalStateException("native Kafka Object cancellation changed its original cut");
+                        }
+                        NereusKafkaObjectMaterialization.cancelUnstarted(task, provider.profile(),
+                                nativeCut.sources().activeRoot().partitionId(), m4, nativeWorkerFence(), () -> {
+                                    if (!originalRawObjectSourceAdvanced()) {
+                                        throw new IllegalStateException("native Kafka Object cancellation lost its current raw Owner");
+                                    }
+                                });
                     }, control)));
         }
 
