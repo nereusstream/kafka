@@ -1125,6 +1125,7 @@ project(':core') {
         excludeTestsMatching 'kafka.server.nereus.KafkaAsyncObjectProcessRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaObjectProviderAdmissionRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaObjectWalAdapterRealTest'
+        excludeTestsMatching 'kafka.server.nereus.KafkaObjectWalAuthorizationRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaObjectWalProcessRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaBookKeeperObjectMaterializationRealTest'
         excludeTestsMatching 'kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest'
