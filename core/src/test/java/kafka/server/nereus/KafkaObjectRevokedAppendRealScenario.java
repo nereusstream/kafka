@@ -23,6 +23,7 @@ import com.nereusstream.kafka.bookkeeper.adapter.KafkaNativeAssignedRecordBatchV
 import com.nereusstream.kafka.bookkeeper.adapter.KafkaRawAssignedRecordBatchFactsV1;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeAppendV1;
 import com.nereusstream.kafka.bookkeeper.commit.KafkaCoherentCommitCoordinatorV1;
+import com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectAuthorizationV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionFenceV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionPublicationKindV1;
 import com.nereusstream.metadata.oxia.v2.objectwal.OxiaCanonicalControlMetadataStore;
