@@ -163,11 +163,13 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 topicId = admin.createTopics(List.of(topic)).topicId(TOPIC).get(30, TimeUnit.SECONDS);
             }
             var opened = first.get(30, TimeUnit.SECONDS);
-            int produced = seedSealedSources(cluster, opened, client, fault.semantic);
+            var erased = fault.semantic ? Optional.of(KafkaObjectCompactionRealScenario.seed(cluster, client))
+                    : Optional.<KafkaObjectCompactionRealScenario.ErasedBatch>empty();
+            int produced = seedSealedSources(opened, client, fault.semantic);
             assertAppendWhileFetchHeld(cluster, client, topicId, heldFetch, produced);
             produced++;
             ColdTakeover takeover = () -> relocate(cluster, client, cold);
-            var probe = new FetchProbe(cluster, topicId, heldFetch, fault);
+            var probe = new FetchProbe(cluster, topicId, heldFetch, fault, erased);
             if (fault.automatic) {
                 verifyAutomatic(opened, fixture, client, produced, probe, takeover);
             } else {
@@ -193,10 +195,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         }
     }
 
-    private static int seedSealedSources(KafkaClusterTestKit cluster, NereusKafkaOwnedProviderRuntime.Opened owner,
+    private static int seedSealedSources(NereusKafkaOwnedProviderRuntime.Opened owner,
             Properties client, boolean semantic) throws Exception {
-        int produced = semantic ? KafkaObjectCompactionRealScenario.seed(cluster, client) : 0;
         int required = semantic ? KafkaObjectCompactionRealScenario.SEALED_TRANSACTION_END : 0;
+        int produced = required;
         while ((sealedRuns(owner) < 2 || owner.storage().nativeReadSources().activeRoot().kafkaStartOffset() < required)
                 && produced < 32) {
             KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + produced, produced);
@@ -285,7 +287,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         assertEquals(0L, FetchResponse.recordsOrFail(data).batches().iterator().next().baseOffset());
     }
 
-    private record FetchProbe(KafkaClusterTestKit cluster, Uuid topicId, HeldFetch held, PublicationFault fault) { }
+    private record FetchProbe(KafkaClusterTestKit cluster, Uuid topicId, HeldFetch held, PublicationFault fault,
+                              Optional<KafkaObjectCompactionRealScenario.ErasedBatch> erased) { }
 
     private static final class PublicationFault {
         private final boolean enabled;
@@ -889,7 +892,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             var firstPayload = first.validated().generation().payloadObjects().get(0);
             assertEquals(PayloadKind.KAFKA_SEMANTIC_COMPACTED_V1, first.validated().generation().payloadKind());
             assertTrue(firstCoverage.exclusiveEnd() >= KafkaObjectCompactionRealScenario.SEALED_TRANSACTION_END);
-            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 0, produced, client);
+            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 0, produced, client, probe.erased().orElseThrow());
             int latest = produced;
             KafkaObjectCompactionRealScenario.appendReplacement(probe.cluster(), latest);
             int end = produceThroughRollover(owner, client, latest + 1);
@@ -909,12 +912,14 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             long compactedEnd = selected.prefix().coverage().exclusiveEnd();
             assertTrue(compactedEnd > latest && compactedEnd < end);
             assertTrue(selected.plan().sourceCut().sources().size() > 1);
-            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 0, end, client, latest, compactedEnd);
+            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 0, end, client,
+                    probe.erased().orElseThrow(), latest, compactedEnd);
             KafkaObjectCompactionRealScenario.verifyReplacement(probe.cluster(), probe.topicId(), 0, latest);
             var recovered = takeover.relocate();
             assertEquals(next.selectedViewSha256(), recovered.nativeM5BindingRoute().readSelector().orElseThrow().selectedViewSha256());
             recovered.storage().verifySelectedObjectPrefix(next.selectedViewSha256()).toCompletableFuture().get(30, TimeUnit.SECONDS);
-            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 1, end, client, latest, compactedEnd);
+            KafkaObjectCompactionRealScenario.verify(probe.cluster(), probe.topicId(), 1, end, client,
+                    probe.erased().orElseThrow(), latest, compactedEnd);
             KafkaObjectCompactionRealScenario.verifyReplacement(probe.cluster(), probe.topicId(), 1, latest);
         }
     }
@@ -1119,12 +1124,12 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 "transaction control batches were left on the BK tail instead of the semantic Object output");
         owner.storage().verifySelectedObjectPrefix(selector.selectedViewSha256()).toCompletableFuture().get(30, TimeUnit.SECONDS);
         int reads = probe.held().originalPrefixReads.get();
-        KafkaObjectCompactionRealScenario.verify(cluster, topic, 0, produced, client);
+        KafkaObjectCompactionRealScenario.verify(cluster, topic, 0, produced, client, probe.erased().orElseThrow());
         var recovered = cold.relocate();
         var after = recovered.nativeM5BindingRoute().readSelector().orElseThrow();
         assertTrue(after.ownerEpoch() > selector.ownerEpoch());
         assertEquals(selector.selectedViewSha256(), after.selectedViewSha256());
-        KafkaObjectCompactionRealScenario.verify(cluster, topic, 1, produced, client);
+        KafkaObjectCompactionRealScenario.verify(cluster, topic, 1, produced, client, probe.erased().orElseThrow());
         assertEquals(reads, probe.held().originalPrefixReads.get(), "compacted Fetch used the original raw BK prefix");
         fixture.removeVersion().accept(verified.generation().generation().payloadObjects().get(0));
         KafkaObjectCompactionRealScenario.verifyMissingFailsClosed(cluster, topic, 1);

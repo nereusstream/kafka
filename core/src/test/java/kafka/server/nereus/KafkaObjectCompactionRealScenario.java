@@ -67,16 +67,26 @@ final class KafkaObjectCompactionRealScenario {
 
     private KafkaObjectCompactionRealScenario() { }
 
-    static int seed(KafkaClusterTestKit cluster, Properties client) throws Exception {
+    record ErasedBatch(MemoryRecords original) {
+        void verifyReplay(KafkaClusterTestKit cluster, int broker) throws Exception {
+            append(cluster, broker, 5, original);
+        }
+    }
+
+    static ErasedBatch seed(KafkaClusterTestKit cluster, Properties client) throws Exception {
         long now = System.currentTimeMillis();
         IdempotentSample.seed(cluster, now);
         append(cluster, 3, row(now + 1, "replace", "new-three"), row(now + 1, "replace-2", "new-four"));
-        append(cluster, 5, row(now + 2, "gone", "old-five"));
+        var producer = IdempotentSample.initialize(cluster).data();
+        var erased = MemoryRecords.withIdempotentRecords(Compression.NONE, producer.producerId(),
+                producer.producerEpoch(), 0, row(now + 2, "gone", "old-five"));
+        append(cluster, 0, 5, erased);
         append(cluster, 6, row(now + 3, "gone", null));
-        return seedTransactions(client);
+        seedTransactions(client);
+        return new ErasedBatch(erased);
     }
 
-    private static int seedTransactions(Properties client) throws Exception {
+    private static void seedTransactions(Properties client) throws Exception {
         try (var admin = Admin.create(client)) {
             var transactionState = new NewTopic("__transaction_state", Map.of(0, List.of(0)))
                     .configs(Map.of("cleanup.policy", "compact"));
@@ -100,7 +110,6 @@ final class KafkaObjectCompactionRealScenario {
                     .get(30, TimeUnit.SECONDS).offset());
             producer.abortTransaction();
         }
-        return SEALED_TRANSACTION_END;
     }
 
     private static SimpleRecord row(long timestamp, String key, String value) {
@@ -145,12 +154,13 @@ final class KafkaObjectCompactionRealScenario {
         }
     }
 
-    static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client) throws Exception {
-        verify(cluster, topic, broker, end, client, -1, -1);
+    static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client, ErasedBatch erased)
+            throws Exception {
+        verify(cluster, topic, broker, end, client, erased, -1, -1);
     }
 
     static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client,
-            long replacement, long compactedEnd) throws Exception {
+            ErasedBatch erased, long replacement, long compactedEnd) throws Exception {
         // The provider can finish before the Controller acknowledges RECOVERED. The official Admin client
         // retries the broker's recovery response; the wire Fetches below then inspect the exact ready owner.
         try (var admin = Admin.create(client)) {
@@ -170,6 +180,8 @@ final class KafkaObjectCompactionRealScenario {
         assertEquals(List.of(1L), offsets, "the rewritten batch did not preserve its original sparse offsets");
         IdempotentSample.verifyReplay(cluster, broker, batch);
 
+        // The selected payload has no records at offset 5, but its acknowledged producer batch still exists logically.
+        erased.verifyReplay(cluster, broker);
         var gap = fetch(cluster, topic, broker, 5);
         assertEquals(Errors.NONE, Errors.forCode(gap.errorCode()));
         assertEquals(end, gap.highWatermark(), "retry of the original producer batch allocated another offset");
@@ -219,6 +231,11 @@ final class KafkaObjectCompactionRealScenario {
 
     private static final class IdempotentSample {
         private static void seed(KafkaClusterTestKit cluster, long timestamp) throws Exception {
+            var producer = initialize(cluster).data();
+            append(cluster, 0, 0, records(producer.producerId(), producer.producerEpoch(), timestamp));
+        }
+
+        private static InitProducerIdResponse initialize(KafkaClusterTestKit cluster) throws Exception {
             var request = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
                     .setTransactionalId(null).setTransactionTimeoutMs(30_000)).build((short) 4);
             var initialized = new AtomicReference<InitProducerIdResponse>();
@@ -231,9 +248,9 @@ final class KafkaObjectCompactionRealScenario {
                     return true;
                 }
             }, 30_000, "the native Producer ID allocator did not load its Controller block");
-            var producer = initialized.get().data();
-            assertEquals(Errors.NONE, Errors.forCode(producer.errorCode()));
-            append(cluster, 0, 0, records(producer.producerId(), producer.producerEpoch(), timestamp));
+            var result = initialized.get();
+            assertEquals(Errors.NONE, Errors.forCode(result.data().errorCode()));
+            return result;
         }
 
         private static void verifyReplay(KafkaClusterTestKit cluster, int broker, RecordBatch compacted) throws Exception {
