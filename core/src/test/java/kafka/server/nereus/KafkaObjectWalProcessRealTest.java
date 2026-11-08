@@ -20,7 +20,6 @@ package kafka.server.nereus;
 import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
 import kafka.server.nsip.KafkaBookKeeperProcessRealTest;
 import kafka.server.nsip.KafkaBookKeeperProcessRealTest.NativeNode;
-import kafka.server.nsip.NativeKafkaRequest;
 
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.ListOffsetsOptions;
@@ -34,17 +33,8 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
-import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.errors.RetriableException;
-import org.apache.kafka.common.message.InitProducerIdRequestData;
-import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.protocol.Errors;
-import org.apache.kafka.common.record.MemoryRecords;
-import org.apache.kafka.common.record.SimpleRecord;
-import org.apache.kafka.common.requests.InitProducerIdRequest;
-import org.apache.kafka.common.requests.InitProducerIdResponse;
-import org.apache.kafka.common.requests.ProduceRequest;
-import org.apache.kafka.common.requests.ProduceResponse;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.server.config.NereusKafkaConfigs;
 import org.apache.kafka.test.TestUtils;
@@ -63,7 +53,6 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.net.URI;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -146,8 +135,7 @@ public class KafkaObjectWalProcessRealTest {
                         fixture, control, topicId);
                 firstKafkaEpoch = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(
                         fixture, control, topicId, OBJECT.topic(), 0).kafkaLeaderEpoch();
-                var replay = idempotentAppend(ports[0]);
-                assertProduceOffset(ports[0], replay, 1);
+                var replay = KafkaObjectProtocolRealScenario.recoverLostProduceResponse(ports[0], admin);
                 producer.initTransactions();
                 producer.beginTransaction();
                 assertEquals(2, producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "committed"))
@@ -182,7 +170,7 @@ public class KafkaObjectWalProcessRealTest {
                     assertEquals(4, coldAdmin.listConsumerGroupOffsets(TXN_GROUP)
                             .partitionsToOffsetAndMetadata().get(30, TimeUnit.SECONDS).get(OBJECT).offset());
                     assertOffsets(coldAdmin, 5, 4);
-                    assertProduceOffset(ports[1], replay, 1);
+                    KafkaObjectProtocolRealScenario.assertProduceOffset(ports[1], replay, 1);
                     producer.abortTransaction();
                     awaitTransactionMarker(coldAdmin, 6);
                     assertOffsets(coldAdmin, 6, 6);
@@ -236,6 +224,10 @@ public class KafkaObjectWalProcessRealTest {
                 assertEquals(List.of("before-0", "before-1", "committed", "aborted", "after", "after-terminal"),
                         readUncommitted(client, OBJECT, 6));
                 KafkaObjectProtocolRealScenario.assertAckZero(ports[0], finalAdmin, boundary + 2);
+                KafkaObjectProtocolRealScenario.verifyNonIdempotentRetry(ports[0], finalAdmin, boundary + 2);
+                assertEquals(List.of("non-idempotent-retry", "non-idempotent-retry"),
+                        readFrom(client, OBJECT, boundary + 2, 2));
+                KafkaObjectFetchExitRealScenario.verify(ports[0], topicId, client, finalAdmin, boundary + 4);
             }
         }
     }
@@ -326,9 +318,14 @@ public class KafkaObjectWalProcessRealTest {
     }
 
     static void awaitInitialOwner(Admin admin) throws Exception {
+        awaitInitialOwner(admin, OBJECT);
+        assertOffsets(admin, 0, 0);
+    }
+
+    static void awaitInitialOwner(Admin admin, TopicPartition partition) throws Exception {
         TestUtils.waitForCondition(() -> {
             try {
-                long end = admin.listOffsets(Map.of(OBJECT, OffsetSpec.latest())).partitionResult(OBJECT)
+                long end = admin.listOffsets(Map.of(partition, OffsetSpec.latest())).partitionResult(partition)
                         .get(5, TimeUnit.SECONDS).offset();
                 assertEquals(0, end, "The newly opened Object WAL partition has unexpected data");
                 return true;
@@ -336,8 +333,7 @@ public class KafkaObjectWalProcessRealTest {
                 if (unavailable.getCause() instanceof RetriableException) return false;
                 throw unavailable;
             }
-        }, 30_000, "The native Broker did not activate the initial Object WAL Owner");
-        assertOffsets(admin, 0, 0);
+        }, 30_000, "The native Broker did not activate the initial Object WAL Owner for " + partition);
     }
 
     private static void awaitTransactionMarker(Admin admin, long end) throws Exception {
@@ -345,32 +341,6 @@ public class KafkaObjectWalProcessRealTest {
                         new ListOffsetsOptions(IsolationLevel.READ_COMMITTED))
                 .partitionResult(OBJECT).get(5, TimeUnit.SECONDS).offset() == end,
                 30_000, "The cold Broker did not publish the native transaction marker");
-    }
-
-    private static ProduceRequest idempotentAppend(int port) throws Exception {
-        var request = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
-                .setTransactionalId(null).setTransactionTimeoutMs(30000)).build((short) 4);
-        try (var wire = new NativeKafkaRequest(port, request)) {
-            var init = (InitProducerIdResponse) wire.receive(30_000);
-            assertEquals(Errors.NONE.code(), init.data().errorCode());
-            var records = MemoryRecords.withIdempotentRecords(Compression.NONE, init.data().producerId(),
-                    init.data().producerEpoch(), 0, new SimpleRecord("key".getBytes(StandardCharsets.UTF_8),
-                            "before-1".getBytes(StandardCharsets.UTF_8)));
-            var topics = new ProduceRequestData.TopicProduceDataCollection();
-            topics.add(new ProduceRequestData.TopicProduceData().setName(OBJECT.topic()).setPartitionData(
-                    List.of(new ProduceRequestData.PartitionProduceData().setIndex(OBJECT.partition()).setRecords(records))));
-            return new ProduceRequest(
-                    new ProduceRequestData().setAcks((short) -1).setTimeoutMs(10000).setTopicData(topics), (short) 9);
-        }
-    }
-
-    private static void assertProduceOffset(int port, ProduceRequest request, long offset) throws Exception {
-        try (var wire = new NativeKafkaRequest(port, request)) {
-            var response = (ProduceResponse) wire.receive(30_000);
-            var partition = response.data().responses().iterator().next().partitionResponses().get(0);
-            assertEquals(Errors.NONE.code(), partition.errorCode());
-            assertEquals(offset, partition.baseOffset());
-        }
     }
 
     private static Properties consumerProperties(Properties client) {
