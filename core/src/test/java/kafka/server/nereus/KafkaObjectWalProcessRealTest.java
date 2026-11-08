@@ -235,6 +235,7 @@ public class KafkaObjectWalProcessRealTest {
         assertEquals(List.of("non-idempotent-retry", "non-idempotent-retry"),
                 readFrom(client, OBJECT, boundary + 2, 2));
         KafkaObjectFetchExitRealScenario.verify(port, topicId, client, finalAdmin, boundary + 4);
+        KafkaObjectProtocolRealScenario.verifyCompressedWireBatches(port, topicId, boundary + 4);
     }
 
     static NewTopic topic(TopicPartition partition, String profile) {

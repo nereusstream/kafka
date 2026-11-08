@@ -46,6 +46,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
@@ -82,6 +83,7 @@ public final class NereusKafkaObjectWalPartition {
         }
     }
 
+    private final AtomicReference<KafkaObjectNativeFetchV1.Cursor> nextFetchCursor = new AtomicReference<>();
     private final KafkaCoherentCommitCoordinatorV1 coordinator;
     private volatile KafkaObjectNativeAppendV1 writer;
     private final Map<Sha256Digest, Source> sources;
@@ -167,12 +169,15 @@ public final class NereusKafkaObjectWalPartition {
             }
             begin();
         }
+        var cursor = nextFetchCursor.getAndSet(null);
         var result = new CompletableFuture<KafkaObjectNativeFetchV1.Result>();
         try {
             reads.execute(() -> {
                 try {
-                    result.complete(KafkaObjectNativeFetchV1.read(snapshot, this::pinExtent,
-                            offset, maximumBytes, hardMaximumBytes, minOneMessage, isolation));
+                    var fetched = KafkaObjectNativeFetchV1.readPositioned(snapshot, this::pinExtent,
+                            offset, maximumBytes, hardMaximumBytes, minOneMessage, isolation, cursor);
+                    fetched.nextCursor().ifPresent(nextFetchCursor::set);
+                    result.complete(fetched.result());
                 } catch (IOException failure) {
                     result.completeExceptionally(new KafkaStorageException("native Object WAL Fetch failed", failure));
                 } catch (RuntimeException | Error failure) {

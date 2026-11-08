@@ -134,6 +134,26 @@ final class KafkaObjectProtocolRealScenario {
                 10_000, "Object WAL did not publish durable end " + end);
     }
 
+    static void verifyCompressedWireBatches(int port, Uuid topic, long start) throws Exception {
+        appendCompressed(port, start, "first-0", "first-1");
+        appendCompressed(port, start + 2, "second-0", "second-1");
+        appendCompressed(port, start + 4, "third-0", "third-1");
+        KafkaBookKeeperAckRealTest.assertWireBatch(port, topic, start + 1, start, start + 6,
+                List.of("first-0", "first-1"));
+        KafkaBookKeeperAckRealTest.assertWireBatch(port, topic, start + 2, start + 2, start + 6,
+                List.of("second-0", "second-1"));
+        appendCompressed(port, start + 6, "fourth-0", "fourth-1");
+        KafkaBookKeeperAckRealTest.assertWireBatch(port, topic, start + 4, start + 4, start + 8,
+                List.of("third-0", "third-1"));
+        KafkaBookKeeperAckRealTest.assertWireBatch(port, topic, start + 6, start + 6, start + 8,
+                List.of("fourth-0", "fourth-1"));
+    }
+
+    private static void appendCompressed(int port, long offset, String first, String second) throws Exception {
+        var records = KafkaBookKeeperAckRealTest.compressed(first, second);
+        assertProduceOffset(port, produce((short) -1, records), offset);
+    }
+
     static void assertRecoveredEpochs(int port, int first, int second, int current, long end) throws Exception {
         KafkaBookKeeperEpochProbe.assertEndOffset(port, OBJECT, current, first, 5);
         KafkaBookKeeperEpochProbe.assertEndOffset(port, OBJECT, current, second, 8);

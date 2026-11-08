@@ -361,19 +361,20 @@ public class KafkaBookKeeperAckRealTest {
             assertWireAppend(cluster, 0, compressed("second-0", "second-1"), 2);
             assertWireAppend(cluster, 0, compressed("third-0", "third-1"), 4);
 
+            int port = cluster.brokers().get(0).socketServer().boundPort(cluster.nodes().brokerListenerName());
             // An interior offset and a one-byte budget still return the entire first batch.
-            assertWireBatch(cluster, topicId, 1, 0, 6, List.of("first-0", "first-1"));
-            assertWireBatch(cluster, topicId, 2, 2, 6, List.of("second-0", "second-1"));
+            assertWireBatch(port, topicId, 1, 0, 6, List.of("first-0", "first-1"));
+            assertWireBatch(port, topicId, 2, 2, 6, List.of("second-0", "second-1"));
             // Publishing a new root invalidates the position obtained for offset 4.
             assertWireAppend(cluster, 0, compressed("fourth-0", "fourth-1"), 6);
-            assertWireBatch(cluster, topicId, 4, 4, 8, List.of("third-0", "third-1"));
-            assertWireBatch(cluster, topicId, 6, 6, 8, List.of("fourth-0", "fourth-1"));
+            assertWireBatch(port, topicId, 4, 4, 8, List.of("third-0", "third-1"));
+            assertWireBatch(port, topicId, 6, 6, 8, List.of("fourth-0", "fourth-1"));
             cluster.fatalFaultHandler().maybeRethrowFirstException();
             cluster.nonFatalFaultHandler().maybeRethrowFirstException();
         }
     }
 
-    private static MemoryRecords compressed(String first, String second) {
+    static MemoryRecords compressed(String first, String second) {
         return MemoryRecords.withRecords(Compression.gzip().build(),
                 new SimpleRecord(first.getBytes(StandardCharsets.UTF_8)),
                 new SimpleRecord(second.getBytes(StandardCharsets.UTF_8)));
@@ -389,7 +390,7 @@ public class KafkaBookKeeperAckRealTest {
         }
     }
 
-    private static void assertWireBatch(KafkaClusterTestKit cluster, Uuid topicId, long requested, long base,
+    static void assertWireBatch(int port, Uuid topicId, long requested, long base,
             long highWatermark, List<String> values) throws Exception {
         var partition = new TopicPartition(TOPIC, 0);
         short version = 16;
@@ -397,7 +398,7 @@ public class KafkaBookKeeperAckRealTest {
                         Map.of(partition, new FetchRequest.PartitionData(topicId, requested,
                                 FetchRequest.INVALID_LOG_START_OFFSET, 1, Optional.empty())))
                 .setMaxBytes(1).isolationLevel(IsolationLevel.READ_UNCOMMITTED).build(version);
-        try (var wire = new NativeKafkaRequest(cluster, 0, fetch)) {
+        try (var wire = new NativeKafkaRequest(port, fetch)) {
             var response = (FetchResponse) wire.receive(30_000);
             var result = response.responseData(Map.of(topicId, TOPIC), version).get(partition);
             assertEquals(Errors.NONE, Errors.forCode(result.errorCode()));
@@ -478,7 +479,7 @@ public class KafkaBookKeeperAckRealTest {
                 new SimpleRecord(value.getBytes(StandardCharsets.UTF_8))));
     }
 
-    private static ProduceRequest produce(short acks, MemoryRecords raw) {
+    static ProduceRequest produce(short acks, MemoryRecords raw) {
         var topic = new ProduceRequestData.TopicProduceData()
                 .setName(TOPIC)
                 .setPartitionData(List.of(new ProduceRequestData.PartitionProduceData().setIndex(0).setRecords(raw)));
