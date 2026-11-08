@@ -80,6 +80,10 @@ public final class NereusKafkaObjectWalBroker implements AutoCloseable {
         });
     }
 
+    public CompletableFuture<Void> sealBeforeHandoff(NereusKafkaObjectWalPartition partition) {
+        return partition.sealBeforeHandoff(bookKeeper.recoveryExecutor());
+    }
+
     synchronized void fence() {
         fenced = true;
         var admitted = cell;

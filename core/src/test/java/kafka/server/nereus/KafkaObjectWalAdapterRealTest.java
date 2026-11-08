@@ -20,6 +20,7 @@ package kafka.server.nereus;
 import kafka.server.KafkaConfig;
 import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
 
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.SimpleRecord;
@@ -41,6 +42,8 @@ import com.nereusstream.kafka.bookkeeper.commit.KafkaCoherentCommitCoordinatorV1
 import com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaObjectAuthorizedRecoveryV1;
 import com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaObjectAuthorizedOwnerOpenV1;
 import com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaObjectRecoveredProtocolClosureV1;
+import com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaProtocolCheckpointHeadCodecV1;
+import com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaProtocolCheckpointHeadStateV1;
 import com.nereusstream.kafka.bookkeeper.object.nwkcp1.ObjectKafkaProtocolCheckpointStoreV1;
 import com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectAuthorizationV1;
 import com.nereusstream.kafka.bookkeeper.object.recovery.KafkaNativePartitionOwnerAuthorityV1;
@@ -55,6 +58,8 @@ import com.nereusstream.storage.object.control.WalRunControlCodec;
 import com.nereusstream.storage.object.control.WalRunControlKeys;
 import com.nereusstream.storage.object.control.WalRunLifecycleManager;
 import com.nereusstream.storage.object.control.WalRunObjectSession;
+import com.nereusstream.storage.object.control.WalRunReference;
+import com.nereusstream.storage.object.control.WalRunRootRecord;
 import com.nereusstream.storage.object.control.WalRunRuntime;
 import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
 import com.nereusstream.storage.object.provider.ObjectIdentity;
@@ -153,6 +158,39 @@ public class KafkaObjectWalAdapterRealTest {
 
     record Provisioned(Map<String, Object> settings, KafkaConfig config, M5CellProviderProfileV2 profile,
                        OxiaPhysicalMetadataNamespaceV2 namespace) { }
+
+    record NativeTerminal(OxiaCanonicalControlMetadataStore metadata, WalRunReference ref, WalRunRootRecord root,
+                          long writerEpoch) {
+        static NativeTerminal capture(Provisioned fixture, AsyncOxiaClient control, Uuid topicId,
+                String name, int brokerId) throws Exception {
+            var topic = new KafkaTopicIncarnationIdentity(new KafkaTopicId(
+                    new Id128(topicId.getMostSignificantBits(), topicId.getLeastSignificantBits())), new KafkaTopicName(name));
+            var binding = DeterministicTopicIdsV1.deriveBindingId(fixture.profile().protocolCell(), topic);
+            var epoch = DeterministicTopicIdsV1.deriveStorageEpochId(binding, 0);
+            var scope = new KafkaPartitionFenceV1(binding, topic, 0, 1, epoch, 1, 0);
+            var exact = new Oxia09ExactMetadataTransactionStoreV1(control);
+            var timeout = Duration.ofSeconds(10);
+            var shard = NereusKafkaObjectWalShard.reserve(exact, fixture.profile().protocolCellSha256(), scope, timeout);
+            var metadata = new OxiaCanonicalControlMetadataStore(control, shard.cellRoot(), shard.id());
+            var pointer = WalRunControlCodec.decodePointer(metadata.get(WalRunControlKeys.pointerKey(shard.id())).orElseThrow());
+            var ref = pointer.current();
+            var root = WalRunControlCodec.decodeRoot(metadata.get(ref.rootKey()).orElseThrow());
+            var owner = new NereusKafkaObjectWalOwners(shard, exact, timeout).creator(root);
+            assertEquals(brokerId, owner.brokerId());
+            return new NativeTerminal(metadata, ref, root, owner.ownerEpoch());
+        }
+
+        void requireSealedByOriginalWriter(S3Client minio, String bucket, long end) {
+            var key = WalRunControlKeys.kafkaProtocolCheckpointHeadKey(ref.shardId(), ref.shardRunEpoch());
+            var head = KafkaProtocolCheckpointHeadCodecV1.decode(KafkaObjectNativeAppendV1.checkpointPrefix(root),
+                    ref.rootSha256(), metadata.get(key).orElseThrow());
+            assertEquals(KafkaProtocolCheckpointHeadStateV1.TERMINAL, head.state());
+            assertEquals(writerEpoch, head.publisherEpoch());
+            assertEquals(List.of(end), head.coveredThroughVector().stream().map(row -> row.rangeIndexCoveredThrough()).toList());
+            assertEquals(head.checkpointObjectLength(),
+                    minio.headObject(request -> request.bucket(bucket).key(head.checkpointObjectKey())).contentLength());
+        }
+    }
 
     static Provisioned provision(Path work, S3Client client, AsyncOxiaClient control, URI endpoint,
             String bkUri, String oxia) throws Exception {

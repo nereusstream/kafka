@@ -39,6 +39,7 @@ final class NereusBrokerStorageRuntime(context: BrokerStorageRuntimeContext, pro
   private var replicaManager: ReplicaManager = _
   private var lifecycle: NereusTopicDeltaLifecycle = _
   private var closed = false
+  private var drain: CompletableFuture[Void] = _
   override def start(): CompletionStage[Void] = provider.start().thenRun(() => objectWal.start())
   override def unifiedLogFactory: UnifiedLogFactory = logs
   override def appendExecutor: Option[BrokerStorageAppendExecutor] = Some(append)
@@ -53,10 +54,19 @@ final class NereusBrokerStorageRuntime(context: BrokerStorageRuntimeContext, pro
     } else if (!(replicaManager eq manager)) throw new IllegalArgumentException("native BK runtime has another ReplicaManager")
     Some(lifecycle)
   }
-  override def beginDrain(reason: BrokerStorageDrainReason): CompletionStage[Void] = {
-    guard.synchronized { closed = true }
-    partitions.beginDrain(); objectWal.fence(); provider.fence(); append.close(); fetch.close()
-    provider.drainNativeSourceScans()
+  override def beginDrain(reason: BrokerStorageDrainReason): CompletionStage[Void] = guard.synchronized {
+    if (drain == null) {
+      closed = true
+      provider.fence(); append.close(); fetch.close()
+      val objectDrained = reason match {
+        case BrokerStorageDrainReason.BrokerShutdown | BrokerStorageDrainReason.OperatorRequest =>
+          partitions.sealObjectWalBeforeHandoff()
+        case _ => CompletableFuture.completedFuture[Void](null)
+      }
+      val retired = objectDrained.whenComplete { (_, _) => partitions.beginDrain(); objectWal.fence() }
+      drain = CompletableFuture.allOf(retired, provider.drainNativeSourceScans().toCompletableFuture)
+    }
+    drain.copy()
   }
   override def awaitDrained(timeout: Duration): CompletionStage[Void] =
     CompletableFuture.allOf(append.drained.toCompletableFuture, fetch.drained.toCompletableFuture).orTimeout(timeout.toMillis, TimeUnit.MILLISECONDS)

@@ -41,10 +41,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
@@ -78,20 +78,21 @@ public final class NereusKafkaObjectWalPartition {
     private final KafkaObjectNativeAppendV1 writer;
     private final Map<Sha256Digest, Source> sources;
     private final Executor reads;
-    private final BooleanSupplier current;
+    private final NativeAssignment assignment;
     private final LongSupplier clock;
     private final CompletableFuture<Void> drained = new CompletableFuture<>();
+    private CompletableFuture<Void> plannedSeal;
     private CompletableFuture<Void> closing;
     private boolean fenced;
     private int actualOperations;
 
     NereusKafkaObjectWalPartition(KafkaCoherentCommitCoordinatorV1 coordinator, KafkaObjectNativeAppendV1 writer,
-            Map<Sha256Digest, Source> sources, Executor reads, BooleanSupplier current, LongSupplier clock) {
+            Map<Sha256Digest, Source> sources, Executor reads, NativeAssignment assignment, LongSupplier clock) {
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.writer = Objects.requireNonNull(writer, "writer");
         this.sources = Map.copyOf(sources);
         this.reads = reads;
-        this.current = current;
+        this.assignment = assignment;
         this.clock = clock;
     }
 
@@ -180,7 +181,7 @@ public final class NereusKafkaObjectWalPartition {
     }
 
     private void requireCurrent() {
-        if (fenced || !current.getAsBoolean()) {
+        if (fenced || !assignment.current()) {
             throw new FencedLeaderEpochException("native Object WAL partition is fenced");
         }
     }
@@ -194,20 +195,35 @@ public final class NereusKafkaObjectWalPartition {
         if (done) drained.complete(null);
     }
 
-    CompletionStage<KafkaObjectNativeAppendV1.ClosedRun> sealDrained() {
-        fence();
-        return drained.thenApply(ignored -> writer.sealDrained());
+    synchronized CompletableFuture<Void> sealBeforeHandoff(Executor recoveryExecutor) {
+        if (plannedSeal == null) {
+            if (closing != null) {
+                return CompletableFuture.failedFuture(new FencedLeaderEpochException("Object WAL is already closing"));
+            }
+            fence();
+            plannedSeal = drained.thenRunAsync(() -> {
+                try {
+                    assignment.whileCurrent(writer::sealDrained);
+                } catch (Exception failure) {
+                    throw new CompletionException(failure);
+                }
+            }, recoveryExecutor);
+        }
+        return plannedSeal.copy();
     }
 
     public synchronized CompletableFuture<Void> closeAsync() {
         if (closing == null || closing.isCompletedExceptionally()) {
             fence();
-            closing = drained.thenRun(this::closeSources);
+            // A timed-out caller still leaves the actual seal attempt owning its Provider and KMS leases.
+            var sealFinished = plannedSeal == null ? drained : plannedSeal.handle((ignored, failure) -> null);
+            closing = sealFinished.thenRun(this::closeSources);
         }
         return closing.copy();
     }
 
     private void closeSources() {
+        writer.closeCheckpointAfterDrain();
         RuntimeException failure = null;
         for (var source : sources.values()) {
             try {

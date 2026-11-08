@@ -66,6 +66,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.OxiaClientBuilder;
 import software.amazon.awssdk.services.s3.S3Client;
 
@@ -90,13 +91,15 @@ public class KafkaObjectWalProcessRealTest {
                  var control = OxiaClientBuilder.create(oxia).asyncClient().get(30, TimeUnit.SECONDS)) {
             var fixture = KafkaObjectWalAdapterRealTest.provision(work, minio, control, KafkaObjectFaultRelay.endpoint(),
                     System.getProperty("nereus.nsip.bkUri"), oxia);
-            run(work, fixture.settings(), minio, KafkaObjectProviderAdmissionRealTest.newVersionedBucket(minio));
+            run(work, fixture, control, minio, KafkaObjectProviderAdmissionRealTest.newVersionedBucket(minio));
         } finally {
             KafkaBookKeeperProcessRealTest.copyProcessLogs(work);
         }
     }
 
-    private static void run(Path work, Map<String, Object> settings, S3Client minio, String foreignBucket) throws Exception {
+    private static void run(Path work, KafkaObjectWalAdapterRealTest.Provisioned fixture, AsyncOxiaClient control,
+            S3Client minio, String foreignBucket) throws Exception {
+        var settings = fixture.settings();
         int[] ports = KafkaBookKeeperProcessRealTest.allocatePorts();
         String voters = "2@127.0.0.1:" + ports[2];
         String cluster = Uuid.randomUuid().toString();
@@ -117,14 +120,16 @@ public class KafkaObjectWalProcessRealTest {
             var txnConsumerClient = consumerProperties(client);
             txnConsumerClient.put("group.id", TXN_GROUP);
             var after = KafkaBookKeeperProcessRealTest.client(ports[1]);
+            Uuid topicId;
             try (var admin = Admin.create(client);
                      var producer = new KafkaProducer<String, String>(producerClient);
                      var txnGroup = new KafkaConsumer<String, String>(txnConsumerClient)) {
                 KafkaBookKeeperProcessRealTest.waitForBroker(admin, 0);
                 KafkaBookKeeperProcessRealTest.assertRejectedTopic(admin,
                         new NewTopic("__share_group_state", Map.of(0, List.of(0))), Errors.INVALID_CONFIG);
-                admin.createTopics(List.of(topic(OBJECT, "OBJECT_WAL"), topic(BK, "BOOKKEEPER_WAL_ONLY")))
-                        .all().get(30, TimeUnit.SECONDS);
+                var created = admin.createTopics(List.of(topic(OBJECT, "OBJECT_WAL"), topic(BK, "BOOKKEEPER_WAL_ONLY")));
+                created.all().get(30, TimeUnit.SECONDS);
+                topicId = created.topicId(OBJECT.topic()).get(30, TimeUnit.SECONDS);
                 appendWithLostPut(client, admin, minio, (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG));
                 var replay = idempotentAppend(ports[0]);
                 assertProduceOffset(ports[0], replay, 1);
@@ -179,6 +184,19 @@ public class KafkaObjectWalProcessRealTest {
             }
             assertEquals(List.of("before-0", "before-1", "committed", "after"),
                     KafkaBookKeeperOwnerRelocationRealTest.consume(after, 4));
+            var terminal = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 1);
+            original.start();
+            try (var finalAdmin = Admin.create(client)) {
+                KafkaBookKeeperProcessRealTest.waitForBroker(finalAdmin, 0);
+                cold.stop();
+                terminal.requireSealedByOriginalWriter(minio, (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG), 8);
+                assertEquals(0, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(finalAdmin, 1));
+                assertEquals(List.of("before-0", "before-1", "committed", "after"),
+                        KafkaBookKeeperOwnerRelocationRealTest.consume(client, 4));
+                assertGroupOffset(client, TXN_GROUP, 8);
+                append(client, OBJECT, 8, "after-terminal");
+                assertOffsets(finalAdmin, 9, 9);
+            }
         }
     }
 

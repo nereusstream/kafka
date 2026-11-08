@@ -38,11 +38,12 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
   private val slots = mutable.HashMap.empty[TopicIdPartition, Slot]
   private val subscriptions = new ConcurrentHashMap[TopicIdPartition, CopyOnWriteArrayList[Runnable]]
   @volatile private var closed = false
+  private var draining = false
 
   def openLeader(partition: Partition, identity: TopicIdPartition, aggregate: TopicBindingAggregateRecord,
                  leaderEpoch: Int, brokerEpoch: Long, metadataOffset: Long): CompletableFuture[Void] = {
     val attempt = guard.synchronized {
-      if (closed) return CompletableFuture.failedFuture(new KafkaStorageException("Nereus lifecycle is draining"))
+      if (draining || closed) return CompletableFuture.failedFuture(new FencedLeaderEpochException("Nereus lifecycle is draining"))
       slots.get(identity).foreach { previous =>
         if (previous.live && previous.epoch == leaderEpoch && previous.brokerEpoch == brokerEpoch && (previous.partition eq partition)) {
           return previous.result.copy()
@@ -241,6 +242,13 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
       case None => slot.flatMap(_.opened).map(_.closeAsync()).getOrElse(CompletableFuture.completedFuture(null))
     })
   }
+  def sealObjectWalBeforeHandoff(): CompletableFuture[Void] = guard.synchronized {
+    draining = true
+    val seals = slots.valuesIterator.filter(slot => current(slot) && slot.result.isDone && !slot.result.isCompletedExceptionally)
+      .flatMap(_.objectOpened).map(objectWal.sealBeforeHandoff).toSeq
+    CompletableFuture.allOf(seals: _*)
+  }
+
   def beginDrain(): Unit = guard.synchronized {
     closed = true
     slots.values.foreach(revoke)

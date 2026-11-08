@@ -246,6 +246,8 @@
       <file name="KafkaObjectWalAdapterRealTest(\.java)?" regex="true">
         <allow class="software.amazon.awssdk.services.s3.S3Client" />
         <allow class="com.nereusstream.storage.object.control.CanonicalControlMetadataStore" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaProtocolCheckpointHeadCodecV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaProtocolCheckpointHeadStateV1" />
         <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeAppendV1" />
         <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeExtentV1" />
         <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeVerificationV1" />
@@ -260,6 +262,8 @@
         <allow class="com.nereusstream.storage.object.control.WalRunLifecycleManager" />
         <allow class="com.nereusstream.storage.object.control.WalRunObjectSession" />
         <allow class="com.nereusstream.storage.object.control.WalRunRuntime" />
+        <allow class="com.nereusstream.storage.object.control.WalRunReference" />
+        <allow class="com.nereusstream.storage.object.control.WalRunRootRecord" />
         <allow class="com.nereusstream.storage.object.materialization.M5CellProviderProfileV2" />
         <allow class="com.nereusstream.storage.object.provider.ObjectIdentity" />
         <allow class="com.nereusstream.storage.object.provider.ProviderObjectOutcome" />

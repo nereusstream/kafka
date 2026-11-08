@@ -356,7 +356,7 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
             var writer = KafkaObjectNativeAppendV1.open(fresh, metadata, authority, coordinator, tail, assignment::current);
             if (!assignment.current()) throw new FencedLeaderEpochException("Object WAL election changed before ready");
             return new NereusKafkaObjectWalPartition(coordinator, writer, sources, provider.fetchExecutor(),
-                    assignment::current, () -> context.time().milliseconds());
+                    assignment, () -> context.time().milliseconds());
         }
 
         private <T> T whileCurrentIo(Callable<T> callback) throws IOException {
