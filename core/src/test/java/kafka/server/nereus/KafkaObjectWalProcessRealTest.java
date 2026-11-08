@@ -48,6 +48,16 @@ import org.apache.kafka.common.requests.ProduceResponse;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.server.config.NereusKafkaConfigs;
 import org.apache.kafka.test.TestUtils;
+
+import com.nereusstream.domain.codec.DeterministicTopicIdsV1;
+import com.nereusstream.domain.identity.Id128;
+import com.nereusstream.domain.identity.KafkaTopicId;
+import com.nereusstream.domain.protocol.KafkaTopicIncarnationIdentity;
+import com.nereusstream.domain.protocol.KafkaTopicName;
+import com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectAuthorizationV1;
+import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionFenceV1;
+import com.nereusstream.metadata.oxia.v2.objectwal.OxiaCanonicalControlMetadataStore;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -72,10 +82,11 @@ import software.amazon.awssdk.services.s3.S3Client;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Runs the actual Kafka entry point and cold partition handoff over all four real storage services. */
 public class KafkaObjectWalProcessRealTest {
-    private static final TopicPartition OBJECT = new TopicPartition("native-cold", 0);
+    static final TopicPartition OBJECT = new TopicPartition("native-cold", 0);
     private static final TopicPartition BK = new TopicPartition("native-bk-contrast", 0);
     private static final TopicPartition OFFSETS = new TopicPartition("__consumer_offsets", 0);
     private static final TopicPartition TRANSACTIONS = new TopicPartition("__transaction_state", 0);
@@ -130,7 +141,8 @@ public class KafkaObjectWalProcessRealTest {
                 var created = admin.createTopics(List.of(topic(OBJECT, "OBJECT_WAL"), topic(BK, "BOOKKEEPER_WAL_ONLY")));
                 created.all().get(30, TimeUnit.SECONDS);
                 topicId = created.topicId(OBJECT.topic()).get(30, TimeUnit.SECONDS);
-                appendWithLostPut(client, admin, minio, (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG));
+                appendWithLostPut(client, admin, minio, (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG),
+                        fixture, control, topicId);
                 var replay = idempotentAppend(ports[0]);
                 assertProduceOffset(ports[0], replay, 1);
                 producer.initTransactions();
@@ -218,7 +230,7 @@ public class KafkaObjectWalProcessRealTest {
         }
     }
 
-    private static NewTopic topic(TopicPartition partition, String profile) {
+    static NewTopic topic(TopicPartition partition, String profile) {
         return new NewTopic(partition.topic(), Map.of(partition.partition(), List.of(0)))
                 .configs(Map.of("nereus.storage.profile", profile));
     }
@@ -230,7 +242,8 @@ public class KafkaObjectWalProcessRealTest {
         }
     }
 
-    private static void appendWithLostPut(Properties client, Admin admin, S3Client minio, String bucket) throws Exception {
+    private static void appendWithLostPut(Properties client, Admin admin, S3Client minio, String bucket,
+            KafkaObjectWalAdapterRealTest.Provisioned fixture, AsyncOxiaClient control, Uuid topicId) throws Exception {
         String prefix = KafkaObjectProviderAdmissionRealTest.PREFIX + "/object-wal/";
         TestUtils.waitForCondition(() -> {
             try {
@@ -247,10 +260,36 @@ public class KafkaObjectWalProcessRealTest {
             relay.arm("first-put-response-lost");
             var produce = producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "before-0"));
             var persistedVersion = relay.awaitAppliedPut();
+            var held = relay.originalPutTrace();
+            assertEquals(1, held.puts());
+            assertEquals(0, held.fullGets());
+            assertTrue(held.path().startsWith("/" + bucket + "/" + prefix));
+            String key = held.path().substring(bucket.length() + 2);
+            int shard = Integer.parseInt(key.substring(prefix.length()).split("/", 2)[0]);
+            var authority = authorization(new OxiaCanonicalControlMetadataStore(control,
+                    "/nereus-kafka-object-wal/" + fixture.profile().protocolCellSha256().toHex(), shard), shard);
+            var scope = scope(fixture, topicId);
+            var before = authority.read(scope).orElseThrow();
+            assertEquals(0, before.endOffset());
+            assertTrue(before.grants().isEmpty());
             append(client, BK, 0, "bk-control");
             assertFalse(produce.isDone(), "an Object WAL write acknowledged before it could prove the exact PUT");
             relay.losePutResponses();
             assertEquals(0, produce.get(30, TimeUnit.SECONDS).offset());
+            var published = authority.read(scope).orElseThrow();
+            assertEquals(1, published.endOffset());
+            assertEquals(before.fence(), published.fence());
+            assertEquals(1, published.grants().size());
+            assertEquals(key, published.grants().get(0).object().key());
+            assertEquals(0, published.grants().get(0).locator().startOffset());
+            assertEquals(1, published.grants().get(0).locator().endOffsetExclusive());
+            var reconciled = relay.originalPutTrace();
+            assertEquals(held.path(), reconciled.path());
+            assertEquals(persistedVersion, reconciled.version());
+            assertTrue(reconciled.lists() > held.lists() && reconciled.fullGets() > held.fullGets(),
+                    "The client ACK did not include actual provider reconciliation");
+            System.out.printf("Original Object ACK put=%d fullGet=%d list=%d committedGrants=%d%n",
+                    reconciled.puts(), reconciled.fullGets(), reconciled.lists(), published.grants().size());
             assertOffsets(admin, 1, 1);
             var versions = minio.listObjectVersions(request -> request.bucket(bucket).prefix(prefix)).versions();
             assertEquals(1, versions.size());
@@ -258,7 +297,20 @@ public class KafkaObjectWalProcessRealTest {
         }
     }
 
-    private static void assertOffsets(Admin admin, long end, long stable) throws Exception {
+    static KafkaObjectAuthorizationV1 authorization(OxiaCanonicalControlMetadataStore metadata, int shard) {
+        return new KafkaObjectAuthorizationV1(metadata, shard,
+                new KafkaObjectAuthorizationV1.Bounds(2048, 1024, 1024L * 64 * 1024 * 1024, 1024));
+    }
+
+    static KafkaPartitionFenceV1 scope(KafkaObjectWalAdapterRealTest.Provisioned fixture, Uuid topicId) {
+        var incarnation = new KafkaTopicIncarnationIdentity(new KafkaTopicId(new Id128(
+                topicId.getMostSignificantBits(), topicId.getLeastSignificantBits())), new KafkaTopicName(OBJECT.topic()));
+        var binding = DeterministicTopicIdsV1.deriveBindingId(fixture.profile().protocolCell(), incarnation);
+        return new KafkaPartitionFenceV1(binding, incarnation, OBJECT.partition(), 1,
+                DeterministicTopicIdsV1.deriveStorageEpochId(binding, 0), 1, 0);
+    }
+
+    static void assertOffsets(Admin admin, long end, long stable) throws Exception {
         assertEquals(0, admin.listOffsets(Map.of(OBJECT, OffsetSpec.earliest()))
                 .partitionResult(OBJECT).get(30, TimeUnit.SECONDS).offset());
         assertEquals(end, admin.listOffsets(Map.of(OBJECT, OffsetSpec.latest()))
@@ -311,7 +363,7 @@ public class KafkaObjectWalProcessRealTest {
         return configuration;
     }
 
-    private static List<String> readUncommitted(Properties client, TopicPartition partition, int count) {
+    static List<String> readUncommitted(Properties client, TopicPartition partition, int count) {
         return readFrom(client, partition, 0, count);
     }
 

@@ -1161,6 +1161,23 @@ project(':core') {
         systemProperty 'nereus.nsip.vaultTokenFile', providers.gradleProperty('v2M6VaultTokenFile').get()
       }
     }
+    tasks.register('nereusKafkaObjectWalAuthorizationRealTest', Test) {
+      group = 'verification'
+      description = 'Measures Object WAL authorization on the native Kafka Produce path.'
+      testClassesDirs = sourceSets.test.output.classesDirs
+      classpath = sourceSets.test.runtimeClasspath
+      useJUnitPlatform()
+      filter { includeTestsMatching 'kafka.server.nereus.KafkaObjectWalAuthorizationRealTest' }
+      dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain'
+      outputs.upToDateWhen { false }
+      doFirst {
+        systemProperty 'nereus.nsip.bkUri', providers.gradleProperty('v2M2BookKeeperMetadataServiceUri').get()
+        systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+        systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
+        systemProperty 'nereus.nsip.vaultEndpoint', providers.gradleProperty('v2M6VaultEndpoint').get()
+        systemProperty 'nereus.nsip.vaultTokenFile', providers.gradleProperty('v2M6VaultTokenFile').get()
+      }
+    }
     tasks.register('nereusKafkaObjectWalProcessRealTest', Test) {
       group = 'verification'
       description = 'Runs Kafka Object WAL with separate Controller and Broker processes.'

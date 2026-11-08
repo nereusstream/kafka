@@ -79,6 +79,15 @@ final class KafkaObjectFaultRelay implements AutoCloseable {
         return originalVersion.get();
     }
 
+    record PutTrace(String path, String version, int puts, int fullGets, int lists) { }
+
+    PutTrace originalPutTrace() throws Exception {
+        var state = Json.parseBytesAs(send(request().GET().build()), Map.class);
+        return new PutTrace((String) state.get("selectedPath"), (String) state.get("appliedVersion"),
+                ((Number) state.get("hits")).intValue(), ((Number) state.get("originalFullGets")).intValue(),
+                ((Number) state.get("originalLists")).intValue());
+    }
+
     void losePutResponses() throws Exception {
         send(request().method("PATCH", HttpRequest.BodyPublishers.noBody()).build());
     }
