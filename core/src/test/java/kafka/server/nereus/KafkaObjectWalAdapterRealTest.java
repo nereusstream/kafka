@@ -180,15 +180,20 @@ public class KafkaObjectWalAdapterRealTest {
             return new NativeTerminal(metadata, ref, root, owner.ownerEpoch());
         }
 
-        void requireSealedByOriginalWriter(S3Client minio, String bucket, long end) {
+        String checkpointPrefix() {
+            return KafkaObjectNativeAppendV1.checkpointPrefix(root);
+        }
+
+        String requireSealedByOriginalWriter(S3Client minio, String bucket, long end) {
             var key = WalRunControlKeys.kafkaProtocolCheckpointHeadKey(ref.shardId(), ref.shardRunEpoch());
-            var head = KafkaProtocolCheckpointHeadCodecV1.decode(KafkaObjectNativeAppendV1.checkpointPrefix(root),
+            var head = KafkaProtocolCheckpointHeadCodecV1.decode(checkpointPrefix(),
                     ref.rootSha256(), metadata.get(key).orElseThrow());
             assertEquals(KafkaProtocolCheckpointHeadStateV1.TERMINAL, head.state());
             assertEquals(writerEpoch, head.publisherEpoch());
             assertEquals(List.of(end), head.coveredThroughVector().stream().map(row -> row.rangeIndexCoveredThrough()).toList());
             assertEquals(head.checkpointObjectLength(),
                     minio.headObject(request -> request.bucket(bucket).key(head.checkpointObjectKey())).contentLength());
+            return head.checkpointObjectKey();
         }
     }
 

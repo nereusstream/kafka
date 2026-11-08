@@ -200,8 +200,15 @@ public class KafkaObjectWalProcessRealTest {
             original.start();
             try (var finalAdmin = Admin.create(client)) {
                 KafkaBookKeeperProcessRealTest.waitForBroker(finalAdmin, 0);
-                cold.stop();
-                terminal.requireSealedByOriginalWriter(minio, (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG), 8);
+                var bucket = (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
+                var lostCheckpoint = KafkaObjectRunRolloverRealScenario.stopWithLostCheckpoint(cold, bucket, terminal);
+                String checkpoint = terminal.requireSealedByOriginalWriter(minio, bucket, 8);
+                assertEquals("/" + bucket + "/" + checkpoint, lostCheckpoint.path());
+                var versions = minio.listObjectVersions(request -> request.bucket(bucket).prefix(checkpoint)).versions();
+                assertEquals(1, versions.size());
+                assertEquals(lostCheckpoint.version(), versions.get(0).versionId());
+                System.out.printf("Native terminal Kafka checkpoint recovered the original version after %d PUT attempt(s)%n",
+                        lostCheckpoint.puts());
                 assertEquals(0, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(finalAdmin, 1));
                 assertEquals(List.of("before-0", "before-1", "committed", "after"),
                         KafkaBookKeeperOwnerRelocationRealTest.consume(client, 4));
@@ -210,12 +217,8 @@ public class KafkaObjectWalProcessRealTest {
                 assertOffsets(finalAdmin, 9, 9);
                 var oldRun = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
                 long boundary = Math.addExact(8, oldRun.root().bounds().maxExtentCount());
-                try (var producer = new KafkaProducer<String, String>(client)) {
-                    for (long offset = 9; offset <= boundary; offset++) {
-                        assertEquals(offset, producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "run-" + offset))
-                                .get(30, TimeUnit.SECONDS).offset());
-                    }
-                }
+                KafkaObjectRunRolloverRealScenario.fillAndReadBeforeRollover(client, ports[0], boundary, fixture,
+                        control, topicId);
                 var rolled = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
                 assertEquals(oldRun.writerEpoch(), rolled.writerEpoch());
                 assertEquals(oldRun.ref().shardRunEpoch() + 1, rolled.ref().shardRunEpoch());

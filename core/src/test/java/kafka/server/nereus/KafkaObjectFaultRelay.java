@@ -68,6 +68,13 @@ final class KafkaObjectFaultRelay implements AutoCloseable {
         }, 30_000, "the exact Object version was not requested through the fault relay");
     }
 
+    void awaitAppliedRange() throws Exception {
+        TestUtils.waitForCondition(() -> {
+            var state = Json.parseBytesAs(send(request().GET().build()), Map.class);
+            return ((Number) state.get("upstreamReads")).intValue() > 0;
+        }, 30_000, "MinIO did not serve the original Range GET before its response was held");
+    }
+
     String awaitAppliedPut() throws Exception {
         var originalVersion = new AtomicReference<String>();
         TestUtils.waitForCondition(() -> {
