@@ -511,6 +511,10 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
     }
 
     public static void writeCapability(Path inputs, java.util.Optional<Path> m4Summary) throws Exception {
+        writeCapability(inputs, m4Summary, Boolean.getBoolean("nereus.nsip.m6ReadQualification"));
+    }
+
+    public static void writeCapability(Path inputs, java.util.Optional<Path> m4Summary, boolean m6) throws Exception {
         Path capability = inputs.resolve("capability.properties");
         Path password = inputs.resolve("password");
         Files.write(password, new byte[0]);
@@ -546,9 +550,10 @@ public class KafkaBookKeeperOwnerRelocationRealTest {
             byte[] bytes = Files.readAllBytes(summary);
             String digest = java.util.HexFormat.of().formatHex(
                     java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
-            Files.writeString(capability, "\nm4IsolatedAdmission.sourceRoot=" + Path.of(sourceRoot).toRealPath()
-                    + "\nm4IsolatedAdmission.runSummaryFile=" + summary
-                    + "\nm4IsolatedAdmission.runSummarySha256=" + digest + "\n",
+            String prefix = m6 ? "m6IsolatedAdmission." : "m4IsolatedAdmission.";
+            Files.writeString(capability, "\n" + prefix + "sourceRoot=" + Path.of(sourceRoot).toRealPath()
+                    + "\n" + prefix + "runSummaryFile=" + summary
+                    + "\n" + prefix + "runSummarySha256=" + digest + "\n",
                     java.nio.file.StandardOpenOption.APPEND);
         }
     }

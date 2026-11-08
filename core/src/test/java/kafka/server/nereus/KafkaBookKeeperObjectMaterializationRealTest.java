@@ -79,7 +79,6 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
@@ -689,13 +688,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
     }
 
     static void writeM6Capability(Path work) throws Exception {
-        var summary = Path.of(System.getProperty("nereus.nsip.m4RunSummary")).toRealPath();
-        var source = Path.of(System.getProperty("nereus.nsip.m4SourceRoot")).toRealPath();
-        KafkaBookKeeperOwnerRelocationRealTest.writeCapability(work, Optional.empty());
-        Files.writeString(work.resolve("capability.properties"), "\nm6IsolatedAdmission.sourceRoot=" + source
-                + "\nm6IsolatedAdmission.runSummaryFile=" + summary
-                + "\nm6IsolatedAdmission.runSummarySha256="
-                + NereusKafkaM4AdmissionV2.sha(Files.readAllBytes(summary)).toHex() + "\n", StandardOpenOption.APPEND);
+        var summary = Path.of(System.getProperty("nereus.nsip.m4RunSummary"));
+        KafkaBookKeeperOwnerRelocationRealTest.writeCapability(work, Optional.of(summary), true);
     }
 
     private static long sealedRuns(NereusKafkaOwnedProviderRuntime.Opened opened) {

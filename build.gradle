@@ -1286,6 +1286,7 @@ project(':core') {
         systemProperty 'nereus.nsip.m4SourceRoot', providers.gradleProperty('v2M5KafkaRunSourceRoot').get()
         systemProperty 'nereus.nsip.m4RunSummary', providers.gradleProperty('v2M5KafkaRunSummaryFile').get()
         systemProperty 'nereus.nsip.m5SealedGcProfile', providers.gradleProperty('v2M5KafkaSealedGcProfile').getOrElse('false')
+        systemProperty 'nereus.nsip.m6ReadQualification', providers.gradleProperty('v2M6KafkaReadQualification').getOrElse('false')
       }
     }
   }
