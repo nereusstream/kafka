@@ -30,6 +30,7 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.message.FetchResponseData;
 import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.CompressionType;
@@ -115,6 +116,106 @@ public class KafkaBookKeeperAckRealTest {
             cluster.fatalFaultHandler().maybeRethrowFirstException();
             cluster.nonFatalFaultHandler().maybeRethrowFirstException();
         }
+    }
+
+    @Test
+    @Timeout(180)
+    public void delayedNativeFetchWakesOnSharedCommitAndTransactionMarker(@TempDir Path inputs) throws Exception {
+        var observer = new HoldDurability();
+        try (var cluster = nativeCluster(inputs, observer, 1)) {
+            cluster.format();
+            cluster.startup();
+            cluster.waitForReadyBrokers();
+            var client = new Properties();
+            client.setProperty("bootstrap.servers", cluster.bootstrapServers());
+            var partition = new TopicPartition(TOPIC, 0);
+            Uuid topicId;
+            try (var admin = Admin.create(client)) {
+                topicId = admin.createTopics(List.of(new NewTopic(TOPIC, Map.of(0, List.of(0)))))
+                        .topicId(TOPIC).get(30, TimeUnit.SECONDS);
+            }
+            var storage = observer.storage.get(30, TimeUnit.SECONDS);
+            assertAckAfterPublication(client, observer, storage, "all", 0);
+            var cut = new Cut(1, new CompletableFuture<>(), new CompletableFuture<>());
+            observer.armed.set(cut);
+            try (var append = new NativeKafkaRequest(cluster, 0, produce((short) -1, "publish-wake"))) {
+                assertEquals(2, cut.durable().get(20, TimeUnit.SECONDS).acknowledgedBookies());
+                assertEquals(1, storage.capture().root().frontiers().highWatermark());
+                int controlCalls = observer.controlCalls.get();
+                try (var waiting = new NativeKafkaRequest(cluster, 0,
+                        delayedFetch(partition, topicId, 1, IsolationLevel.READ_UNCOMMITTED, 15_000))) {
+                    assertThrows(SocketTimeoutException.class, () -> waiting.receive(250),
+                            "Fetch exposed a quorum write before shared publication");
+                    assertEquals(controlCalls, observer.controlCalls.get(), "Pending Fetch polled Oxia");
+                    cut.release().complete(null);
+                    var response = (ProduceResponse) append.receive(10_000);
+                    var appended = response.data().responses().iterator().next().partitionResponses().get(0);
+                    assertEquals(Errors.NONE, Errors.forCode(appended.errorCode()));
+                    assertEquals(1, appended.baseOffset());
+                    var observed = ((FetchResponse) waiting.receive(5_000))
+                            .responseData(Map.of(topicId, TOPIC), (short) 16).get(partition);
+                    assertEquals(2, observed.highWatermark());
+                    assertFetchedValues(observed, List.of("publish-wake"));
+                    assertEquals(controlCalls, observer.controlCalls.get(), "Shared commit or Fetch performed control I/O");
+                }
+            } finally {
+                observer.armed.set(null);
+                cut.release().complete(null);
+            }
+
+            var transactional = new Properties();
+            transactional.putAll(client);
+            transactional.setProperty("key.serializer", StringSerializer.class.getName());
+            transactional.setProperty("value.serializer", StringSerializer.class.getName());
+            transactional.setProperty("transactional.id", "m6-delayed-fetch");
+            try (var producer = new KafkaProducer<String, String>(transactional)) {
+                producer.initTransactions();
+                producer.beginTransaction();
+                assertEquals(2, producer.send(new ProducerRecord<>(TOPIC, 0, "key", "marker-wake"))
+                        .get(30, TimeUnit.SECONDS).offset());
+                try (var uncommitted = new NativeKafkaRequest(cluster, 0,
+                            delayedFetch(partition, topicId, 2, IsolationLevel.READ_UNCOMMITTED, 0));
+                        var committed = new NativeKafkaRequest(cluster, 0,
+                            delayedFetch(partition, topicId, 2, IsolationLevel.READ_COMMITTED, 15_000))) {
+                    var visible = ((FetchResponse) uncommitted.receive(5_000))
+                            .responseData(Map.of(topicId, TOPIC), (short) 16).get(partition);
+                    assertEquals(3, visible.highWatermark());
+                    assertFetchedValues(visible, List.of("marker-wake"));
+                    assertThrows(SocketTimeoutException.class, () -> committed.receive(250),
+                            "Read-committed Fetch returned while the original transaction was open");
+                    producer.commitTransaction();
+                    var stable = ((FetchResponse) committed.receive(5_000))
+                            .responseData(Map.of(topicId, TOPIC), (short) 16).get(partition);
+                    assertEquals(4, stable.highWatermark());
+                    assertEquals(4, stable.lastStableOffset());
+                    assertFetchedValues(stable, List.of("marker-wake"));
+                }
+            }
+            cluster.fatalFaultHandler().maybeRethrowFirstException();
+            cluster.nonFatalFaultHandler().maybeRethrowFirstException();
+        }
+    }
+
+    private static FetchRequest delayedFetch(TopicPartition partition, Uuid topicId, long offset,
+            IsolationLevel isolation, int maxWait) {
+        short version = 16;
+        return FetchRequest.Builder.forConsumer(version, maxWait, 1,
+                        Map.of(partition, new FetchRequest.PartitionData(topicId, offset,
+                                FetchRequest.INVALID_LOG_START_OFFSET, 1024 * 1024, Optional.empty())))
+                .isolationLevel(isolation).build(version);
+    }
+
+    private static void assertFetchedValues(FetchResponseData.PartitionData observed,
+            List<String> expected) {
+        assertEquals(Errors.NONE, Errors.forCode(observed.errorCode()));
+        var actual = new ArrayList<String>();
+        for (var batch : FetchResponse.recordsOrFail(observed).batches()) {
+            batch.ensureValid();
+            if (!batch.isControlBatch()) {
+                batch.forEach(record -> actual.add(StandardCharsets.UTF_8.decode(record.value()).toString()));
+            }
+        }
+        assertEquals(expected, actual);
     }
 
     @Test

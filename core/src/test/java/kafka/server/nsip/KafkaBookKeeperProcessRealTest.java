@@ -51,6 +51,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -88,6 +89,7 @@ public class KafkaBookKeeperProcessRealTest {
         System.out.println("Native process logs: " + work);
         try (controller; secondController; thirdController; first; next) {
             controller.assertRejectsImplicitFormat(clusterId);
+            controller.assertRejectsLegacyFeatureFormat(clusterId);
             for (var voter : controllers.values()) voter.format(clusterId);
             first.format(clusterId);
             next.format(clusterId);
@@ -179,7 +181,8 @@ public class KafkaBookKeeperProcessRealTest {
             if (!Files.isDirectory(source)) continue;
             Path node = Files.createDirectory(destination.resolve(source.getFileName()));
             for (String name : List.of("server.log", "launcher.log", "controller.log", "format.log", "server.properties",
-                    "implicit-format.log", "disabled-restart.log", "disabled.properties", "shutdown-threads.log",
+                    "implicit-format.log", "legacy-feature-format.log", "disabled-restart.log", "disabled.properties",
+                    "shutdown-threads.log",
                     "foreign-scope.log", "foreign-scope.properties", "foreign-object.log", "foreign-object.properties",
                     "unauthorized-vault.log", "unauthorized-vault.properties")) {
                 var file = source.resolve(name);
@@ -311,6 +314,15 @@ public class KafkaBookKeeperProcessRealTest {
             assertExit(1, log, "kafka.tools.StorageTool", "format", "--config", config.toString(),
                     "--cluster-id", clusterId);
             assertTrue(Files.readString(directory.resolve(log)).contains("requires explicit nereus.storage.version=2"));
+        }
+
+        void assertRejectsLegacyFeatureFormat(String clusterId) throws Exception {
+            String log = "legacy-feature-format.log";
+            assertExit(1, log, "kafka.tools.StorageTool", "format", "--config", config.toString(),
+                    "--cluster-id", clusterId, "--feature", "nereus.storage.version=1");
+            assertTrue(Files.readString(directory.resolve(log)).contains(
+                    "nereus.storage.version only supports fresh V2 feature level 2; configured level was 1"));
+            assertFalse(Files.exists(directory.resolve("logs/meta.properties")));
         }
 
         void assertRejectsDisabledRestart() throws Exception {
