@@ -35,7 +35,7 @@ import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
-import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.errors.RetriableException;
 import org.apache.kafka.common.message.InitProducerIdRequestData;
 import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.protocol.Errors;
@@ -255,16 +255,7 @@ public class KafkaObjectWalProcessRealTest {
     private static void appendWithLostPut(Properties client, Admin admin, S3Client minio, String bucket,
             KafkaObjectWalAdapterRealTest.Provisioned fixture, AsyncOxiaClient control, Uuid topicId) throws Exception {
         String prefix = KafkaObjectProviderAdmissionRealTest.PREFIX + "/object-wal/";
-        TestUtils.waitForCondition(() -> {
-            try {
-                return admin.describeTopics(List.of(OBJECT.topic())).allTopicNames().get(5, TimeUnit.SECONDS)
-                        .get(OBJECT.topic()).partitions().get(0).leader() != null;
-            } catch (ExecutionException unavailable) {
-                if (unavailable.getCause() instanceof UnknownTopicOrPartitionException) return false;
-                throw unavailable;
-            }
-        }, 30_000, "The Controller did not publish the Object WAL topic");
-        assertOffsets(admin, 0, 0);
+        awaitInitialOwner(admin);
         var ackOne = new Properties();
         ackOne.putAll(client);
         ackOne.setProperty("acks", "1");
@@ -332,6 +323,21 @@ public class KafkaObjectWalProcessRealTest {
         assertEquals(stable, admin.listOffsets(Map.of(OBJECT, OffsetSpec.latest()),
                         new ListOffsetsOptions(IsolationLevel.READ_COMMITTED))
                 .partitionResult(OBJECT).get(30, TimeUnit.SECONDS).offset());
+    }
+
+    static void awaitInitialOwner(Admin admin) throws Exception {
+        TestUtils.waitForCondition(() -> {
+            try {
+                long end = admin.listOffsets(Map.of(OBJECT, OffsetSpec.latest())).partitionResult(OBJECT)
+                        .get(5, TimeUnit.SECONDS).offset();
+                assertEquals(0, end, "The newly opened Object WAL partition has unexpected data");
+                return true;
+            } catch (ExecutionException unavailable) {
+                if (unavailable.getCause() instanceof RetriableException) return false;
+                throw unavailable;
+            }
+        }, 30_000, "The native Broker did not activate the initial Object WAL Owner");
+        assertOffsets(admin, 0, 0);
     }
 
     private static void awaitTransactionMarker(Admin admin, long end) throws Exception {

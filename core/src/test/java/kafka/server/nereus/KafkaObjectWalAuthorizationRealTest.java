@@ -60,6 +60,7 @@ import static org.apache.kafka.test.TestUtils.waitForCondition;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.OBJECT;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.assertOffsets;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.authorization;
+import static kafka.server.nereus.KafkaObjectWalProcessRealTest.awaitInitialOwner;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.readUncommitted;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.scope;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.topic;
@@ -111,7 +112,7 @@ public class KafkaObjectWalAuthorizationRealTest {
                  var producer = new KafkaProducer<String, String>(client)) {
             var created = admin.createTopics(List.of(topic(OBJECT, "OBJECT_WAL")));
             Uuid topicId = created.topicId(OBJECT.topic()).get(30, TimeUnit.SECONDS);
-            assertOffsets(admin, 0, 0);
+            awaitInitialOwner(admin);
             var run = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
             var fence = scope(fixture, topicId);
             var authority = authorization(run.metadata(), run.ref().shardId());
