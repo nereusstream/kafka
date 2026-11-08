@@ -143,7 +143,15 @@ public final class NereusKafkaObjectWalPartition {
         }
         begin();
         try {
-            admitted.writer.append(admitted.reservation, batches, clock.getAsLong(), accept);
+            admitted.writer.append(admitted.reservation, batches, clock.getAsLong(), publish -> {
+                try {
+                    return assignment.whileCurrent(publish::get);
+                } catch (RuntimeException failure) {
+                    throw failure;
+                } catch (Exception failure) {
+                    throw new CompletionException(failure);
+                }
+            }, accept);
         } finally {
             finished();
         }

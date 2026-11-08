@@ -17,12 +17,19 @@
 
 package kafka.server.nereus;
 
+import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
 import kafka.server.nsip.KafkaBookKeeperProcessRealTest;
+import kafka.server.nsip.NativeKafkaRequest;
 
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.FetchResponse;
+import org.apache.kafka.common.requests.ProduceResponse;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
@@ -39,9 +46,12 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -67,6 +77,7 @@ import static kafka.server.nereus.KafkaObjectWalProcessRealTest.topic;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** Measures the real Oxia authorization operations on the native Object WAL Produce path. */
 public class KafkaObjectWalAuthorizationRealTest {
@@ -82,11 +93,13 @@ public class KafkaObjectWalAuthorizationRealTest {
             var cut = new AuthorizationCut();
             var bootstrap = BootstrapMetadata.fromVersion(MetadataVersion.latestTesting(), "nsip-object-auth")
                     .copyWithFeatureRecord("nereus.storage.version", (short) 2);
-            var nodes = new TestKitNodes.Builder(bootstrap).setNumBrokerNodes(1).setNumControllerNodes(1).build();
+            var nodes = new TestKitNodes.Builder(bootstrap).setNumBrokerNodes(2).setNumControllerNodes(1).build();
             var builder = new KafkaClusterTestKit.Builder(nodes)
                     .setControllerStorageRuntimeFactory(new NereusControllerStorageRuntimeFactory())
                     .setBrokerStorageRuntimeFactory(context -> new NereusBrokerStorageRuntime(
-                            context, new NereusKafkaOwnedProviderRuntime(context, cut)));
+                            context, context.config().brokerId() == 0
+                                    ? new NereusKafkaOwnedProviderRuntime(context, cut)
+                                    : new NereusKafkaOwnedProviderRuntime(context)));
             fixture.settings().forEach((key, value) -> {
                 if (!Set.of("node.id", "process.roles", "controller.quorum.voters", "log.dirs").contains(key)) {
                     builder.setConfigProp(key, value);
@@ -99,14 +112,15 @@ public class KafkaObjectWalAuthorizationRealTest {
                 cluster.waitForReadyBrokers();
                 var client = KafkaBookKeeperProcessRealTest.client(0);
                 client.setProperty("bootstrap.servers", cluster.bootstrapServers());
-                verifyAuthorizationCut(client, control, fixture, cut);
+                var topicId = verifyAuthorizationCut(client, control, fixture, cut);
+                verifyRevocationAfterExactAuthorization(cluster, client, control, fixture, topicId, cut);
                 cluster.fatalFaultHandler().maybeRethrowFirstException();
                 cluster.nonFatalFaultHandler().maybeRethrowFirstException();
             }
         }
     }
 
-    private static void verifyAuthorizationCut(Properties client, AsyncOxiaClient control,
+    private static Uuid verifyAuthorizationCut(Properties client, AsyncOxiaClient control,
             KafkaObjectWalAdapterRealTest.Provisioned fixture, AuthorizationCut cut) throws Exception {
         try (var admin = Admin.create(client);
                  var producer = new KafkaProducer<String, String>(client)) {
@@ -163,8 +177,57 @@ public class KafkaObjectWalAuthorizationRealTest {
                 cut.deliverReread.complete(null);
                 cut.deliverCheckpoint.complete(null);
             }
+            return topicId;
         }
     }
+
+    private static void verifyRevocationAfterExactAuthorization(KafkaClusterTestKit cluster, Properties client,
+            AsyncOxiaClient control, KafkaObjectWalAdapterRealTest.Provisioned fixture, Uuid topicId,
+            AuthorizationCut cut) throws Exception {
+        var run = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
+        var fence = scope(fixture, topicId);
+        var authority = authorization(run.metadata(), run.ref().shardId());
+        var held = cut.holdNextAuthorization();
+        var oldLog = cluster.brokers().get(0).replicaManager().localLog(OBJECT).get();
+        try (var admin = Admin.create(client);
+                var waiting = new NativeKafkaRequest(cluster, 0, KafkaBookKeeperAckRealTest.delayedFetch(
+                        OBJECT, topicId, 1, IsolationLevel.READ_UNCOMMITTED, 60_000));
+                var produce = new NativeKafkaRequest(cluster, 0,
+                        KafkaBookKeeperAckRealTest.produce((short) -1, "authorized-before-revocation"))) {
+            held.applied().get(30, TimeUnit.SECONDS);
+            var before = authority.read(fence).orElseThrow();
+            assertEquals(2, before.endOffset());
+            assertEquals(2, before.grants().size());
+            assertThrows(SocketTimeoutException.class, () -> produce.receive(250));
+            assertThrows(SocketTimeoutException.class, () -> waiting.receive(250));
+            admin.alterPartitionReassignments(Map.of(OBJECT, Optional.of(new NewPartitionReassignment(List.of(1)))))
+                    .all().get(30, TimeUnit.SECONDS);
+            waitForCondition(() -> {
+                var topic = cluster.brokers().get(0).metadataCache().getImage().topics().getTopic(topicId);
+                return topic != null && topic.partitions().get(OBJECT.partition()).leader == 1;
+            }, "Original Object WAL Broker did not observe the new assignment");
+            held.release().complete(null);
+
+            var response = (ProduceResponse) produce.receive(30_000);
+            var produceError = Errors.forCode(response.data().responses().iterator().next()
+                    .partitionResponses().get(0).errorCode());
+            assertTrue(produceError == Errors.FENCED_LEADER_EPOCH || produceError == Errors.NOT_LEADER_OR_FOLLOWER
+                    || produceError == Errors.KAFKA_STORAGE_ERROR, "Superseded Object WAL Produce returned " + produceError);
+            assertEquals(1, oldLog.logEndOffset());
+            var fetched = ((FetchResponse) waiting.receive(30_000))
+                    .responseData(Map.of(topicId, OBJECT.topic()), (short) 16).get(OBJECT);
+            var fetchError = Errors.forCode(fetched.errorCode());
+            assertTrue(fetchError == Errors.NOT_LEADER_OR_FOLLOWER || fetchError == Errors.FENCED_LEADER_EPOCH,
+                    "Superseded Object WAL waiter returned " + fetchError);
+            assertEquals(1, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 0));
+            assertEquals(List.of("authorized", "authorized-before-revocation"), readUncommitted(client, OBJECT, 2));
+            assertOffsets(admin, 2, 2);
+        } finally {
+            held.release().complete(null);
+        }
+    }
+
+    private record RevocationCut(CompletableFuture<Void> applied, CompletableFuture<Void> release) { }
 
     private record AuthorizationVersion(long version, CanonicalBytes body) { }
 
@@ -172,6 +235,7 @@ public class KafkaObjectWalAuthorizationRealTest {
 
     private static final class AuthorizationCut implements NereusKafkaOwnedProviderRuntime.NativeRunResponseObserver {
         private final AtomicReference<Keys> keys = new AtomicReference<>();
+        private final AtomicReference<RevocationCut> revoked = new AtomicReference<>();
         private final AtomicInteger casAttempts = new AtomicInteger();
         private final AtomicInteger readsBeforeCas = new AtomicInteger();
         private final AtomicInteger reconciliationReads = new AtomicInteger();
@@ -185,6 +249,12 @@ public class KafkaObjectWalAuthorizationRealTest {
 
         void arm(String exactKey, String checkpointPagePrefix) {
             assertTrue(keys.compareAndSet(null, new Keys(exactKey, checkpointPagePrefix)));
+        }
+
+        RevocationCut holdNextAuthorization() {
+            var cut = new RevocationCut(new CompletableFuture<>(), new CompletableFuture<>());
+            assertTrue(revoked.compareAndSet(null, cut));
+            return cut;
         }
 
         @Override
@@ -210,6 +280,15 @@ public class KafkaObjectWalAuthorizationRealTest {
         }
 
         private Object afterPut(Keys selected, String key, byte[] bytes, CompletionStage<?> response) {
+            if (selected.authorization().equals(key)) {
+                var cut = revoked.getAndSet(null);
+                if (cut != null) {
+                    return response.thenCompose(value -> {
+                        cut.applied().complete(null);
+                        return cut.release().thenApply(ignored -> value);
+                    }).toCompletableFuture();
+                }
+            }
             if (key.startsWith(selected.checkpointPagePrefix()) && checkpointAttempts.incrementAndGet() == 1) {
                 return response.thenCompose(value -> {
                     checkpointApplied.complete(key);
