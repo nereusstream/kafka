@@ -54,7 +54,6 @@ import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.kafka.bookkeeper.adapter.KafkaNativeAssignedRecordBatchV1;
 import com.nereusstream.kafka.bookkeeper.adapter.KafkaRawAssignedRecordBatchFactsV1;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1;
-import com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeAppendV1;
 import com.nereusstream.kafka.bookkeeper.commit.KafkaBatchDuplicateIdentityV1;
 import com.nereusstream.kafka.bookkeeper.commit.KafkaCommittedProducerStateV1;
 import com.nereusstream.kafka.bookkeeper.commit.KafkaLeaderEpochIndexV1;
@@ -95,7 +94,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private final NereusListOffsetsScanConfig timestampScan;
     private final NereusProducerStateManager producers;
     private final ThreadLocal<KafkaBookKeeperPartitionV1.AdmittedAppend> admission = new ThreadLocal<>();
-    private final ThreadLocal<KafkaObjectNativeAppendV1.Admission> objectAdmission = new ThreadLocal<>();
+    private final ThreadLocal<NereusKafkaObjectWalPartition.Admission> objectAdmission = new ThreadLocal<>();
     private KafkaBookKeeperPartitionV1 storage;
     private NereusKafkaObjectWalPartition objectStorage;
     // One disposable position per log. The reader checks it against a fresh snapshot on every use.

@@ -196,6 +196,24 @@ public class KafkaObjectWalProcessRealTest {
                 assertGroupOffset(client, TXN_GROUP, 8);
                 append(client, OBJECT, 8, "after-terminal");
                 assertOffsets(finalAdmin, 9, 9);
+                var oldRun = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
+                long boundary = Math.addExact(8, oldRun.root().bounds().maxExtentCount());
+                try (var producer = new KafkaProducer<String, String>(client)) {
+                    for (long offset = 9; offset <= boundary; offset++) {
+                        assertEquals(offset, producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "run-" + offset))
+                                .get(30, TimeUnit.SECONDS).offset());
+                    }
+                }
+                var rolled = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
+                assertEquals(oldRun.writerEpoch(), rolled.writerEpoch());
+                assertEquals(oldRun.ref().shardRunEpoch() + 1, rolled.ref().shardRunEpoch());
+                assertEquals(oldRun.ref(), rolled.root().predecessor().orElseThrow().root());
+                oldRun.requireSealedByOriginalWriter(minio, (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG), boundary);
+                assertOffsets(finalAdmin, boundary + 1, boundary + 1);
+                assertEquals(List.of("run-" + (boundary - 1), "run-" + boundary),
+                        readFrom(client, OBJECT, boundary - 1, 2));
+                assertEquals(List.of("before-0", "before-1", "committed", "aborted", "after", "after-terminal"),
+                        readUncommitted(client, OBJECT, 6));
             }
         }
     }
@@ -294,15 +312,22 @@ public class KafkaObjectWalProcessRealTest {
     }
 
     private static List<String> readUncommitted(Properties client, TopicPartition partition, int count) {
+        return readFrom(client, partition, 0, count);
+    }
+
+    private static List<String> readFrom(Properties client, TopicPartition partition, long offset, int count) {
         var configuration = consumerProperties(client);
         configuration.put("isolation.level", "read_uncommitted");
         try (var consumer = new KafkaConsumer<String, String>(configuration)) {
             consumer.assign(List.of(partition));
-            consumer.seekToBeginning(List.of(partition));
+            consumer.seek(partition, offset);
             var values = new ArrayList<String>();
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
             while (values.size() < count && System.nanoTime() < deadline) {
-                consumer.poll(Duration.ofMillis(200)).forEach(record -> values.add(record.value()));
+                for (var record : consumer.poll(Duration.ofMillis(200))) {
+                    values.add(record.value());
+                    if (values.size() == count) return values;
+                }
             }
             return values;
         }

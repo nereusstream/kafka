@@ -67,6 +67,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
 import io.oxia.client.api.AsyncOxiaClient;
@@ -81,29 +82,32 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
     private final NereusKafkaObjectProvider provider;
     private final NereusKafkaObjectWalKms kms;
     private final NereusKafkaObjectWalRoot roots;
+    private final Executor recoveryExecutor;
     private final Duration timeout;
     private final Set<NereusKafkaObjectWalPartition> owned = new HashSet<>();
     private boolean closed;
 
     NereusKafkaObjectWalCell(BrokerStorageRuntimeContext context, OxiaPhysicalMetadataNamespaceV2 namespace,
-            AsyncOxiaClient control, NereusKafkaObjectProvider provider, NereusKafkaObjectWalKms kms) {
+            AsyncOxiaClient control, NereusKafkaObjectProvider provider, NereusKafkaObjectWalKms kms,
+            Executor recoveryExecutor) {
         this.context = context;
         this.namespace = namespace;
         this.control = control;
         this.provider = provider;
         this.kms = kms;
+        this.recoveryExecutor = recoveryExecutor;
         this.roots = new NereusKafkaObjectWalRoot(context.config(), provider.profile());
         timeout = context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout();
     }
 
     static NereusKafkaObjectWalCell start(BrokerStorageRuntimeContext context,
-            OxiaPhysicalMetadataNamespaceV2 namespace, AsyncOxiaClient control) throws Exception {
+            OxiaPhysicalMetadataNamespaceV2 namespace, AsyncOxiaClient control, Executor recoveryExecutor) throws Exception {
         var cell = NereusBookKeeperCapability.metadataPolicy(context.config()).cellIdentity();
         var provider = NereusKafkaObjectProvider.open(context.config(), cell, namespace);
         NereusKafkaObjectWalKms kms = null;
         try {
             kms = NereusKafkaObjectWalKms.open(context.config(), provider.profile());
-            return new NereusKafkaObjectWalCell(context, namespace, control, provider, kms);
+            return new NereusKafkaObjectWalCell(context, namespace, control, provider, kms, recoveryExecutor);
         } catch (Exception | Error failure) {
             if (kms != null) {
                 try {
@@ -356,7 +360,28 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
             var writer = KafkaObjectNativeAppendV1.open(fresh, metadata, authority, coordinator, tail, assignment::current);
             if (!assignment.current()) throw new FencedLeaderEpochException("Object WAL election changed before ready");
             return new NereusKafkaObjectWalPartition(coordinator, writer, sources, provider.fetchExecutor(),
-                    assignment, () -> context.time().milliseconds());
+                    recoveryExecutor, assignment, () -> context.time().milliseconds(), this::rollover);
+        }
+
+        private NereusKafkaObjectWalPartition.RolledRun rollover(KafkaObjectNativeAppendV1 writer) throws Exception {
+            var predecessor = writer.sealForRollover();
+            var lifecycle = new WalRunLifecycleManager(metadata, terminalVerifier(), runs::terminalReader);
+            var selected = runs.advance(predecessor, lifecycle, context.time().milliseconds(), owner);
+            var fresh = selected.freshSession().orElseThrow(
+                    () -> new FencedLeaderEpochException("Object WAL rollover successor requires native recovery"));
+            try {
+                var source = NereusKafkaObjectWalPartition.Source.live(
+                        fresh, KafkaObjectNativeVerificationV1.context(fresh.rootRecord(), fence));
+                var successor = writer.openSuccessor(fresh);
+                return new NereusKafkaObjectWalPartition.RolledRun(successor, fresh.rootSha256(), source);
+            } catch (RuntimeException | Error failure) {
+                try {
+                    fresh.close();
+                } catch (RuntimeException cleanup) {
+                    failure.addSuppressed(cleanup);
+                }
+                throw failure;
+            }
         }
 
         private <T> T whileCurrentIo(Callable<T> callback) throws IOException {

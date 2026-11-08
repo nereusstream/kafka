@@ -43,6 +43,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.function.Consumer;
@@ -62,6 +63,13 @@ public final class NereusKafkaObjectWalPartition {
                 throws IOException;
     }
 
+    @FunctionalInterface
+    interface Rollover {
+        RolledRun advance(KafkaObjectNativeAppendV1 predecessor) throws Exception;
+    }
+
+    record RolledRun(KafkaObjectNativeAppendV1 writer, Sha256Digest root, Source source) { }
+
     record Source(ReadExtent read, Runnable close) {
         static Source live(WalRunObjectSession run, Nwg1VerificationContextV1 verification) {
             return new Source((locator, consume) -> KafkaObjectNativeExtentV1.read(run, verification, locator, consume),
@@ -75,25 +83,32 @@ public final class NereusKafkaObjectWalPartition {
     }
 
     private final KafkaCoherentCommitCoordinatorV1 coordinator;
-    private final KafkaObjectNativeAppendV1 writer;
+    private volatile KafkaObjectNativeAppendV1 writer;
     private final Map<Sha256Digest, Source> sources;
     private final Executor reads;
+    private final Executor recovery;
     private final NativeAssignment assignment;
     private final LongSupplier clock;
+    private final Rollover rollover;
     private final CompletableFuture<Void> drained = new CompletableFuture<>();
     private CompletableFuture<Void> plannedSeal;
     private CompletableFuture<Void> closing;
     private boolean fenced;
+    private boolean rolloverRequested;
+    private Throwable rolloverFailure;
     private int actualOperations;
 
     NereusKafkaObjectWalPartition(KafkaCoherentCommitCoordinatorV1 coordinator, KafkaObjectNativeAppendV1 writer,
-            Map<Sha256Digest, Source> sources, Executor reads, NativeAssignment assignment, LongSupplier clock) {
+            Map<Sha256Digest, Source> sources, Executor reads, Executor recovery, NativeAssignment assignment,
+            LongSupplier clock, Rollover rollover) {
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.writer = Objects.requireNonNull(writer, "writer");
-        this.sources = Map.copyOf(sources);
+        this.sources = new ConcurrentHashMap<>(sources);
         this.reads = reads;
+        this.recovery = recovery;
         this.assignment = assignment;
         this.clock = clock;
+        this.rollover = rollover;
     }
 
     public KafkaObjectCoherentProtocolSnapshotV1 capture() {
@@ -104,16 +119,31 @@ public final class NereusKafkaObjectWalPartition {
         return writer.maximumFrameBytes();
     }
 
-    public synchronized KafkaObjectNativeAppendV1.Admission admit(List<Integer> frameBounds) {
+    public synchronized Admission admit(List<Integer> frameBounds) {
         requireCurrent();
-        return writer.admit(frameBounds);
+        try {
+            if (rolloverRequested || writer.requiresRollover(clock.getAsLong())) {
+                rolloverRequested = true;
+                scheduleRollover();
+                throw new KafkaStorageException("native Object WAL is sealing the previous run");
+            }
+            var selected = writer;
+            var reservation = selected.admit(frameBounds);
+            actualOperations = Math.incrementExact(actualOperations);
+            return new Admission(this, selected, reservation);
+        } catch (IllegalStateException unavailable) {
+            throw new KafkaStorageException("native Object WAL append admission is unavailable", unavailable);
+        }
     }
 
-    public void append(KafkaObjectNativeAppendV1.Admission admitted, List<KafkaNativeAssignedRecordBatchV1> batches,
+    public void append(Admission admitted, List<KafkaNativeAssignedRecordBatchV1> batches,
             Consumer<KafkaObjectCoherentProtocolSnapshotV1> accept) {
+        if (admitted.owner != this || admitted.closed || admitted.writer != writer) {
+            throw new KafkaStorageException("Object WAL append reservation belongs to a different native run");
+        }
         begin();
         try {
-            writer.append(admitted, batches, clock.getAsLong(), accept);
+            admitted.writer.append(admitted.reservation, batches, clock.getAsLong(), accept);
         } finally {
             finished();
         }
@@ -122,7 +152,13 @@ public final class NereusKafkaObjectWalPartition {
     public CompletionStage<KafkaObjectNativeFetchV1.Result> read(
             KafkaObjectCoherentProtocolSnapshotV1 snapshot, long offset, int maximumBytes, int hardMaximumBytes,
             boolean minOneMessage, KafkaReadIsolationV1 isolation) {
-        begin();
+        synchronized (this) {
+            if (rolloverRequested) {
+                scheduleRollover();
+                throw new KafkaStorageException("native Object WAL is sealing the previous run");
+            }
+            begin();
+        }
         var result = new CompletableFuture<KafkaObjectNativeFetchV1.Result>();
         try {
             reads.execute(() -> {
@@ -181,6 +217,9 @@ public final class NereusKafkaObjectWalPartition {
     }
 
     private void requireCurrent() {
+        if (rolloverFailure != null) {
+            throw new KafkaStorageException("native Object WAL run rollover did not settle", rolloverFailure);
+        }
         if (fenced || !assignment.current()) {
             throw new FencedLeaderEpochException("native Object WAL partition is fenced");
         }
@@ -191,8 +230,73 @@ public final class NereusKafkaObjectWalPartition {
         synchronized (this) {
             actualOperations = Math.decrementExact(actualOperations);
             done = fenced && actualOperations == 0;
+            if (!done) scheduleRollover();
         }
         if (done) drained.complete(null);
+    }
+
+    /** The same private-operation count protects reservations, old Fetches and the actual rollover itself. */
+    private void scheduleRollover() {
+        if (!rolloverRequested || fenced || actualOperations != 0 || !assignment.current()) return;
+        actualOperations++;
+        var predecessor = writer;
+        try {
+            recovery.execute(() -> roll(predecessor));
+        } catch (RejectedExecutionException exhausted) {
+            actualOperations--;
+        }
+    }
+
+    private void roll(KafkaObjectNativeAppendV1 predecessor) {
+        try {
+            var next = assignment.whileCurrent(() -> rollover.advance(predecessor));
+            synchronized (this) {
+                if (sources.putIfAbsent(next.root(), next.source()) != null) {
+                    next.writer().closeCheckpointAfterDrain();
+                    next.source().close().run();
+                    throw new IllegalStateException("native Object WAL rollover reused a retained Root");
+                }
+                writer = next.writer();
+                if (fenced) writer.fence();
+                rolloverRequested = false;
+            }
+        } catch (Exception | Error failure) {
+            synchronized (this) {
+                rolloverFailure = failure;
+                fenced = true;
+                writer.fence();
+                rolloverRequested = false;
+            }
+            if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+            if (failure instanceof Error error) throw error;
+        } finally {
+            finished();
+        }
+    }
+
+    public static final class Admission implements AutoCloseable {
+        private final NereusKafkaObjectWalPartition owner;
+        private final KafkaObjectNativeAppendV1 writer;
+        private final KafkaObjectNativeAppendV1.Admission reservation;
+        private boolean closed;
+
+        private Admission(NereusKafkaObjectWalPartition owner, KafkaObjectNativeAppendV1 writer,
+                KafkaObjectNativeAppendV1.Admission reservation) {
+            this.owner = owner;
+            this.writer = writer;
+            this.reservation = reservation;
+        }
+
+        @Override
+        public void close() {
+            if (closed) return;
+            closed = true;
+            try {
+                reservation.close();
+            } finally {
+                owner.finished();
+            }
+        }
     }
 
     synchronized CompletableFuture<Void> sealBeforeHandoff(Executor recoveryExecutor) {
@@ -203,7 +307,7 @@ public final class NereusKafkaObjectWalPartition {
             fence();
             plannedSeal = drained.thenRunAsync(() -> {
                 try {
-                    assignment.whileCurrent(writer::sealDrained);
+                    assignment.whileCurrent(() -> writer.sealDrained());
                 } catch (Exception failure) {
                     throw new CompletionException(failure);
                 }

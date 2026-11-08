@@ -46,7 +46,8 @@ public final class NereusKafkaObjectWalBroker implements AutoCloseable {
         if (context.config().nereusKafkaStorageConfig().core().profile() != Profile.OBJECT_WAL_SYNC_OBJECT) return;
         if (fenced) throw new IllegalStateException("native Object WAL Broker is draining");
         try {
-            cell = NereusKafkaObjectWalCell.start(context, bookKeeper.physicalNamespace(), bookKeeper.controlClient());
+            cell = NereusKafkaObjectWalCell.start(context, bookKeeper.physicalNamespace(), bookKeeper.controlClient(),
+                    bookKeeper.recoveryExecutor());
         } catch (Exception failure) {
             throw new CompletionException(failure);
         }
