@@ -17,6 +17,7 @@
 
 package kafka.log.nereus
 
+import com.nereusstream.kafka.bookkeeper.protocol.{KafkaPartitionFrontiersV1, KafkaPartitionPublicationEventV1, KafkaPartitionPublicationKindV1}
 import kafka.cluster.Partition
 import kafka.server.nereus.{NereusKafkaObjectWalBroker, NereusKafkaObjectWalPartition, NereusKafkaOwnedProviderRuntime}
 import kafka.server.storage.BrokerStorageRuntimeContext
@@ -24,6 +25,7 @@ import org.apache.kafka.common.TopicIdPartition
 import org.apache.kafka.common.errors.{FencedLeaderEpochException, KafkaStorageException}
 import org.apache.kafka.common.metadata.TopicBindingAggregateRecord
 import org.apache.kafka.image.{MetadataDelta, MetadataImage}
+import org.apache.kafka.server.storage.log.FetchIsolation
 
 import java.time.Duration
 import java.util.concurrent.{Callable, CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
@@ -36,7 +38,7 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
   extends AutoCloseable {
   private val guard = new Object
   private val slots = mutable.HashMap.empty[TopicIdPartition, Slot]
-  private val subscriptions = new ConcurrentHashMap[TopicIdPartition, CopyOnWriteArrayList[Runnable]]
+  private val subscriptions = new ConcurrentHashMap[TopicIdPartition, CopyOnWriteArrayList[FetchSubscription]]
   @volatile private var closed = false
   private var draining = false
 
@@ -62,7 +64,7 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
       return attempt.result.copy()
     }
     provider.open(identity, aggregate, leaderEpoch, brokerEpoch, metadataOffset,
-      () => current(attempt), _ => signal(identity)).whenComplete { (opened, failure) =>
+      () => current(attempt), event => signalPublication(identity, event)).whenComplete { (opened, failure) =>
       var cleanup = false
       guard.synchronized {
         if (failure != null || !current(attempt)) {
@@ -118,7 +120,7 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
       }
     }
     objectWal.open(attempt.identity, aggregate, attempt.epoch, attempt.brokerEpoch, attempt.metadataOffset,
-      assignment, _ => signal(attempt.identity)).whenComplete { (opened, failure) =>
+      assignment, event => signalPublication(attempt.identity, event)).whenComplete { (opened, failure) =>
       var cleanup = false
       guard.synchronized {
         if (failure != null || !current(attempt)) {
@@ -280,15 +282,38 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
     slot.result.completeExceptionally(new FencedLeaderEpochException("Nereus native owner was revoked"))
     signal(slot.identity)
   }
-  def subscribe(identity: TopicIdPartition, wakeup: Runnable): AutoCloseable = guard.synchronized {
-    val listeners = subscriptions.computeIfAbsent(identity, _ => new CopyOnWriteArrayList[Runnable])
-    listeners.add(wakeup)
-    () => { listeners.remove(wakeup); () }
+  def subscribe(identity: TopicIdPartition, isolation: FetchIsolation, wakeup: Runnable): AutoCloseable = guard.synchronized {
+    val listener = new FetchSubscription(isolation, wakeup)
+    subscriptions.compute(identity, (_, existing) => {
+      val listeners = if (existing == null) new CopyOnWriteArrayList[FetchSubscription] else existing
+      listeners.add(listener)
+      listeners
+    })
+    () => {
+      subscriptions.computeIfPresent(identity, (_, listeners) => {
+        listeners.remove(listener)
+        if (listeners.isEmpty) null else listeners
+      })
+      ()
+    }
   }
   private def signal(identity: TopicIdPartition): Unit = {
     val listeners = subscriptions.get(identity)
-    if (listeners != null) listeners.forEach(_.run())
+    if (listeners != null) listeners.forEach(_.wakeup.run())
   }
+  private def signalPublication(identity: TopicIdPartition, event: KafkaPartitionPublicationEventV1): Unit = {
+    val listeners = subscriptions.get(identity)
+    if (listeners != null) {
+      val before = event.previous().frontiers()
+      val after = event.published().frontiers()
+      listeners.forEach(listener => {
+        if (NereusListOffsetsLifecycle.wakesFor(listener.isolation, event.kind(), before, after)) {
+          listener.wakeup.run()
+        }
+      })
+    }
+  }
+  private final class FetchSubscription(val isolation: FetchIsolation, val wakeup: Runnable)
   private final class Slot(val partition: Partition, val identity: TopicIdPartition, val epoch: Int,
                            val brokerEpoch: Long, val metadataOffset: Long, val objectWal: Boolean) {
     @volatile var live = true
@@ -298,5 +323,21 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
     var objectOpened: Option[NereusKafkaObjectWalPartition] = None
     var log: Option[NereusUnifiedLog] = None
     var lookup: Option[NereusListOffsetsBridge] = None
+  }
+}
+
+object NereusListOffsetsLifecycle {
+  private[kafka] def wakesFor(isolation: FetchIsolation, kind: KafkaPartitionPublicationKindV1,
+                             before: KafkaPartitionFrontiersV1, after: KafkaPartitionFrontiersV1): Boolean = {
+    if (before.trimStartOffset() != after.trimStartOffset()) return true
+    kind match {
+      case KafkaPartitionPublicationKindV1.COMMIT | KafkaPartitionPublicationKindV1.SPECULATIVE_ROLLBACK =>
+        isolation match {
+          case FetchIsolation.LOG_END => before.readableEndOffset() != after.readableEndOffset()
+          case FetchIsolation.HIGH_WATERMARK => before.highWatermark() != after.highWatermark()
+          case FetchIsolation.TXN_COMMITTED => before.lastStableOffset() != after.lastStableOffset()
+        }
+      case _ => true // A source or Owner transition invalidates a captured read plan at the same offsets.
+    }
   }
 }

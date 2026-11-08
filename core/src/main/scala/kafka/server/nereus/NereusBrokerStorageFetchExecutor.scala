@@ -79,7 +79,7 @@ final class NereusBrokerStorageFetchExecutor(config: NereusKafkaStorageConfig.Fe
     private var started = false
     def start(): Unit = {
       try {
-        infos.foreach { case (identity, _) => subscriptions += lifecycle.subscribe(identity, () => wakeup()) }
+        infos.foreach { case (identity, _) => subscriptions += lifecycle.subscribe(identity, params.isolation, () => wakeup()) }
         lock.synchronized {
           started = true
           timer = scheduler.schedule((() => deadline()): Runnable, Math.max(0L, params.maxWaitMs), TimeUnit.MILLISECONDS)

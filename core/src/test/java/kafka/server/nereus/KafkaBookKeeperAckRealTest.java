@@ -45,6 +45,7 @@ import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.config.NereusKafkaConfigs;
 import org.apache.kafka.test.TestUtils;
 
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1;
@@ -122,7 +123,7 @@ public class KafkaBookKeeperAckRealTest {
     @Timeout(180)
     public void delayedNativeFetchWakesOnSharedCommitAndTransactionMarker(@TempDir Path inputs) throws Exception {
         var observer = new HoldDurability();
-        try (var cluster = nativeCluster(inputs, observer, 1)) {
+        try (var cluster = nativeCluster(inputs, observer, 1, 1)) {
             cluster.format();
             cluster.startup();
             cluster.waitForReadyBrokers();
@@ -183,12 +184,16 @@ public class KafkaBookKeeperAckRealTest {
                     assertFetchedValues(visible, List.of("marker-wake"));
                     assertThrows(SocketTimeoutException.class, () -> committed.receive(250),
                             "Read-committed Fetch returned while the original transaction was open");
+                    assertEquals(3, producer.send(new ProducerRecord<>(TOPIC, 0, "key", "only-hw"))
+                            .get(30, TimeUnit.SECONDS).offset());
+                    assertThrows(SocketTimeoutException.class, () -> committed.receive(250),
+                            "Read-committed Fetch returned when only HW advanced");
                     producer.commitTransaction();
                     var stable = ((FetchResponse) committed.receive(5_000))
                             .responseData(Map.of(topicId, TOPIC), (short) 16).get(partition);
-                    assertEquals(4, stable.highWatermark());
-                    assertEquals(4, stable.lastStableOffset());
-                    assertFetchedValues(stable, List.of("marker-wake"));
+                    assertEquals(5, stable.highWatermark());
+                    assertEquals(5, stable.lastStableOffset());
+                    assertFetchedValues(stable, List.of("marker-wake", "only-hw"));
                 }
             }
             cluster.fatalFaultHandler().maybeRethrowFirstException();
@@ -415,6 +420,11 @@ public class KafkaBookKeeperAckRealTest {
     }
 
     private static KafkaClusterTestKit nativeCluster(Path inputs, HoldDurability observer, int brokers) throws Exception {
+        return nativeCluster(inputs, observer, brokers, NereusKafkaConfigs.FETCH_OPERATION_MAX_REREADS_DEFAULT);
+    }
+
+    private static KafkaClusterTestKit nativeCluster(Path inputs, HoldDurability observer, int brokers,
+            int fetchOperationMaxRereads) throws Exception {
         KafkaBookKeeperOwnerRelocationRealTest.writeCapability(inputs, Optional.empty());
         var bootstrap = BootstrapMetadata.fromVersion(MetadataVersion.latestTesting(), "nsip-ack")
                 .copyWithFeatureRecord("nereus.storage.version", (short) 2);
@@ -426,6 +436,7 @@ public class KafkaBookKeeperAckRealTest {
                 .setControllerStorageRuntimeFactory(new NereusControllerStorageRuntimeFactory());
         KafkaBookKeeperOwnerRelocationRealTest.nativeConfig(inputs, System.getProperty("nereus.nsip.bkUri"),
                 System.getProperty("nereus.nsip.oxia")).forEach(builder::setConfigProp);
+        builder.setConfigProp(NereusKafkaConfigs.FETCH_OPERATION_MAX_REREADS_CONFIG, fetchOperationMaxRereads);
         return builder.build();
     }
 

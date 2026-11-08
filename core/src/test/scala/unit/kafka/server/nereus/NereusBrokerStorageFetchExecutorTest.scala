@@ -17,6 +17,7 @@
 
 package kafka.server.nereus
 
+import com.nereusstream.kafka.bookkeeper.protocol.{KafkaPartitionFrontiersV1, KafkaPartitionPublicationKindV1}
 import kafka.log.nereus.NereusListOffsetsLifecycle
 import kafka.utils.TestUtils
 import org.apache.kafka.common.{TopicIdPartition, TopicPartition, Uuid}
@@ -40,6 +41,22 @@ import java.util.{Optional, OptionalLong}
 import scala.collection.Seq
 
 class NereusBrokerStorageFetchExecutorTest {
+  @Test
+  def testOpenTransactionPublicationOnlyWakesTheFrontierThatChanged(): Unit = {
+    val initial = new KafkaPartitionFrontiersV1(0, 6, 6, 6, 6, 2)
+    val appended = new KafkaPartitionFrontiersV1(0, 7, 7, 7, 7, 2)
+    val committed = new KafkaPartitionFrontiersV1(0, 8, 8, 8, 8, 8)
+    val trimmed = new KafkaPartitionFrontiersV1(1, 8, 8, 8, 8, 8)
+    val publish = KafkaPartitionPublicationKindV1.COMMIT
+    assertTrue(NereusListOffsetsLifecycle.wakesFor(FetchIsolation.LOG_END, publish, initial, appended))
+    assertTrue(NereusListOffsetsLifecycle.wakesFor(FetchIsolation.HIGH_WATERMARK, publish, initial, appended))
+    assertFalse(NereusListOffsetsLifecycle.wakesFor(FetchIsolation.TXN_COMMITTED, publish, initial, appended))
+    assertTrue(NereusListOffsetsLifecycle.wakesFor(FetchIsolation.TXN_COMMITTED, publish, appended, committed))
+    assertTrue(NereusListOffsetsLifecycle.wakesFor(FetchIsolation.TXN_COMMITTED, publish, committed, trimmed))
+    assertTrue(NereusListOffsetsLifecycle.wakesFor(FetchIsolation.TXN_COMMITTED,
+      KafkaPartitionPublicationKindV1.BOOKKEEPER_SOURCE_RETIREMENT, committed, committed))
+  }
+
   @Test
   def testEventRereadUsesStockWaveOnBoundedWorkerAndDrainsAfterClose(): Unit = {
     val scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -176,8 +193,8 @@ class NereusBrokerStorageFetchExecutorTest {
     val listener = new AtomicReference[Runnable]
     val listeners = new CopyOnWriteArrayList[Runnable]
     val subscriptionClosed = new AtomicBoolean
-    when(lifecycle.subscribe(any(classOf[TopicIdPartition]), any(classOf[Runnable]))).thenAnswer { invocation =>
-      val exactListener = invocation.getArgument(1, classOf[Runnable])
+    when(lifecycle.subscribe(any(classOf[TopicIdPartition]), any(classOf[FetchIsolation]), any(classOf[Runnable]))).thenAnswer { invocation =>
+      val exactListener = invocation.getArgument(2, classOf[Runnable])
       listener.set(exactListener); listeners.add(exactListener)
       (() => { listeners.remove(exactListener); subscriptionClosed.set(true); () }): AutoCloseable
     }
