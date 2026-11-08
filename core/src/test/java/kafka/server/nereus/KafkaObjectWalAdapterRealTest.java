@@ -22,7 +22,6 @@ import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
 
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
-import org.apache.kafka.common.errors.FencedLeaderEpochException;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.SimpleRecord;
 import org.apache.kafka.server.config.NereusKafkaConfigs;
@@ -49,7 +48,6 @@ import com.nereusstream.kafka.bookkeeper.object.nwkcp1.ObjectKafkaProtocolCheckp
 import com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectAuthorizationV1;
 import com.nereusstream.kafka.bookkeeper.object.recovery.KafkaNativePartitionOwnerAuthorityV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionFenceV1;
-import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionPublicationKindV1;
 import com.nereusstream.metadata.oxia.v2.objectwal.OxiaCanonicalControlMetadataStore;
 import com.nereusstream.metadata.oxia.v2.retention.Oxia09ExactMetadataTransactionStoreV1;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
@@ -84,12 +82,10 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -146,14 +142,7 @@ public class KafkaObjectWalAdapterRealTest {
                         Duration.ofSeconds(10));
                 verifyWrite(runs, metadata, authority, fence);
                 var otherFence = new KafkaPartitionFenceV1(binding, topic, 1, 1, epoch, 1, 0);
-                var otherShard = NereusKafkaObjectWalShard.reserve(exact, profile.protocolCellSha256(), otherFence,
-                        Duration.ofSeconds(10));
-                var otherMetadata = new OxiaCanonicalControlMetadataStore(control, otherShard.cellRoot(), otherShard.id());
-                var otherRuns = new NereusKafkaObjectWalRuns(otherShard, otherMetadata, exact, provider, kms, roots,
-                        Duration.ofSeconds(10));
-                var otherAuthority = new KafkaObjectAuthorizationV1(otherMetadata, otherShard.id(),
-                        new KafkaObjectAuthorizationV1.Bounds(64, 16, 16L << 20, 32));
-                verifyRevokedPublication(otherRuns, otherMetadata, otherAuthority, otherFence);
+                KafkaObjectRevokedAppendRealScenario.verify(otherFence, fixture, control, exact, provider, kms);
                 provider.beginDrain();
             }
             try (var provider = NereusKafkaObjectProvider.open(config, cell, namespace);
@@ -297,57 +286,6 @@ public class KafkaObjectWalAdapterRealTest {
         assertTrue(discovered.freshSession().isEmpty());
     }
 
-    private static void verifyRevokedPublication(NereusKafkaObjectWalRuns runs,
-            OxiaCanonicalControlMetadataStore metadata, KafkaObjectAuthorizationV1 authority,
-            KafkaPartitionFenceV1 fence) throws Exception {
-        var nativeOwner = election(fence);
-        runs.admitNativeOwner(nativeOwner);
-        var selected = runs.selectOrCreateGenesis(System.currentTimeMillis(), false, nativeOwner);
-        try (var session = selected.freshSession().orElseThrow()) {
-            var events = new ArrayList<KafkaPartitionPublicationKindV1>();
-            var coordinator = KafkaCoherentCommitCoordinatorV1.bootstrapObject(fence, 0,
-                    event -> events.add(event.kind()));
-            authority.open(fence, 0, Optional.empty());
-            var current = new AtomicBoolean(true);
-            var writer = KafkaObjectNativeAppendV1.open(session, metadata, authority, coordinator,
-                    Optional.empty(), current::get);
-            var assignment = new NereusKafkaObjectWalPartition.NativeAssignment() {
-                @Override
-                public boolean current() {
-                    return current.get();
-                }
-
-                @Override
-                public <T> T whileCurrent(Callable<T> action) {
-                    assertEquals(1, authority.read(fence).orElseThrow().endOffset());
-                    assertTrue(current.compareAndSet(true, false));
-                    throw new FencedLeaderEpochException("assignment revoked before local publication");
-                }
-            };
-            var partition = new NereusKafkaObjectWalPartition(coordinator, writer, Map.of(),
-                    Runnable::run, Runnable::run, assignment, System::currentTimeMillis, ignored -> {
-                        throw new AssertionError("single append did not roll its run");
-                    });
-            try {
-                var canonical = nativeBytes();
-                var assigned = KafkaNativeAssignedRecordBatchV1.validate(KafkaRawAssignedRecordBatchFactsV1.parse(canonical));
-                try (var reservation = partition.admit(List.of(canonical.length()))) {
-                    assertThrows(FencedLeaderEpochException.class, () -> partition.append(
-                            reservation, List.of(assigned), snapshot -> {
-                                throw new AssertionError("revoked assignment acknowledged a durable grant");
-                            }));
-                }
-                var frontiers = partition.capture().root().frontiers();
-                assertEquals(0, frontiers.durableEndOffset());
-                assertEquals(0, frontiers.readableEndOffset());
-                assertFalse(events.contains(KafkaPartitionPublicationKindV1.COMMIT));
-                assertEquals(1, authority.read(fence).orElseThrow().grants().size());
-            } finally {
-                partition.closeAsync().get(10, TimeUnit.SECONDS);
-            }
-        }
-    }
-
     private static void verifyColdRead(NereusKafkaObjectWalRuns runs, OxiaCanonicalControlMetadataStore metadata,
             KafkaObjectAuthorizationV1 authority, KafkaPartitionFenceV1 fence) throws Exception {
         var successor = runs.current().orElseThrow();
@@ -371,7 +309,7 @@ public class KafkaObjectWalAdapterRealTest {
         }
     }
 
-    private static CanonicalBytes nativeBytes() {
+    static CanonicalBytes nativeBytes() {
         return nativeBytes(0, 0);
     }
 
@@ -536,7 +474,7 @@ public class KafkaObjectWalAdapterRealTest {
         };
     }
 
-    private static KafkaOwnerIdentityV1 election(KafkaPartitionFenceV1 fence) {
+    static KafkaOwnerIdentityV1 election(KafkaPartitionFenceV1 fence) {
         return new KafkaOwnerIdentityV1(fence.ownerEpoch(), fence.kafkaLeaderEpoch(),
                 fence.kafkaLeaderEpoch() % 2, fence.ownerEpoch(), fence.ownerEpoch());
     }
