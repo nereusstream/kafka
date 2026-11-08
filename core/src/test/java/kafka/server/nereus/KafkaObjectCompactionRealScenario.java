@@ -20,6 +20,7 @@ import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
 import kafka.server.nsip.NativeKafkaRequest;
 
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.ListOffsetsOptions;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -32,6 +33,7 @@ import org.apache.kafka.common.message.InitProducerIdRequestData;
 import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.ControlRecordType;
+import org.apache.kafka.common.record.EndTransactionMarker;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.record.SimpleRecord;
@@ -67,13 +69,16 @@ final class KafkaObjectCompactionRealScenario {
 
     private KafkaObjectCompactionRealScenario() { }
 
-    record ErasedBatch(MemoryRecords original) {
+    record ErasedBatch(MemoryRecords original, TransactionMarker commit, TransactionMarker abort) {
         void verifyReplay(KafkaClusterTestKit cluster, int broker) throws Exception {
             append(cluster, broker, 5, original);
         }
     }
 
-    static ErasedBatch seed(KafkaClusterTestKit cluster, Properties client) throws Exception {
+    record TransactionMarker(EndTransactionMarker marker, long producerId, short producerEpoch, int leaderEpoch,
+                             long timestamp) { }
+
+    static ErasedBatch seed(KafkaClusterTestKit cluster, Uuid topic, Properties client) throws Exception {
         long now = System.currentTimeMillis();
         IdempotentSample.seed(cluster, now);
         append(cluster, 3, row(now + 1, "replace", "new-three"), row(now + 1, "replace-2", "new-four"));
@@ -83,7 +88,14 @@ final class KafkaObjectCompactionRealScenario {
         append(cluster, 0, 5, erased);
         append(cluster, 6, row(now + 3, "gone", null));
         seedTransactions(client);
-        return new ErasedBatch(erased);
+        try (var admin = Admin.create(client)) {
+            TestUtils.waitForCondition(() -> admin.listOffsets(Map.of(PARTITION, OffsetSpec.latest()),
+                            new ListOffsetsOptions(IsolationLevel.READ_COMMITTED))
+                    .partitionResult(PARTITION).get(5, TimeUnit.SECONDS).offset() == SEALED_TRANSACTION_END,
+                    20_000, "Original transaction markers did not become visible");
+        }
+        return new ErasedBatch(erased, marker(cluster, topic, 0, 8, ControlRecordType.COMMIT),
+                marker(cluster, topic, 0, 10, ControlRecordType.ABORT));
     }
 
     private static void seedTransactions(Properties client) throws Exception {
@@ -191,15 +203,14 @@ final class KafkaObjectCompactionRealScenario {
         assertNull(tombstone.value(), "compaction discarded or rewrote the latest tombstone");
         assertTrue(tombstoneBatch.deleteHorizonMs().orElseThrow() > tombstone.timestamp());
 
+        assertEquals(erased.commit(), marker(cluster, topic, broker, 8, ControlRecordType.COMMIT));
+        assertEquals(erased.abort(), marker(cluster, topic, broker, 10, ControlRecordType.ABORT));
         verifyTransactions(cluster, topic, broker, end, client, replacement, compactedEnd);
     }
 
     private static void verifyTransactions(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client,
             long replacement, long compactedEnd)
             throws Exception {
-        verifyMarker(cluster, topic, broker, 8, ControlRecordType.COMMIT);
-        verifyMarker(cluster, topic, broker, 10, ControlRecordType.ABORT);
-
         var aborted = fetch(cluster, topic, broker, 9);
         assertEquals(Errors.NONE, Errors.forCode(aborted.errorCode()));
         var data = FetchResponse.recordsOrFail(aborted).batches().iterator().next();
@@ -219,14 +230,21 @@ final class KafkaObjectCompactionRealScenario {
         assertEquals(visible, KafkaBookKeeperOwnerRelocationRealTest.consume(client, visible.size()));
     }
 
-    private static void verifyMarker(KafkaClusterTestKit cluster, Uuid topic, int broker, long offset, ControlRecordType kind)
-            throws Exception {
+    private static TransactionMarker marker(KafkaClusterTestKit cluster, Uuid topic, int broker, long offset,
+            ControlRecordType kind) throws Exception {
         var response = fetch(cluster, topic, broker, offset);
         assertEquals(Errors.NONE, Errors.forCode(response.errorCode()));
         var batch = FetchResponse.recordsOrFail(response).batches().iterator().next();
         assertTrue(batch.isControlBatch());
+        batch.ensureValid();
         assertEquals(offset, batch.baseOffset());
-        assertEquals(kind, ControlRecordType.parse(batch.iterator().next().key()));
+        assertEquals(offset, batch.lastOffset());
+        var record = batch.iterator().next();
+        assertEquals(offset, record.offset());
+        var marker = EndTransactionMarker.deserialize(record);
+        assertEquals(kind, marker.controlType());
+        return new TransactionMarker(marker, batch.producerId(), batch.producerEpoch(), batch.partitionLeaderEpoch(),
+                record.timestamp());
     }
 
     private static final class IdempotentSample {

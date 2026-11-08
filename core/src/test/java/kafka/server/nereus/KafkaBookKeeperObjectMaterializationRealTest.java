@@ -163,9 +163,10 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                 topicId = admin.createTopics(List.of(topic)).topicId(TOPIC).get(30, TimeUnit.SECONDS);
             }
             var opened = first.get(30, TimeUnit.SECONDS);
-            var erased = fault.semantic ? Optional.of(KafkaObjectCompactionRealScenario.seed(cluster, client))
+            var erased = fault.semantic ? Optional.of(KafkaObjectCompactionRealScenario.seed(cluster, topicId, client))
                     : Optional.<KafkaObjectCompactionRealScenario.ErasedBatch>empty();
-            int produced = seedSealedSources(opened, client, fault.semantic);
+            int measured = fault.countAppendAccounting ? verifyAppendAccounting(client, fault) : 0;
+            int produced = seedSealedSources(opened, client, fault.semantic, measured);
             assertAppendWhileFetchHeld(cluster, client, topicId, heldFetch, produced);
             produced++;
             ColdTakeover takeover = () -> relocate(cluster, client, cold);
@@ -195,10 +196,20 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         }
     }
 
+    private static int verifyAppendAccounting(Properties client, PublicationFault fault) throws Exception {
+        KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-0", 0);
+        int before = fault.controlCalls.get();
+        assertTrue(before > 0, "The native async Owner did not exercise the real Oxia call counter");
+        KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-1", 1);
+        assertEquals(before, fault.controlCalls.get(), "A warm async Object profile append used Oxia before ACK");
+        System.out.println("Native async Object profile BookKeeper append controlCalls=0");
+        return 2;
+    }
+
     private static int seedSealedSources(NereusKafkaOwnedProviderRuntime.Opened owner,
-            Properties client, boolean semantic) throws Exception {
+            Properties client, boolean semantic, int measured) throws Exception {
         int required = semantic ? KafkaObjectCompactionRealScenario.SEALED_TRANSACTION_END : 0;
-        int produced = required;
+        int produced = Math.max(required, measured);
         while ((sealedRuns(owner) < 2 || owner.storage().nativeReadSources().activeRoot().kafkaStartOffset() < required)
                 && produced < 32) {
             KafkaBookKeeperRootVerifierRealScenario.produce(client, "input-" + produced, produced);
@@ -221,7 +232,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         return new NereusKafkaOwnedProviderRuntime.NativeRunResponseObserver() {
             @Override
             public AsyncOxiaClient controlClient(AsyncOxiaClient client) {
-                return fault.wrap(client);
+                return fault.countAppendAccounting ? fault.countedClient(client) : fault.wrap(client);
             }
 
             @Override
@@ -303,6 +314,8 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         private final boolean unknownPut;
         private final boolean semantic;
         private final boolean semanticNext;
+        private final boolean countAppendAccounting;
+        private final AtomicInteger controlCalls = new AtomicInteger();
         private final AtomicReference<Sha256Digest> manifest = new AtomicReference<>();
         private final CompletableFuture<M5PendingOutputInventoryV2> pendingApplied = new CompletableFuture<>();
         private final CompletableFuture<Void> pendingReadDenied = new CompletableFuture<>();
@@ -324,6 +337,7 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
             readFaults = outcome.equals("faults");
             unknownPut = outcome.equals("put-unknown");
             semantic = outcome.equals("semantic") || semanticNext;
+            countAppendAccounting = outcome.equals("known");
         }
 
         private AsyncOxiaClient wrap(AsyncOxiaClient client) {
@@ -352,6 +366,18 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
                             }).toCompletableFuture();
                         }
                         return pendingResponse(key, args, nativeScopeResponse(key, response));
+                    });
+        }
+
+        private AsyncOxiaClient countedClient(AsyncOxiaClient client) {
+            return (AsyncOxiaClient) Proxy.newProxyInstance(getClass().getClassLoader(),
+                    new Class<?>[] {AsyncOxiaClient.class}, (proxy, method, args) -> {
+                        if (method.getDeclaringClass() != Object.class) controlCalls.incrementAndGet();
+                        try {
+                            return method.invoke(client, args);
+                        } catch (InvocationTargetException failure) {
+                            throw failure.getCause();
+                        }
                     });
         }
 
