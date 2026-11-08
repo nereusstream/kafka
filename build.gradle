@@ -1124,6 +1124,8 @@ project(':core') {
         excludeTestsMatching 'kafka.server.nereus.KafkaBookKeeperAckRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaAsyncObjectProcessRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaObjectProviderAdmissionRealTest'
+        excludeTestsMatching 'kafka.server.nereus.KafkaObjectWalAdapterRealTest'
+        excludeTestsMatching 'kafka.server.nereus.KafkaObjectWalProcessRealTest'
         excludeTestsMatching 'kafka.server.nereus.KafkaBookKeeperObjectMaterializationRealTest'
         excludeTestsMatching 'kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest'
         excludeTestsMatching 'kafka.server.nsip.KafkaBookKeeperProcessRealTest'
@@ -1141,6 +1143,45 @@ project(':core') {
       doFirst {
         systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
         systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
+      }
+    }
+    tasks.register('nereusObjectWalAdapterRealTest', Test) {
+      group = 'verification'
+      description = 'Checks the native Object WAL adapter against real Vault, MinIO and Oxia.'
+      testClassesDirs = sourceSets.test.output.classesDirs
+      classpath = sourceSets.test.runtimeClasspath
+      useJUnitPlatform()
+      filter { includeTestsMatching 'kafka.server.nereus.KafkaObjectWalAdapterRealTest' }
+      dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain'
+      outputs.upToDateWhen { false }
+      doFirst {
+        systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+        systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
+        systemProperty 'nereus.nsip.vaultEndpoint', providers.gradleProperty('v2M6VaultEndpoint').get()
+        systemProperty 'nereus.nsip.vaultTokenFile', providers.gradleProperty('v2M6VaultTokenFile').get()
+      }
+    }
+    tasks.register('nereusKafkaObjectWalProcessRealTest', Test) {
+      group = 'verification'
+      description = 'Runs Kafka Object WAL with separate Controller and Broker processes.'
+      testClassesDirs = sourceSets.test.output.classesDirs
+      classpath = sourceSets.test.runtimeClasspath
+      useJUnitPlatform()
+      filter { includeTestsMatching 'kafka.server.nereus.KafkaObjectWalProcessRealTest' }
+      dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain'
+      outputs.upToDateWhen { false }
+      doFirst {
+        systemProperty 'nereus.nsip.bkUri', providers.gradleProperty('v2M2BookKeeperMetadataServiceUri').get()
+        systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+        systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
+        systemProperty 'nereus.nsip.vaultEndpoint', providers.gradleProperty('v2M6VaultEndpoint').get()
+        systemProperty 'nereus.nsip.vaultTokenFile', providers.gradleProperty('v2M6VaultTokenFile').get()
+        systemProperty 'nereus.nsip.processClasspath', (sourceSets.main.runtimeClasspath + configurations.releaseOnly).asPath
+        systemProperty 'nereus.nsip.processLogConfig', rootProject.file('config/log4j2.yaml').absolutePath
+        def directory = providers.gradleProperty('v2M6ObjectWalProcessEvidenceDir').getOrNull()
+        if (directory != null) {
+          systemProperty 'nereus.nsip.processEvidenceDir', directory
+        }
       }
     }
     tasks.register('nereusBookKeeperOwnerRelocationRealTest', Test) {
@@ -1317,7 +1358,8 @@ project(':core') {
 
     // Nereus inject start: exact product-owned adapter boundary
     if (nereusDevelopmentEnabled) {
-      ['nereus-kafka-bookkeeper', 'nereus-storage-bookkeeper', 'nereus-storage-object-s3', 'nereus-metadata-oxia'].each { moduleName ->
+      ['nereus-kafka-bookkeeper', 'nereus-storage-bookkeeper', 'nereus-storage-object-s3',
+       'nereus-storage-object-vault', 'nereus-metadata-oxia'].each { moduleName ->
         implementation("com.nereusstream:${moduleName}:${nereusDevelopmentVersion.get()}") {
           changing = true
           exclude group: 'org.apache.bookkeeper', module: 'circe-checksum'

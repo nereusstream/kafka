@@ -21,45 +21,27 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.storage.internals.log.LeaderEpochAwareRecoveryState;
 
-import com.nereusstream.kafka.bookkeeper.commit.KafkaCoherentProtocolSnapshotV1;
+import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionProtocolStateV1;
 
 import java.util.Objects;
 
 /** Immutable shared-commit state installed after checkpoint and tail recovery. */
 public record NereusKafkaRecoveredState(
-        TopicPartition topicPartition, Uuid topicId, int leaderEpoch, KafkaCoherentProtocolSnapshotV1 sharedState)
+        TopicPartition topicPartition, Uuid topicId, int leaderEpoch, KafkaPartitionProtocolStateV1 root)
         implements LeaderEpochAwareRecoveryState {
     public NereusKafkaRecoveredState {
         Objects.requireNonNull(topicPartition, "topicPartition");
         Objects.requireNonNull(topicId, "topicId");
-        Objects.requireNonNull(sharedState, "sharedState");
+        Objects.requireNonNull(root, "root");
+        var fence = root.fence();
+        var topic = fence.topicIncarnation();
+        var id = topic.topicId().value();
         if (topicId.equals(Uuid.ZERO_UUID)
-                || leaderEpoch != sharedState.root().fence().kafkaLeaderEpoch()
-                || !topicPartition
-                        .topic()
-                        .equals(sharedState
-                                .root()
-                                .fence()
-                                .topicIncarnation()
-                                .topicName()
-                                .value())
-                || !topicId.equals(new Uuid(
-                        sharedState
-                                .root()
-                                .fence()
-                                .topicIncarnation()
-                                .topicId()
-                                .value()
-                                .highBits(),
-                        sharedState
-                                .root()
-                                .fence()
-                                .topicIncarnation()
-                                .topicId()
-                                .value()
-                                .lowBits()))
-                || topicPartition.partition() != sharedState.root().fence().partitionId()) {
-            throw new IllegalArgumentException("native recovered identity differs from the shared BK root");
+                || leaderEpoch != fence.kafkaLeaderEpoch()
+                || !topicPartition.topic().equals(topic.topicName().value())
+                || !topicId.equals(new Uuid(id.highBits(), id.lowBits()))
+                || topicPartition.partition() != fence.partitionId()) {
+            throw new IllegalArgumentException("native recovered identity differs from the shared protocol root");
         }
     }
 

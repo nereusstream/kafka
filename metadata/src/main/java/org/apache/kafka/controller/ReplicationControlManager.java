@@ -2499,7 +2499,7 @@ public class ReplicationControlManager {
                 throw new RuntimeException("Partition " + topicIdPart +
                     " existed in isrMembers, but not in the partitions map.");
             }
-            if (isNereusBookKeeperTopic(topic) && (partition.leader == NO_LEADER
+            if (isNereusSingleOwnerTopic(topic) && (partition.leader == NO_LEADER
                     || !isAcceptableLeader.test(partition.leader))) {
                 OptionalInt replacement = clusterControl.brokerRegistrations().keySet().stream()
                     .filter(isAcceptableLeader::test)
@@ -2553,9 +2553,8 @@ public class ReplicationControlManager {
         }
     }
 
-    private boolean isNereusBookKeeperTopic(TopicControlInfo topic) {
-        return featureControl.isNereusStorageFeatureEnabled() && topic.nereusAggregate().filter(aggregate ->
-            aggregate.storageProfile() != com.nereusstream.domain.aggregate.StorageProfileV1.OBJECT_WAL).isPresent();
+    private boolean isNereusSingleOwnerTopic(TopicControlInfo topic) {
+        return featureControl.isNereusStorageFeatureEnabled() && topic.nereusAggregate().isPresent();
     }
 
     /** Changes the actual sole replica in one native record; the new broker gates requests on fenced storage recovery. */
@@ -2563,7 +2562,7 @@ public class ReplicationControlManager {
         TopicIdPartition topicPartition, PartitionRegistration partition, int brokerId, IntPredicate acceptable
     ) {
         if (partition.replicas.length != 1) {
-            throw new IllegalStateException("Nereus shared BK partition does not have RF=1");
+            throw new IllegalStateException("Nereus shared partition does not have RF=1");
         }
         Uuid targetDirectory = clusterDescriber.defaultDir(brokerId);
         IntPredicate targetIsOnline = candidate -> acceptable.test(candidate)
@@ -2720,7 +2719,10 @@ public class ReplicationControlManager {
             validatePartitionReplicationFactorUnchanged(part, target);
         }
 
-        if (isNereusBookKeeperTopic(topics.get(tp.topicId()))) {
+        if (isNereusSingleOwnerTopic(topics.get(tp.topicId()))) {
+            if (target.replicas().size() != 1) {
+                throw new InvalidReplicaAssignmentException("Nereus shared storage requires exactly one replacement owner.");
+            }
             int newOwner = target.replicas().get(0);
             if (!clusterControl.isActive(newOwner)) {
                 throw new InvalidReplicaAssignmentException("Nereus replacement owner must be active and outside controlled shutdown.");

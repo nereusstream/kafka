@@ -16,10 +16,14 @@
  */
 package kafka.log.nereus;
 
+import kafka.server.nereus.NereusKafkaObjectWalPartition;
+
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.errors.OffsetOutOfRangeException;
+import org.apache.kafka.common.errors.RecordTooLargeException;
+import org.apache.kafka.common.message.FetchResponseData.AbortedTransaction;
 import org.apache.kafka.common.record.FileRecords;
 import org.apache.kafka.common.record.MemoryRecords;
 import org.apache.kafka.common.record.RecordBatch;
@@ -50,8 +54,13 @@ import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.kafka.bookkeeper.adapter.KafkaNativeAssignedRecordBatchV1;
 import com.nereusstream.kafka.bookkeeper.adapter.KafkaRawAssignedRecordBatchFactsV1;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1;
+import com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeAppendV1;
 import com.nereusstream.kafka.bookkeeper.commit.KafkaBatchDuplicateIdentityV1;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaCommittedProducerStateV1;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaLeaderEpochIndexV1;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaTransactionStateV1;
 import com.nereusstream.kafka.bookkeeper.pipeline.KafkaOrderedAppendOutcomeV1;
+import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionProtocolStateV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaReadIsolationV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadBatchV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaBookKeeperReadCursorV1;
@@ -67,6 +76,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
@@ -85,7 +95,9 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private final NereusListOffsetsScanConfig timestampScan;
     private final NereusProducerStateManager producers;
     private final ThreadLocal<KafkaBookKeeperPartitionV1.AdmittedAppend> admission = new ThreadLocal<>();
+    private final ThreadLocal<KafkaObjectNativeAppendV1.Admission> objectAdmission = new ThreadLocal<>();
     private KafkaBookKeeperPartitionV1 storage;
+    private NereusKafkaObjectWalPartition objectStorage;
     // One disposable position per log. The reader checks it against a fresh snapshot on every use.
     private final AtomicReference<Optional<KafkaBookKeeperReadCursorV1>> nextFetchCursor =
             new AtomicReference<>(Optional.empty());
@@ -174,26 +186,10 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             int epoch, KafkaBookKeeperPartitionV1 candidate, java.util.function.BooleanSupplier currentOwner)
             throws IOException {
         synchronized (guard) {
-            if (storage != null) throw new KafkaStorageException("shared BK log already has a published owner");
+            requireUnowned();
             var snapshot = candidate.capture();
-            if (snapshot.root().fence().kafkaLeaderEpoch() != epoch
-                    || snapshot.root().frontiers().trimStartOffset() != 0) {
-                throw new KafkaStorageException(
-                        "shared BK recovered partition has a foreign epoch or unsupported prefix");
-            }
-            long end = snapshot.root().frontiers().durableEndOffset();
-            super.truncateFullyAndStartAt(end, Optional.of(0L));
-            producers.loadSharedState(snapshot);
-            if (producers.mapEndOffset() != end) {
-                throw new KafkaStorageException("native producer replay does not cover the shared BK prefix");
-            }
-            snapshot.leaderEpochIndex().startOffsets().forEach(super::assignEpochStartOffset);
-            super.assignEpochStartOffset(epoch, end);
-            super.updateHighWatermark(end);
-            if (lastStableOffset() != snapshot.root().frontiers().lastStableOffset()) {
-                throw new KafkaStorageException("native transaction replay differs from the shared BK LSO");
-            }
-            var state = new NereusKafkaRecoveredState(identity.topicPartition(), identity.topicId(), epoch, snapshot);
+            var state = installRecoveredProtocol(epoch, snapshot.root(), snapshot.committedProducerState(),
+                    snapshot.transactionState(), snapshot.leaderEpochIndex());
             this.currentOwner = currentOwner;
             storage = candidate;
             publishedEpoch = epoch;
@@ -201,9 +197,52 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         }
     }
 
+    public NereusKafkaRecoveredState installRecoveredObjectState(
+            int epoch, NereusKafkaObjectWalPartition candidate, java.util.function.BooleanSupplier currentOwner)
+            throws IOException {
+        synchronized (guard) {
+            requireUnowned();
+            var snapshot = candidate.capture();
+            var state = installRecoveredProtocol(epoch, snapshot.root(), snapshot.committedProducerState(),
+                    snapshot.transactionState(), snapshot.leaderEpochIndex());
+            this.currentOwner = currentOwner;
+            objectStorage = candidate;
+            publishedEpoch = epoch;
+            return state;
+        }
+    }
+
+    private void requireUnowned() {
+        if (storage != null || objectStorage != null) {
+            throw new KafkaStorageException("shared Kafka log already has a published owner");
+        }
+    }
+
+    private NereusKafkaRecoveredState installRecoveredProtocol(int epoch, KafkaPartitionProtocolStateV1 root,
+            KafkaCommittedProducerStateV1 producerState, KafkaTransactionStateV1 transactionState,
+            KafkaLeaderEpochIndexV1 leaderEpochs) throws IOException {
+        if (root.fence().kafkaLeaderEpoch() != epoch || root.frontiers().trimStartOffset() != 0) {
+            throw new KafkaStorageException("native recovered partition has a foreign epoch or unsupported prefix");
+        }
+        var state = new NereusKafkaRecoveredState(identity.topicPartition(), identity.topicId(), epoch, root);
+        long end = root.frontiers().durableEndOffset();
+        super.truncateFullyAndStartAt(end, Optional.of(0L));
+        producers.loadSharedState(root, producerState, transactionState);
+        if (producers.mapEndOffset() != end) {
+            throw new KafkaStorageException("native producer replay does not cover the shared durable prefix");
+        }
+        leaderEpochs.startOffsets().forEach(super::assignEpochStartOffset);
+        super.assignEpochStartOffset(epoch, end);
+        super.updateHighWatermark(end);
+        if (lastStableOffset() != root.frontiers().lastStableOffset()) {
+            throw new KafkaStorageException("native transaction replay differs from the shared LSO");
+        }
+        return state;
+    }
+
     public void removeStorage(int epoch, KafkaBookKeeperPartitionV1 expected) {
         synchronized (guard) {
-            if (publishedEpoch == epoch && (expected == null || storage == expected)) {
+            if (publishedEpoch == epoch && storage != null && (expected == null || storage == expected)) {
                 storage = null;
                 nextFetchCursor.set(Optional.empty());
                 publishedEpoch = -1;
@@ -212,9 +251,18 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         }
     }
 
+    public void removeObjectStorage(int epoch, NereusKafkaObjectWalPartition expected) {
+        synchronized (guard) {
+            if (publishedEpoch == epoch && objectStorage == expected) {
+                objectStorage = null;
+                publishedEpoch = -1;
+            }
+        }
+    }
+
     public boolean nereusWritable(int epoch) {
         synchronized (guard) {
-            return storage != null && publishedEpoch == epoch;
+            return (storage != null || objectStorage != null) && publishedEpoch == epoch;
         }
     }
 
@@ -248,6 +296,9 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         if (requiredAcks != 0 && requiredAcks != 1 && requiredAcks != -1)
             throw new IllegalArgumentException("invalid acks");
         synchronized (guard) {
+            if (objectStorage != null) {
+                return appendObjectAsLeader(records, epoch, origin, requestLocal, verificationGuard, transactionVersion);
+            }
             var exact = requireStorage(epoch);
             var lengths = new ArrayList<Integer>();
             boolean duplicate = origin == AppendOrigin.CLIENT;
@@ -258,18 +309,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                             "shared BK requires magic-v2");
                 }
                 lengths.add(config().maxMessageSize());
-                duplicate = duplicate && batch.hasProducerId()
-                        && !batch.isControlBatch()
-                        && batch.baseSequence() >= 0
-                        && producers.activeProducers().containsKey(batch.producerId())
-                        && exact.capture()
-                                .committedProducerState()
-                                .findDuplicate(new KafkaBatchDuplicateIdentityV1(
-                                        batch.producerId(),
-                                        batch.producerEpoch(),
-                                        batch.baseSequence(),
-                                        batch.lastSequence()))
-                                .isPresent();
+                duplicate = duplicate && isDurableDuplicate(exact.capture().committedProducerState(), batch);
             }
             if (lengths.isEmpty())
                 return super.appendAsLeader(
@@ -305,6 +345,61 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         }
     }
 
+    private boolean isDurableDuplicate(KafkaCommittedProducerStateV1 selected, RecordBatch batch) {
+        return batch.hasProducerId() && !batch.isControlBatch() && batch.baseSequence() >= 0
+                && producers.activeProducers().containsKey(batch.producerId())
+                && selected.findDuplicate(new KafkaBatchDuplicateIdentityV1(
+                        batch.producerId(), batch.producerEpoch(), batch.baseSequence(), batch.lastSequence()))
+                        .isPresent();
+    }
+
+    private LogAppendInfo appendObjectAsLeader(MemoryRecords records, int epoch, AppendOrigin origin,
+            RequestLocal requestLocal, VerificationGuard verificationGuard, short transactionVersion) {
+        var exact = requireObjectStorage(epoch);
+        var selected = exact.capture();
+        var lengths = new ArrayList<Integer>();
+        boolean duplicate = origin == AppendOrigin.CLIENT;
+        boolean exceedsFrameBound = false;
+        int frameBound = Math.min(config().maxMessageSize(), exact.maximumFrameBytes());
+        for (var batch : records.batches()) {
+            batch.ensureValid();
+            if (batch.magic() != RecordBatch.MAGIC_VALUE_V2) {
+                throw new org.apache.kafka.common.errors.UnsupportedForMessageFormatException(
+                        "native Object WAL requires magic-v2");
+            }
+            exceedsFrameBound |= batch.sizeInBytes() > frameBound;
+            lengths.add(frameBound);
+            duplicate = duplicate && isDurableDuplicate(selected.committedProducerState(), batch);
+        }
+        if (lengths.isEmpty() || duplicate) {
+            return super.appendAsLeader(records, epoch, origin, requestLocal, verificationGuard, transactionVersion);
+        }
+        if (exceedsFrameBound) {
+            throw new RecordTooLargeException("native Object WAL frame exceeds its admitted byte limit");
+        }
+        if (objectAdmission.get() != null) throw new IllegalStateException("nested native Object WAL append");
+        try (var reserved = exact.admit(lengths)) {
+            objectAdmission.set(reserved);
+            var result = super.appendAsLeader(records, epoch, origin, requestLocal, verificationGuard, transactionVersion);
+            var root = exact.capture().root();
+            long end = root.frontiers().durableEndOffset();
+            super.updateHighWatermark(end);
+            if (end != logEndOffset() || lastStableOffset() != root.frontiers().lastStableOffset()) {
+                throw new KafkaStorageException("native append differs from the coherent Object WAL publication");
+            }
+            return result;
+        } catch (IOException failure) {
+            exact.fence();
+            throw new KafkaStorageException("native Object WAL frontier publication failed", failure);
+        } catch (RuntimeException | Error failure) {
+            if (Boolean.TRUE.equals(physicallyDispatched.get())) exact.fence();
+            throw failure;
+        } finally {
+            objectAdmission.remove();
+            physicallyDispatched.remove();
+        }
+    }
+
     private static KafkaBookKeeperPartitionV1.AdmittedAppend admitStorage(
             KafkaBookKeeperPartitionV1 exact, List<Integer> lengths) {
         try {
@@ -316,15 +411,19 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     }
 
     private void appendStable(long lastOffset, MemoryRecords records) {
+        if (objectAdmission.get() != null) {
+            var batches = assignedBatches(records);
+            physicallyDispatched.set(true);
+            requireObjectStorage(publishedEpoch).append(objectAdmission.get(), batches, snapshot -> {
+                if (snapshot.root().frontiers().durableEndOffset() != lastOffset + 1) {
+                    throw new KafkaStorageException("Object WAL append did not publish the exact native range");
+                }
+            });
+            return;
+        }
         var reserved = admission.get();
         if (reserved == null) throw new KafkaStorageException("native append has no pre-offset BK admission");
-        var batches = new ArrayList<KafkaNativeAssignedRecordBatchV1>();
-        for (var batch : records.batches()) {
-            var bytes = ByteBuffer.allocate(batch.sizeInBytes());
-            batch.writeTo(bytes);
-            var raw = CanonicalBytes.copyOf(bytes.array());
-            batches.add(KafkaNativeAssignedRecordBatchV1.validate(KafkaRawAssignedRecordBatchFactsV1.parse(raw)));
-        }
+        var batches = assignedBatches(records);
         physicallyDispatched.set(true);
         var result = await(storage.appendAssigned(reserved, batches), appendTimeout);
         if (result.outcome() != KafkaOrderedAppendOutcomeV1.COMMITTED_ORDERED
@@ -332,6 +431,17 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             storage.fence();
             throw new KafkaStorageException("shared BK append did not commit the exact native batch range");
         }
+    }
+
+    private static List<KafkaNativeAssignedRecordBatchV1> assignedBatches(MemoryRecords records) {
+        var batches = new ArrayList<KafkaNativeAssignedRecordBatchV1>();
+        for (var batch : records.batches()) {
+            var bytes = ByteBuffer.allocate(batch.sizeInBytes());
+            batch.writeTo(bytes);
+            var raw = CanonicalBytes.copyOf(bytes.array());
+            batches.add(KafkaNativeAssignedRecordBatchV1.validate(KafkaRawAssignedRecordBatchFactsV1.parse(raw)));
+        }
+        return batches;
     }
 
     @Override
@@ -366,6 +476,9 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             long offset, int maximumBytes, FetchIsolation isolation, boolean minOneMessage) {
         long start = System.nanoTime();
         synchronized (guard) {
+            if (objectStorage != null) {
+                return planObjectFetch(offset, maximumBytes, isolation, minOneMessage);
+            }
             var exact = requireStorage(publishedEpoch);
             var cursor = nextFetchCursor.getAndSet(Optional.empty());
             var mode = readIsolation(isolation);
@@ -398,6 +511,31 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             return planned.result().thenApply(result -> fetchData(result, offset, maximumBytes, isolation, minOneMessage))
                     .toCompletableFuture().orTimeout(remaining, TimeUnit.NANOSECONDS);
         }
+    }
+
+    private CompletionStage<FetchDataInfo> planObjectFetch(
+            long offset, int maximumBytes, FetchIsolation isolation, boolean minOneMessage) {
+        var exact = requireObjectStorage(publishedEpoch);
+        var snapshot = exact.capture();
+        if (offset < snapshot.root().frontiers().trimStartOffset()
+                || offset > snapshot.root().frontiers().readableEndOffset()) {
+            throw new OffsetOutOfRangeException("Object WAL Fetch is outside its captured range");
+        }
+        return exact.read(snapshot, offset, Math.max(0, maximumBytes), hardMaxFetchBytes, minOneMessage,
+                        readIsolation(isolation))
+                .thenApply(read -> {
+                    var buffer = ByteBuffer.allocate(read.bytes());
+                    read.batches().forEach(batch -> buffer.put(batch.rawAssignedBytes().toByteArray()));
+                    buffer.flip();
+                    var aborted = isolation == FetchIsolation.TXN_COMMITTED
+                            ? Optional.of(read.abortedTransactions().stream()
+                                    .map(txn -> new AbortedTransaction().setProducerId(txn.producerId())
+                                            .setFirstOffset(txn.firstOffset())).toList())
+                            : Optional.<List<AbortedTransaction>>empty();
+                    long base = read.batches().isEmpty() ? offset : read.batches().get(0).startOffset();
+                    return new FetchDataInfo(new LogOffsetMetadata(base, 0, 0), MemoryRecords.readableRecords(buffer),
+                            false, aborted);
+                }).toCompletableFuture().orTimeout(fetchTimeout.toNanos(), TimeUnit.NANOSECONDS);
     }
 
     private FetchDataInfo fetchData(KafkaBookKeeperReadResultV1 result, long offset, int maximumBytes,
@@ -445,6 +583,9 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
 
     public CompletionStage<Optional<FileRecords.TimestampAndOffset>> lookupTimestamp(long timestamp, int epoch) {
         synchronized (guard) {
+            if (objectStorage != null) {
+                return lookupObjectTimestamp(timestamp, epoch);
+            }
             var exact = requireStorage(epoch);
             var snapshot = exact.capture();
             if (timestamp == ListOffsetsRequest.EARLIEST_TIMESTAMP
@@ -485,6 +626,38 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
                                 timestampScan);
                     });
         }
+    }
+
+    private CompletionStage<Optional<FileRecords.TimestampAndOffset>> lookupObjectTimestamp(long timestamp, int epoch) {
+        var exact = requireObjectStorage(epoch);
+        var snapshot = exact.capture();
+        var frontiers = snapshot.root().frontiers();
+        if (timestamp == ListOffsetsRequest.EARLIEST_TIMESTAMP || timestamp == ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP) {
+            return CompletableFuture.completedFuture(Optional.of(new FileRecords.TimestampAndOffset(
+                    RecordBatch.NO_TIMESTAMP, frontiers.trimStartOffset(), Optional.empty())));
+        }
+        if (timestamp == ListOffsetsRequest.LATEST_TIMESTAMP) {
+            return CompletableFuture.completedFuture(Optional.of(new FileRecords.TimestampAndOffset(
+                    RecordBatch.NO_TIMESTAMP, frontiers.highWatermark(), Optional.of(epoch))));
+        }
+        if (timestamp < 0 && timestamp != ListOffsetsRequest.MAX_TIMESTAMP) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        int limit = (int) Math.min(timestampScan.maxScanBytes(), Integer.MAX_VALUE);
+        return exact.read(snapshot, frontiers.trimStartOffset(), limit, limit, false, KafkaReadIsolationV1.READ_UNCOMMITTED)
+                .toCompletableFuture().orTimeout(timestampScan.timeout().toMillis(), TimeUnit.MILLISECONDS)
+                .thenApply(result -> {
+                    synchronized (guard) {
+                        if (requireObjectStorage(epoch) != exact) {
+                            throw new KafkaStorageException("Object WAL timestamp scan owner changed");
+                        }
+                    }
+                    if (frontiers.trimStartOffset() == frontiers.highWatermark()) return Optional.empty();
+                    var batches = result.batches().stream().map(batch -> new KafkaBookKeeperReadBatchV1(
+                            batch.startOffset(), batch.endOffsetExclusive(), OptionalLong.empty(), batch.rawAssignedBytes()))
+                            .toList();
+                    return scanTimestamp(batches, frontiers.highWatermark(), timestamp, timestampScan);
+                });
     }
 
     static Optional<FileRecords.TimestampAndOffset> scanTimestamp(
@@ -617,6 +790,17 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
         if (storage == null || publishedEpoch != epoch)
             throw new KafkaStorageException("shared BK partition is not recovered for this epoch");
         return storage;
+    }
+
+    private NereusKafkaObjectWalPartition requireObjectStorage(int epoch) {
+        if (objectStorage != null && !currentOwner.getAsBoolean()) {
+            objectStorage.fence();
+            throw new org.apache.kafka.common.errors.FencedLeaderEpochException("native Object WAL assignment was revoked");
+        }
+        if (objectStorage == null || publishedEpoch != epoch) {
+            throw new KafkaStorageException("Object WAL partition is not recovered for this epoch");
+        }
+        return objectStorage;
     }
 
     private <T> T await(CompletionStage<T> stage, Duration timeout) {

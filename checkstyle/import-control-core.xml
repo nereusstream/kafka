@@ -59,6 +59,7 @@
     <subpackage name="nereus">
       <!-- V2 closed-owner/shared BK composition is confined to this native adapter boundary. -->
       <allow pkg="com.nereusstream.domain" />
+      <allow class="kafka.server.nereus.NereusKafkaObjectWalPartition" />
       <allow pkg="com.nereusstream.kafka.bookkeeper" />
       <allow pkg="com.nereusstream.storage.api.bookkeeper" />
       <allow pkg="com.nereusstream.storage.api.kafka" />
@@ -70,6 +71,7 @@
       <allow class="com.nereusstream.metadata.oxia.VersionedKafkaPartitionBinding" />
       <allow pkg="org.apache.kafka.common.compress" />
       <allow pkg="org.apache.kafka.common.errors" />
+      <allow class="org.apache.kafka.common.message.FetchResponseData.AbortedTransaction" />
       <allow pkg="org.apache.kafka.common.protocol" />
       <allow pkg="org.apache.kafka.common.record" />
       <allow pkg="org.apache.kafka.common.requests" />
@@ -157,6 +159,116 @@
       <allow pkg="com.nereusstream.metadata.oxia.v2" />
       <allow pkg="io.oxia.client.api" />
       <allow pkg="org.apache.bookkeeper" />
+      <file name="NereusKafkaObjectWalShard(\.java)?" regex="true">
+        <allow class="com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1" />
+      </file>
+      <file name="NereusKafkaObjectWalKms(\.java)?" regex="true">
+        <allow class="com.nereusstream.storage.object.kms.KmsCellSession" />
+        <allow class="com.nereusstream.storage.object.materialization.M5CellProviderProfileV2" />
+        <allow class="com.nereusstream.storage.object.vault.VaultTransitRunKeyKms" />
+      </file>
+      <file name="NereusKafkaObjectWalRoot(\.java)?" regex="true">
+        <allow class="com.nereusstream.storage.object.control.Nwg1RootAdmissionCaps" />
+        <allow class="com.nereusstream.storage.object.control.ObjectProviderAccessProfile" />
+        <allow class="com.nereusstream.storage.object.control.ObjectProviderRootConfiguration" />
+        <allow class="com.nereusstream.storage.object.control.ProviderProofMode" />
+        <allow class="com.nereusstream.storage.object.control.WalCheckpointPolicy" />
+        <allow class="com.nereusstream.storage.object.control.WalRunBounds" />
+        <allow class="com.nereusstream.storage.object.control.WalRunFormatContractV1" />
+        <allow class="com.nereusstream.storage.object.control.WalRunPredecessor" />
+        <allow class="com.nereusstream.storage.object.control.WalRunRootRecord" />
+        <allow class="com.nereusstream.storage.object.kms.KmsCellSession" />
+        <allow class="com.nereusstream.storage.object.materialization.M5CellProviderProfileV2" />
+        <allow class="com.nereusstream.storage.object.nwg1.Nwg1ConstantsV1" />
+      </file>
+      <file name="NereusKafkaObjectWalRuns(\.java)?" regex="true">
+        <allow class="com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1" />
+        <allow class="com.nereusstream.storage.object.control.CurrentWalRunPointer" />
+        <allow class="com.nereusstream.storage.object.control.TerminalProtocolCheckpointVerifierV1" />
+        <allow class="com.nereusstream.storage.object.control.WalRunControlCodec" />
+        <allow class="com.nereusstream.storage.object.control.WalRunControlKeys" />
+        <allow class="com.nereusstream.storage.object.control.WalRunHistoricalObjectReaderV1" />
+        <allow class="com.nereusstream.storage.object.control.WalRunLifecycleManager" />
+        <allow class="com.nereusstream.storage.object.control.WalRunObjectSession" />
+        <allow class="com.nereusstream.storage.object.control.WalRunPredecessor" />
+        <allow class="com.nereusstream.storage.object.control.WalRunReference" />
+        <allow class="com.nereusstream.storage.object.control.WalRunRootRecord" />
+        <allow class="com.nereusstream.storage.object.kms.KmsCellSession" />
+        <allow class="com.nereusstream.storage.object.kms.RunKeyCacheIdentity" />
+        <allow class="com.nereusstream.storage.object.provider.C1ObjectProviderSession" />
+        <allow class="com.nereusstream.storage.object.recovery.WalRunLineageRecovery" />
+      </file>
+      <file name="NereusKafkaObjectWalDispatchFence(\.java)?" regex="true">
+        <allow class="com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1" />
+        <allow class="com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1.MutationOutcome" />
+        <allow class="com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1.VersionedValue" />
+        <allow class="com.nereusstream.storage.object.control.WalRunControlCodec" />
+        <allow class="com.nereusstream.storage.object.control.WalRunRootRecord" />
+        <allow class="com.nereusstream.storage.object.provider.C1ObjectProviderSession" />
+        <allow class="com.nereusstream.storage.object.provider.ObjectIdentity" />
+      </file>
+      <file name="NereusKafkaObjectWalOwners(\.java)?" regex="true">
+        <allow class="com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1" />
+        <allow class="com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1.MutationOutcome" />
+        <allow class="com.nereusstream.storage.object.control.WalRunControlCodec" />
+        <allow class="com.nereusstream.storage.object.control.WalRunRootRecord" />
+      </file>
+      <file name="NereusKafkaObjectWalCell(\.java)?" regex="true">
+        <allow class="com.nereusstream.storage.object.control.TerminalProtocolCheckpointVerifierV1" />
+        <allow class="com.nereusstream.storage.object.control.WalCheckpointHeadV1" />
+        <allow class="com.nereusstream.storage.object.control.WalRunControlCodec" />
+        <allow class="com.nereusstream.storage.object.control.WalRunControlKeys" />
+        <allow class="com.nereusstream.storage.object.control.WalRunLifecycleManager" />
+        <allow class="com.nereusstream.storage.object.control.WalRunObjectSession" />
+        <allow class="com.nereusstream.storage.object.control.WalRunRootRecord" />
+        <allow class="com.nereusstream.storage.object.recovery.OwnerOpenRecoveryCoordinator" />
+        <allow class="com.nereusstream.storage.object.recovery.WalRunLineageRecovery" />
+      </file>
+      <file name="NereusKafkaObjectWalTransport(\.java)?" regex="true">
+        <allow class="com.nereusstream.storage.object.provider.ObjectIdentity" />
+        <allow class="com.nereusstream.storage.object.provider.ObjectProviderCapabilities" />
+        <allow class="com.nereusstream.storage.object.provider.ObjectProviderTransport" />
+      </file>
+      <file name="NereusKafkaObjectWalPartition(\.java)?" regex="true">
+        <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeAppendV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeExtentV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeFetchV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectCoherentProtocolSnapshotV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectExtentLocatorV1" />
+        <allow class="com.nereusstream.storage.object.control.WalRunHistoricalObjectReaderV1" />
+        <allow class="com.nereusstream.storage.object.control.WalRunObjectSession" />
+        <allow class="com.nereusstream.storage.object.nwg1.Nwg1ObjectReaderV1" />
+        <allow class="com.nereusstream.storage.object.nwg1.Nwg1VerificationContextV1" />
+      </file>
+      <file name="KafkaObjectWalProcessRealTest(\.java)?" regex="true">
+        <allow class="software.amazon.awssdk.services.s3.S3Client" />
+      </file>
+      <file name="KafkaObjectWalAdapterRealTest(\.java)?" regex="true">
+        <allow class="software.amazon.awssdk.services.s3.S3Client" />
+        <allow class="com.nereusstream.storage.object.control.CanonicalControlMetadataStore" />
+        <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeAppendV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeExtentV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeVerificationV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaObjectAuthorizedRecoveryV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaObjectAuthorizedOwnerOpenV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaObjectRecoveredProtocolClosureV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.nwkcp1.ObjectKafkaProtocolCheckpointStoreV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectAuthorizationV1" />
+        <allow class="com.nereusstream.kafka.bookkeeper.object.recovery.KafkaNativePartitionOwnerAuthorityV1" />
+        <allow class="com.nereusstream.storage.object.control.WalRunControlCodec" />
+        <allow class="com.nereusstream.storage.object.control.WalRunControlKeys" />
+        <allow class="com.nereusstream.storage.object.control.WalRunLifecycleManager" />
+        <allow class="com.nereusstream.storage.object.control.WalRunObjectSession" />
+        <allow class="com.nereusstream.storage.object.control.WalRunRuntime" />
+        <allow class="com.nereusstream.storage.object.materialization.M5CellProviderProfileV2" />
+        <allow class="com.nereusstream.storage.object.provider.ObjectIdentity" />
+        <allow class="com.nereusstream.storage.object.provider.ProviderObjectOutcome" />
+        <allow class="com.nereusstream.storage.object.provider.RepeatableObjectBody" />
+        <allow class="com.nereusstream.storage.object.recovery.OwnerOpenRecoveryCoordinator" />
+        <allow class="com.nereusstream.storage.object.recovery.WalRunLineageRecovery" />
+        <allow class="com.nereusstream.storage.object.s3.S3C1ObjectProviderTransport" />
+        <allow class="com.nereusstream.storage.object.s3.S3M5PhysicalNamespaceAuthorityV2" />
+      </file>
       <file name="(NereusKafkaObjectProvider|KafkaObjectProviderAdmissionRealTest)(\.java)?" regex="true">
         <allow class="com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1.ReadFailure" />
         <allow class="com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1.UnresolvedRead" />

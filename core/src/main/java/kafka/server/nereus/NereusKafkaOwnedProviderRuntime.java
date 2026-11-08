@@ -261,7 +261,7 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                 () -> {
                     try {
                         var config = context.config().nereusKafkaStorageConfig();
-                        if (!config.core().profile().usesBookKeeper()) {
+                        if (!config.core().profile().requiresBookKeeper()) {
                             throw new IllegalArgumentException(
                                     "NSIP-1 native BookKeeper runtime cannot activate Object WAL");
                         }
@@ -467,6 +467,18 @@ public final class NereusKafkaOwnedProviderRuntime implements AutoCloseable {
                     }
                     runResponses.afterRecovery(identity, failure);
                 });
+    }
+
+    OxiaPhysicalMetadataNamespaceV2 physicalNamespace() {
+        return namespace;
+    }
+
+    AsyncOxiaClient controlClient() {
+        return oxia;
+    }
+
+    ThreadPoolExecutor recoveryExecutor() {
+        return openings;
     }
 
     private void ownObjectMaterialization(TopicBindingAggregateRecord binding, Opened owner) {

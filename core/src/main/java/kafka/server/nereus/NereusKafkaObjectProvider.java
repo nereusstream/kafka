@@ -112,7 +112,7 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
         }
         if (!profile.protocolCell().equals(cell)
                 || !profile.adapterVersion().equals(S3C1ObjectProviderTransport.ADAPTER_VERSION)
-                || !profile.providerConfigurationSha256().equals(configurationSha256(core))) {
+                || !profile.providerConfigurationSha256().equals(configurationSha256(config))) {
             throw new IllegalArgumentException("native Kafka Object capability belongs to another Cell or provider configuration");
         }
         return profile;
@@ -177,6 +177,21 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
         return Sha256Digest.hash(CanonicalBytes.copyOf(bytes.toByteArray()));
     }
 
+    static Sha256Digest configurationSha256(KafkaConfig config) throws IOException {
+        var core = config.nereusKafkaStorageConfig().core();
+        var s3 = configurationSha256(core);
+        if (core.profile() != NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT) return s3;
+        var bytes = new ByteArrayOutputStream();
+        try (var out = new DataOutputStream(bytes)) {
+            out.writeUTF("NEREUS_KAFKA_OBJECT_WAL_CONFIG_V1");
+            out.write(s3.bytes().toByteArray());
+            out.writeUTF(NereusKafkaObjectWalKms.keyIdentity(config));
+            // The same mount and key name on a different Vault endpoint are not the admitted wrapping route.
+            out.writeUTF(NereusKafkaObjectWalKms.endpoint(config).toASCIIString());
+        }
+        return Sha256Digest.hash(CanonicalBytes.copyOf(bytes.toByteArray()));
+    }
+
     private static Path requiredPath(KafkaConfig config, String key) {
         String value = config.getString(key);
         if (value == null || value.isBlank()) throw new IllegalArgumentException("native Kafka Object requires " + key);
@@ -201,6 +216,23 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
 
     C1ObjectProviderSession session() {
         return session;
+    }
+
+    /** The WalRun owns the narrower session; the Cell owns the shared S3 transport. */
+    C1ObjectProviderSession openWalRunProvider(String prefix, long maximumBodyBytes, int maximumPrefixBytes) {
+        return openWalRunProvider(prefix, maximumBodyBytes, maximumPrefixBytes, null);
+    }
+
+    C1ObjectProviderSession openWalRunProvider(String prefix, long maximumBodyBytes, int maximumPrefixBytes,
+            NereusKafkaObjectWalDispatchFence dispatch) {
+        var profile = profile();
+        if (!prefix.startsWith(profile.exclusiveNamespacePrefix() + "/object-wal/")
+                || maximumBodyBytes > profile.maximumObjectBytes()
+                || maximumPrefixBytes > profile.maximumRangeBytes()) {
+            throw new IllegalArgumentException("native WalRun provider exceeds its admitted Cell");
+        }
+        var scoped = dispatch == null ? transport : new NereusKafkaObjectWalTransport(transport, dispatch);
+        return new C1ObjectProviderSession(scoped, profile.scopeId(), prefix, maximumBodyBytes, maximumPrefixBytes);
     }
 
     VerifiedObjectConsumption<CanonicalBytes> readVersion(ObjectIdentity identity, CanonicalBytes version)

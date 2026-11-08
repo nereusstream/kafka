@@ -17,6 +17,10 @@
 
 package kafka.log.nereus;
 
+import com.nereusstream.kafka.bookkeeper.commit.KafkaCommittedProducerStateV1;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaTransactionStateV1;
+import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionProtocolStateV1;
+
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.utils.Time;
@@ -53,11 +57,11 @@ public final class NereusProducerStateManager extends ProducerStateManager {
         transactionIndex.reset();
     }
 
-    public void loadSharedState(com.nereusstream.kafka.bookkeeper.commit.KafkaCoherentProtocolSnapshotV1 state)
-            throws IOException {
-        resetForRecovery(state.root().frontiers().trimStartOffset());
-        for (var producer : state.committedProducerState().producers().values()) {
-            var ongoing = state.transactionState().ongoingTransactions().get(producer.producerId());
+    public void loadSharedState(KafkaPartitionProtocolStateV1 root, KafkaCommittedProducerStateV1 producers,
+            KafkaTransactionStateV1 transactions) throws IOException {
+        resetForRecovery(root.frontiers().trimStartOffset());
+        for (var producer : producers.producers().values()) {
+            var ongoing = transactions.ongoingTransactions().get(producer.producerId());
             var batches = producer.recentBatches().stream()
                     .map(batch -> new org.apache.kafka.storage.internals.log.BatchMetadata(
                             batch.identity().lastSequence(),
@@ -73,14 +77,14 @@ public final class NereusProducerStateManager extends ProducerStateManager {
                     ongoing == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(ongoing.firstOffset()),
                     batches));
         }
-        long end = state.root().frontiers().durableEndOffset();
-        for (var transaction : state.transactionState().abortedTransactions()) {
+        long end = root.frontiers().durableEndOffset();
+        for (var transaction : transactions.abortedTransactions()) {
             long stable = transaction.markerEndOffsetExclusive();
-            for (var other : state.transactionState().ongoingTransactions().values()) {
+            for (var other : transactions.ongoingTransactions().values()) {
                 if (other.firstOffset() < transaction.markerEndOffsetExclusive())
                     stable = Math.min(stable, other.firstOffset());
             }
-            for (var other : state.transactionState().completedTransactions()) {
+            for (var other : transactions.completedTransactions()) {
                 if (other.producerId() != transaction.producerId()
                         && other.firstOffset() < transaction.markerEndOffsetExclusive()
                         && other.markerEndOffsetExclusive() > transaction.markerEndOffsetExclusive())

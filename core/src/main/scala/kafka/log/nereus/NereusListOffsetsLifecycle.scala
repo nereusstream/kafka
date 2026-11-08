@@ -18,7 +18,7 @@
 package kafka.log.nereus
 
 import kafka.cluster.Partition
-import kafka.server.nereus.NereusKafkaOwnedProviderRuntime
+import kafka.server.nereus.{NereusKafkaObjectWalBroker, NereusKafkaObjectWalPartition, NereusKafkaOwnedProviderRuntime}
 import kafka.server.storage.BrokerStorageRuntimeContext
 import org.apache.kafka.common.TopicIdPartition
 import org.apache.kafka.common.errors.{FencedLeaderEpochException, KafkaStorageException}
@@ -26,12 +26,13 @@ import org.apache.kafka.common.metadata.TopicBindingAggregateRecord
 import org.apache.kafka.image.{MetadataDelta, MetadataImage}
 
 import java.time.Duration
-import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
+import java.util.concurrent.{Callable, CompletableFuture, ConcurrentHashMap, CopyOnWriteArrayList}
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 /** One exact native recovery slot. Stale completions close only their own connections and never install readiness. */
-final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, provider: NereusKafkaOwnedProviderRuntime)
+final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, provider: NereusKafkaOwnedProviderRuntime,
+                                     objectWal: NereusKafkaObjectWalBroker)
   extends AutoCloseable {
   private val guard = new Object
   private val slots = mutable.HashMap.empty[TopicIdPartition, Slot]
@@ -50,9 +51,14 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
         revoke(previous)
       }
       partition.beginLeaderEpochAwareOffsetLookup(leaderEpoch)
-      val created = new Slot(partition, identity, leaderEpoch, brokerEpoch)
+      val created = new Slot(partition, identity, leaderEpoch, brokerEpoch, metadataOffset,
+        NereusKafkaObjectWalBroker.selectsObjectWal(aggregate))
       slots.put(identity, created)
       created
+    }
+    if (attempt.objectWal) {
+      openObjectLeader(attempt, aggregate)
+      return attempt.result.copy()
     }
     provider.open(identity, aggregate, leaderEpoch, brokerEpoch, metadataOffset,
       () => current(attempt), _ => signal(identity)).whenComplete { (opened, failure) =>
@@ -102,6 +108,62 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
     attempt.result.copy()
   }
 
+  private def openObjectLeader(attempt: Slot, aggregate: TopicBindingAggregateRecord): Unit = {
+    val assignment = new NereusKafkaObjectWalPartition.NativeAssignment {
+      override def current(): Boolean = NereusListOffsetsLifecycle.this.current(attempt)
+      override def whileCurrent[T](action: Callable[T]): T = attempt.ownerGate.synchronized {
+        if (!current()) throw new FencedLeaderEpochException("Object WAL native assignment was superseded")
+        action.call()
+      }
+    }
+    objectWal.open(attempt.identity, aggregate, attempt.epoch, attempt.brokerEpoch, attempt.metadataOffset,
+      assignment, _ => signal(attempt.identity)).whenComplete { (opened, failure) =>
+      var cleanup = false
+      guard.synchronized {
+        if (failure != null || !current(attempt)) {
+          cleanup = opened != null
+          attempt.result.completeExceptionally(if (failure != null) failure else new FencedLeaderEpochException("Object WAL recovery was superseded"))
+          if (slots.get(attempt.identity).contains(attempt)) { slots.remove(attempt.identity); revoke(attempt) }
+        } else {
+          try {
+            val log = attempt.partition.localLogOrException match {
+              case exact: NereusUnifiedLog => exact
+              case _ => throw new KafkaStorageException("native Object WAL partition has no Nereus log")
+            }
+            val state = log.installRecoveredObjectState(attempt.epoch, opened, () => assignment.current())
+            attempt.objectOpened = Some(opened)
+            attempt.log = Some(log)
+            attempt.partition.installNereusRecoveredState(attempt.epoch, state)
+            val lookup = new NereusListOffsetsBridge(log)
+            attempt.lookup = Some(lookup)
+            attempt.partition.completeNereusRecovery(attempt.epoch).whenComplete { (_, recoveryFailure) =>
+              guard.synchronized {
+                if (recoveryFailure == null && current(attempt)) {
+                  try {
+                    attempt.partition.installLeaderEpochAwareOffsetLookup(attempt.epoch, lookup)
+                    attempt.result.complete(null)
+                    signal(attempt.identity)
+                  } catch {
+                    case installFailure: Throwable => attempt.result.completeExceptionally(installFailure); revoke(attempt)
+                  }
+                } else {
+                  attempt.result.completeExceptionally(if (recoveryFailure != null) recoveryFailure else
+                    new FencedLeaderEpochException("Object WAL ready belongs to an older native owner"))
+                  revoke(attempt)
+                }
+              }
+            }
+          } catch {
+            case installFailure: Throwable =>
+              attempt.result.completeExceptionally(installFailure)
+              slots.remove(attempt.identity); revoke(attempt); cleanup = true
+          }
+        }
+      }
+      if (cleanup) objectWal.closePartition(opened)
+    }
+  }
+
   def publishMetadataImage(delta: MetadataDelta, newImage: MetadataImage, publish: () => Unit): Unit = {
     val brokerId = context.config.brokerId
     val brokerChanged = Option(delta.clusterDelta()).exists(_.changedBrokers().containsKey(brokerId))
@@ -116,8 +178,7 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
         if (slot.live && !matchesAssignment(slot, newImage)) {
           // This fences the same ordered pipeline that publishes a durable callback,
           // without waiting for ReplicaManager's partition lock or closing any resources.
-          slot.opened.foreach(_.fence())
-          slot.live = false
+          fenceSlot(slot)
         }
       }
 
@@ -153,7 +214,8 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
       assignment.replicas.length == 1 && assignment.replicas(0) == context.config.brokerId &&
       assignment.isr.length == 1 && assignment.isr(0) == context.config.brokerId &&
       registration != null && registration.epoch() == slot.brokerEpoch && !registration.fenced() &&
-      !registration.inControlledShutdown() && context.brokerEpochSupplier() == slot.brokerEpoch
+      !registration.inControlledShutdown() && context.brokerEpochSupplier() == slot.brokerEpoch &&
+      image.provenance().lastContainedOffset() >= slot.metadataOffset
   }
 
   def resign(identity: TopicIdPartition, epoch: Int, timeout: Duration,
@@ -174,9 +236,9 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
     } catch {
       case failure: Throwable => return CompletableFuture.failedFuture(failure)
     }
-    coordinator.thenCompose(_ => slot.flatMap(_.opened) match {
-      case Some(opened) => opened.closeAsync()
-      case None => CompletableFuture.completedFuture(null)
+    coordinator.thenCompose(_ => slot.flatMap(_.objectOpened) match {
+      case Some(opened) => objectWal.closePartition(opened)
+      case None => slot.flatMap(_.opened).map(_.closeAsync()).getOrElse(CompletableFuture.completedFuture(null))
     })
   }
   def beginDrain(): Unit = guard.synchronized {
@@ -186,10 +248,25 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
   }
   def shutdown(): CompletableFuture[Void] = { beginDrain(); CompletableFuture.completedFuture(null) }
   override def close(): Unit = beginDrain()
+  private def fenceSlot(slot: Slot): Unit = {
+    if (slot.objectWal) {
+      slot.ownerGate.synchronized {
+        slot.live = false
+        slot.objectOpened.foreach(_.fence())
+      }
+    } else {
+      slot.opened.foreach(_.fence())
+      slot.live = false
+    }
+  }
+
   private def revoke(slot: Slot): Unit = {
-    slot.live = false
-    slot.opened.foreach(_.fence())
+    fenceSlot(slot)
     for (log <- slot.log; opened <- slot.opened) log.removeStorage(slot.epoch, opened.storage())
+    for (log <- slot.log; opened <- slot.objectOpened) log.removeObjectStorage(slot.epoch, opened)
+    // A failed ready response or a new local epoch may revoke the slot without a later resignation callback.
+    // The Object route releases its source set only after the actual accepted operations have stopped.
+    slot.objectOpened.foreach(objectWal.closePartition)
     slot.lookup.foreach(slot.partition.removeLeaderEpochAwareOffsetLookup(slot.epoch, _))
     slot.partition.cancelLeaderEpochAwareOffsetLookup(slot.epoch)
     slot.result.completeExceptionally(new FencedLeaderEpochException("Nereus native owner was revoked"))
@@ -204,10 +281,13 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
     val listeners = subscriptions.get(identity)
     if (listeners != null) listeners.forEach(_.run())
   }
-  private final class Slot(val partition: Partition, val identity: TopicIdPartition, val epoch: Int, val brokerEpoch: Long) {
+  private final class Slot(val partition: Partition, val identity: TopicIdPartition, val epoch: Int,
+                           val brokerEpoch: Long, val metadataOffset: Long, val objectWal: Boolean) {
     @volatile var live = true
     val result = new CompletableFuture[Void]
+    val ownerGate = new Object
     var opened: Option[NereusKafkaOwnedProviderRuntime#Opened] = None
+    var objectOpened: Option[NereusKafkaObjectWalPartition] = None
     var log: Option[NereusUnifiedLog] = None
     var lookup: Option[NereusListOffsetsBridge] = None
   }

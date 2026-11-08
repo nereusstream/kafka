@@ -27,6 +27,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.server.config.NereusKafkaConfigs;
 import org.apache.kafka.snapshot.SnapshotPath;
 import org.apache.kafka.snapshot.Snapshots;
 import org.apache.kafka.test.TestUtils;
@@ -179,7 +180,8 @@ public class KafkaBookKeeperProcessRealTest {
             Path node = Files.createDirectory(destination.resolve(source.getFileName()));
             for (String name : List.of("server.log", "launcher.log", "controller.log", "format.log", "server.properties",
                     "implicit-format.log", "disabled-restart.log", "disabled.properties", "shutdown-threads.log",
-                    "foreign-scope.log", "foreign-scope.properties", "foreign-object.log", "foreign-object.properties")) {
+                    "foreign-scope.log", "foreign-scope.properties", "foreign-object.log", "foreign-object.properties",
+                    "unauthorized-vault.log", "unauthorized-vault.properties")) {
                 var file = source.resolve(name);
                 if (Files.isRegularFile(file)) Files.copy(file, node.resolve(name));
             }
@@ -218,7 +220,7 @@ public class KafkaBookKeeperProcessRealTest {
         return admin.describeTopics(List.of(topic)).allTopicNames().get(30, TimeUnit.SECONDS).get(topic).topicId();
     }
 
-    private static void assertRejectedTopic(Admin admin, NewTopic topic, Errors expected) {
+    public static void assertRejectedTopic(Admin admin, NewTopic topic, Errors expected) {
         var failure = assertThrows(ExecutionException.class,
                 () -> admin.createTopics(List.of(topic)).all().get(30, TimeUnit.SECONDS));
         assertEquals(expected, Errors.forException(failure.getCause()));
@@ -332,6 +334,14 @@ public class KafkaBookKeeperProcessRealTest {
             assertExit(1, log, "kafka.server.nereus.NereusKafka", foreign.toString());
             assertTrue(Files.readString(directory.resolve(log)).contains(
                     "native Kafka Object capability belongs to another Cell or provider configuration"));
+        }
+
+        public void assertRejectsUnqualifiedObjectWalToken(Path token) throws Exception {
+            Path rejected = withProperty("unauthorized-vault.properties",
+                    NereusKafkaConfigs.OBJECT_WAL_VAULT_TOKEN_FILE_CONFIG, token.toString());
+            String log = "unauthorized-vault.log";
+            assertExit(1, log, "kafka.server.nereus.NereusKafka", rejected.toString());
+            assertTrue(Files.readString(directory.resolve(log)).contains("Vault Transit rejected authorization"));
         }
 
         private Path withProperty(String file, String key, String value) throws Exception {

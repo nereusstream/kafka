@@ -160,7 +160,7 @@ public record NereusKafkaStorageConfig(
                         duration(config, NereusKafkaConfigs.SHUTDOWN_DRAIN_TIMEOUT_MS_CONFIG),
                         duration(config, NereusKafkaConfigs.SHUTDOWN_CHECKPOINT_TIMEOUT_MS_CONFIG)),
                 config.getBoolean(NereusKafkaConfigs.ENABLED_CONFIG)
-                                && profile(config).usesBookKeeper()
+                                && profile(config).requiresBookKeeper()
                         ? Optional.of(bookKeeper(config))
                         : Optional.empty());
     }
@@ -188,7 +188,7 @@ public record NereusKafkaStorageConfig(
             requirePresent(core.objectProvider(), NereusKafkaConfigs.OBJECT_PROVIDER_CONFIG);
             requirePresent(core.objectBucket(), NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
         }
-        if (core.profile().usesBookKeeper()) {
+        if (core.profile().requiresBookKeeper()) {
             requirePresent(
                     core.bookKeeperMetadataServiceUri(),
                     NereusKafkaConfigs.BOOKKEEPER_METADATA_SERVICE_URI_CONFIG);
@@ -445,6 +445,10 @@ public record NereusKafkaStorageConfig(
 
         public boolean usesBookKeeper() {
             return usesBookKeeper;
+        }
+
+        public boolean requiresBookKeeper() {
+            return usesBookKeeper || this == OBJECT_WAL_SYNC_OBJECT;
         }
 
         public boolean usesObjectStorage() {

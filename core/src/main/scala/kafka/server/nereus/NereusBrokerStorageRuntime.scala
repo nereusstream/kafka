@@ -30,7 +30,8 @@ import java.util.concurrent.{CompletableFuture, CompletionStage, TimeUnit}
 final class NereusBrokerStorageRuntime(context: BrokerStorageRuntimeContext, provider: NereusKafkaOwnedProviderRuntime)
   extends BrokerStorageRuntime {
   private val guard = new Object
-  private val partitions = new NereusListOffsetsLifecycle(context, provider)
+  private val objectWal = new NereusKafkaObjectWalBroker(context, provider)
+  private val partitions = new NereusListOffsetsLifecycle(context, provider, objectWal)
   private val append = new NereusBrokerStorageAppendExecutor(context.config.nereusKafkaStorageConfig.append(), context.config.brokerId)
   private val fetch = new NereusBrokerStorageFetchExecutor(context.config.nereusKafkaStorageConfig.fetch(), context.config.brokerId,
     partitions, context.scheduler.scheduledExecutorService())
@@ -38,7 +39,7 @@ final class NereusBrokerStorageRuntime(context: BrokerStorageRuntimeContext, pro
   private var replicaManager: ReplicaManager = _
   private var lifecycle: NereusTopicDeltaLifecycle = _
   private var closed = false
-  override def start(): CompletionStage[Void] = provider.start()
+  override def start(): CompletionStage[Void] = provider.start().thenRun(() => objectWal.start())
   override def unifiedLogFactory: UnifiedLogFactory = logs
   override def appendExecutor: Option[BrokerStorageAppendExecutor] = Some(append)
   override def fetchExecutor: Option[BrokerStorageFetchExecutor] = Some(fetch)
@@ -54,13 +55,14 @@ final class NereusBrokerStorageRuntime(context: BrokerStorageRuntimeContext, pro
   }
   override def beginDrain(reason: BrokerStorageDrainReason): CompletionStage[Void] = {
     guard.synchronized { closed = true }
-    partitions.beginDrain(); provider.fence(); append.close(); fetch.close()
+    partitions.beginDrain(); objectWal.fence(); provider.fence(); append.close(); fetch.close()
     provider.drainNativeSourceScans()
   }
   override def awaitDrained(timeout: Duration): CompletionStage[Void] =
     CompletableFuture.allOf(append.drained.toCompletableFuture, fetch.drained.toCompletableFuture).orTimeout(timeout.toMillis, TimeUnit.MILLISECONDS)
   override def close(): Unit = {
     beginDrain(BrokerStorageDrainReason.BrokerShutdown)
+    objectWal.close()
     provider.close()
   }
 }

@@ -66,7 +66,8 @@ class NereusProducerStateManagerTest {
                 List.of(Integer.MAX_VALUE, 0, 1, 2, 3),
                 batches.stream().map(value -> value.lastSeq()).toList());
         NereusProducerStateManager restored = fixture("restored");
-        restored.loadSharedState(sharedSnapshot(source));
+        var snapshot = sharedSnapshot(source);
+        restored.loadSharedState(snapshot.root(), snapshot.committedProducerState(), snapshot.transactionState());
         assertEquals(
                 source.activeProducers().get(91L).batchMetadata().stream()
                         .map(value -> value.lastOffset())
@@ -96,7 +97,8 @@ class NereusProducerStateManagerTest {
         assertEquals(11, source.collectAbortedTransactions(0, 3).get(0).producerId());
 
         NereusProducerStateManager restored = fixture("transaction-restored");
-        restored.loadSharedState(sharedSnapshot(source));
+        var snapshot = sharedSnapshot(source);
+        restored.loadSharedState(snapshot.root(), snapshot.committedProducerState(), snapshot.transactionState());
         assertEquals(source.collectAbortedTransactions(0, 3), restored.collectAbortedTransactions(0, 3));
         assertEquals(
                 source.activeProducers().get(11L).lastTimestamp(),

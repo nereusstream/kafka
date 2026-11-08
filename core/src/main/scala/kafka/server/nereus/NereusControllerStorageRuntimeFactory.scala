@@ -33,10 +33,11 @@ final class NereusControllerStorageRuntimeFactory extends ControllerStorageRunti
   override def create(context: ControllerStorageRuntimeContext): ControllerStorageRuntime = {
     if (!context.config.nereusKafkaStorageConfig.enabled()) return ControllerStorageRuntimeFactory.Disabled.create(context)
     val profile = context.config.nereusKafkaStorageConfig.core().profile()
-    if (!profile.usesBookKeeper()) {
+    if (!profile.requiresBookKeeper()) {
       throw new IllegalArgumentException("NSIP-1 native Controller has no admitted Object WAL authority")
     }
-    if (profile == NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT) {
+    if (profile == NereusKafkaStorageConfig.Profile.BOOKKEEPER_WAL_ASYNC_OBJECT ||
+        profile == NereusKafkaStorageConfig.Profile.OBJECT_WAL_SYNC_OBJECT) {
       NereusBookKeeperCapability.requireControllerObjectProfile(context.config)
     }
     new ControllerStorageRuntime {

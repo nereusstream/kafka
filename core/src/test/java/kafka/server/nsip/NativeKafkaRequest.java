@@ -35,9 +35,12 @@ public final class NativeKafkaRequest implements AutoCloseable {
     private final RequestHeader header;
 
     public NativeKafkaRequest(KafkaClusterTestKit cluster, int broker, AbstractRequest request) throws IOException {
+        this(cluster.brokers().get(broker).socketServer().boundPort(cluster.nodes().brokerListenerName()), request);
+    }
+
+    public NativeKafkaRequest(int port, AbstractRequest request) throws IOException {
         header = new RequestHeader(request.apiKey(), request.version(), "nsip-native", 1);
-        socket = new Socket("127.0.0.1",
-                cluster.brokers().get(broker).socketServer().boundPort(cluster.nodes().brokerListenerName()));
+        socket = new Socket("127.0.0.1", port);
         try {
             var bytes = request.serializeWithHeader(header);
             var output = new DataOutputStream(socket.getOutputStream());

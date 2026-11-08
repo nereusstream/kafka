@@ -62,6 +62,9 @@ public final class NereusKafkaConfigs {
             "nereus.kafka.storage.object.path.style.access";
     public static final String OBJECT_CAPABILITY_FILE_CONFIG = "nereus.kafka.storage.object.capability.file";
     public static final String OBJECT_CREDENTIALS_FILE_CONFIG = "nereus.kafka.storage.object.credentials.file";
+    public static final String OBJECT_WAL_VAULT_ENDPOINT_CONFIG = "nereus.kafka.storage.object.wal.vault.endpoint";
+    public static final String OBJECT_WAL_VAULT_KEY_CONFIG = "nereus.kafka.storage.object.wal.vault.key";
+    public static final String OBJECT_WAL_VAULT_TOKEN_FILE_CONFIG = "nereus.kafka.storage.object.wal.vault.token.file";
     public static final String BOOKKEEPER_CAPABILITY_FILE_CONFIG = "nereus.kafka.bookkeeper.capability.file";
     public static final String BOOKKEEPER_METADATA_SERVICE_URI_CONFIG =
             "nereus.kafka.storage.bookkeeper.metadata.service.uri";
@@ -349,6 +352,12 @@ public final class NereusKafkaConfigs {
                     "Path to the canonical admitted V2 Object provider profile for this Kafka Cell.")
             .define(OBJECT_CREDENTIALS_FILE_CONFIG, STRING, null, HIGH,
                     "Path to the AWS credentials file for this Kafka Cell's admitted credential scope.")
+            .define(OBJECT_WAL_VAULT_ENDPOINT_CONFIG, STRING, null, HIGH,
+                    "Vault Transit endpoint for the exact Object WAL wrapping key in the admitted profile.")
+            .define(OBJECT_WAL_VAULT_KEY_CONFIG, STRING, null, HIGH,
+                    "Object WAL wrapping key identity, in vault-transit://mount/keys/key form.")
+            .define(OBJECT_WAL_VAULT_TOKEN_FILE_CONFIG, STRING, null, HIGH,
+                    "Path to the Vault credential file for the admitted Object WAL wrapping key.")
             .define(BOOKKEEPER_CAPABILITY_FILE_CONFIG, STRING, null, HIGH,
                     "Path to the admitted V2 BookKeeper capability descriptor, required by the native BK runtime.")
             .define(BOOKKEEPER_METADATA_SERVICE_URI_CONFIG, STRING, null, HIGH,
