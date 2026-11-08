@@ -160,7 +160,7 @@ public class KafkaObjectWalAdapterRealTest {
                        OxiaPhysicalMetadataNamespaceV2 namespace) { }
 
     record NativeTerminal(OxiaCanonicalControlMetadataStore metadata, WalRunReference ref, WalRunRootRecord root,
-                          long writerEpoch) {
+                          long writerEpoch, int kafkaLeaderEpoch) {
         static NativeTerminal capture(Provisioned fixture, AsyncOxiaClient control, Uuid topicId,
                 String name, int brokerId) throws Exception {
             var topic = new KafkaTopicIncarnationIdentity(new KafkaTopicId(
@@ -177,7 +177,7 @@ public class KafkaObjectWalAdapterRealTest {
             var root = WalRunControlCodec.decodeRoot(metadata.get(ref.rootKey()).orElseThrow());
             var owner = new NereusKafkaObjectWalOwners(shard, exact, timeout).creator(root);
             assertEquals(brokerId, owner.brokerId());
-            return new NativeTerminal(metadata, ref, root, owner.ownerEpoch());
+            return new NativeTerminal(metadata, ref, root, owner.ownerEpoch(), owner.kafkaLeaderEpoch());
         }
 
         String checkpointPrefix() {

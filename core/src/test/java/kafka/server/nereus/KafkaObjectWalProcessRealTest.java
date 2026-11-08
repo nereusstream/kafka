@@ -132,6 +132,7 @@ public class KafkaObjectWalProcessRealTest {
             txnConsumerClient.put("group.id", TXN_GROUP);
             var after = KafkaBookKeeperProcessRealTest.client(ports[1]);
             Uuid topicId;
+            int firstKafkaEpoch;
             try (var admin = Admin.create(client);
                      var producer = new KafkaProducer<String, String>(producerClient);
                      var txnGroup = new KafkaConsumer<String, String>(txnConsumerClient)) {
@@ -143,6 +144,8 @@ public class KafkaObjectWalProcessRealTest {
                 topicId = created.topicId(OBJECT.topic()).get(30, TimeUnit.SECONDS);
                 appendWithLostPut(client, admin, minio, (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG),
                         fixture, control, topicId);
+                firstKafkaEpoch = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(
+                        fixture, control, topicId, OBJECT.topic(), 0).kafkaLeaderEpoch();
                 var replay = idempotentAppend(ports[0]);
                 assertProduceOffset(ports[0], replay, 1);
                 producer.initTransactions();
@@ -150,7 +153,7 @@ public class KafkaObjectWalProcessRealTest {
                 assertEquals(2, producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "committed"))
                         .get(30, TimeUnit.SECONDS).offset());
                 producer.sendOffsetsToTransaction(Map.of(OBJECT, new OffsetAndMetadata(4)), txnGroup.groupMetadata());
-                producer.commitTransaction();
+                KafkaObjectProtocolRealScenario.commitAndWake(ports[0], topicId, producer);
                 producer.beginTransaction();
                 assertEquals(4, producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "aborted"))
                         .get(30, TimeUnit.SECONDS).offset());
@@ -221,14 +224,18 @@ public class KafkaObjectWalProcessRealTest {
                         control, topicId);
                 var rolled = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
                 assertEquals(oldRun.writerEpoch(), rolled.writerEpoch());
+                assertEquals(oldRun.kafkaLeaderEpoch(), rolled.kafkaLeaderEpoch());
                 assertEquals(oldRun.ref().shardRunEpoch() + 1, rolled.ref().shardRunEpoch());
                 assertEquals(oldRun.ref(), rolled.root().predecessor().orElseThrow().root());
                 oldRun.requireSealedByOriginalWriter(minio, (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG), boundary);
                 assertOffsets(finalAdmin, boundary + 1, boundary + 1);
+                KafkaObjectProtocolRealScenario.assertRecoveredEpochs(
+                        ports[0], firstKafkaEpoch, terminal.kafkaLeaderEpoch(), rolled.kafkaLeaderEpoch(), boundary + 1);
                 assertEquals(List.of("run-" + (boundary - 1), "run-" + boundary),
                         readFrom(client, OBJECT, boundary - 1, 2));
                 assertEquals(List.of("before-0", "before-1", "committed", "aborted", "after", "after-terminal"),
                         readUncommitted(client, OBJECT, 6));
+                KafkaObjectProtocolRealScenario.assertAckZero(ports[0], finalAdmin, boundary + 2);
             }
         }
     }
@@ -258,8 +265,12 @@ public class KafkaObjectWalProcessRealTest {
             }
         }, 30_000, "The Controller did not publish the Object WAL topic");
         assertOffsets(admin, 0, 0);
+        var ackOne = new Properties();
+        ackOne.putAll(client);
+        ackOne.setProperty("acks", "1");
+        ackOne.setProperty("enable.idempotence", "false");
         try (var relay = KafkaObjectFaultRelay.lostPut(bucket, prefix);
-                 var producer = new KafkaProducer<String, String>(client)) {
+                 var producer = new KafkaProducer<String, String>(ackOne)) {
             relay.arm("first-put-response-lost");
             var produce = producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "before-0"));
             var persistedVersion = relay.awaitAppliedPut();

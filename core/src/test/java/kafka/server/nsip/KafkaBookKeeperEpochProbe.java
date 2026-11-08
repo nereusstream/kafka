@@ -30,12 +30,17 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-final class KafkaBookKeeperEpochProbe {
+public final class KafkaBookKeeperEpochProbe {
     private KafkaBookKeeperEpochProbe() { }
 
     static void assertEndOffset(KafkaClusterTestKit cluster, int broker, TopicPartition partition,
                                 int currentEpoch, int epoch, long endOffset) throws Exception {
-        var result = epochEnd(cluster, broker, partition, currentEpoch, epoch);
+        assertEndOffset(port(cluster, broker), partition, currentEpoch, epoch, endOffset);
+    }
+
+    public static void assertEndOffset(int port, TopicPartition partition, int currentEpoch, int epoch, long endOffset)
+            throws Exception {
+        var result = epochEnd(port, partition, currentEpoch, epoch);
         assertEquals(Errors.NONE.code(), result.errorCode());
         assertEquals(epoch, result.leaderEpoch());
         assertEquals(endOffset, result.endOffset());
@@ -43,19 +48,27 @@ final class KafkaBookKeeperEpochProbe {
 
     static void assertFenced(KafkaClusterTestKit cluster, int broker, TopicPartition partition, int staleEpoch)
             throws Exception {
-        var result = epochEnd(cluster, broker, partition, staleEpoch, staleEpoch);
+        assertFenced(port(cluster, broker), partition, staleEpoch);
+    }
+
+    public static void assertFenced(int port, TopicPartition partition, int staleEpoch) throws Exception {
+        var result = epochEnd(port, partition, staleEpoch, staleEpoch);
         assertEquals(Errors.FENCED_LEADER_EPOCH.code(), result.errorCode());
         assertEquals(OffsetsForLeaderEpochResponse.UNDEFINED_EPOCH_OFFSET, result.endOffset());
     }
 
-    private static EpochEndOffset epochEnd(KafkaClusterTestKit cluster, int broker, TopicPartition partition,
-                                           int currentEpoch, int epoch) throws Exception {
+    private static int port(KafkaClusterTestKit cluster, int broker) {
+        return cluster.brokers().get(broker).socketServer().boundPort(cluster.nodes().brokerListenerName());
+    }
+
+    private static EpochEndOffset epochEnd(int port, TopicPartition partition, int currentEpoch, int epoch)
+            throws Exception {
         var topics = new OffsetForLeaderTopicCollection();
         topics.add(new OffsetForLeaderTopic().setTopic(partition.topic())
                 .setPartitions(List.of(new OffsetForLeaderPartition().setPartition(partition.partition())
                         .setCurrentLeaderEpoch(currentEpoch).setLeaderEpoch(epoch))));
         var request = OffsetsForLeaderEpochRequest.Builder.forConsumer(topics).build();
-        try (var wire = new NativeKafkaRequest(cluster, broker, request)) {
+        try (var wire = new NativeKafkaRequest(port, request)) {
             var result = (OffsetsForLeaderEpochResponse) wire.receive(30_000);
             var topic = result.data().topics().iterator().next();
             assertEquals(partition.topic(), topic.topic());

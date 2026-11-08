@@ -196,7 +196,7 @@ public class KafkaBookKeeperAckRealTest {
         }
     }
 
-    private static FetchRequest delayedFetch(TopicPartition partition, Uuid topicId, long offset,
+    static FetchRequest delayedFetch(TopicPartition partition, Uuid topicId, long offset,
             IsolationLevel isolation, int maxWait) {
         short version = 16;
         return FetchRequest.Builder.forConsumer(version, maxWait, 1,
@@ -205,7 +205,7 @@ public class KafkaBookKeeperAckRealTest {
                 .isolationLevel(isolation).build(version);
     }
 
-    private static void assertFetchedValues(FetchResponseData.PartitionData observed,
+    static void assertFetchedValues(FetchResponseData.PartitionData observed,
             List<String> expected) {
         assertEquals(Errors.NONE, Errors.forCode(observed.errorCode()));
         var actual = new ArrayList<String>();
@@ -462,7 +462,7 @@ public class KafkaBookKeeperAckRealTest {
         }
     }
 
-    private static ProduceRequest produce(short acks, String value) {
+    static ProduceRequest produce(short acks, String value) {
         return produce(acks, MemoryRecords.withRecords(Compression.NONE,
                 new SimpleRecord(value.getBytes(StandardCharsets.UTF_8))));
     }
