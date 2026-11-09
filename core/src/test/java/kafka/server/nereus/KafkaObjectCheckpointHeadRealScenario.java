@@ -38,6 +38,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
@@ -64,7 +65,8 @@ final class KafkaObjectCheckpointHeadRealScenario implements NereusKafkaOwnedPro
     KafkaObjectWalAdapterRealTest.NativeTerminal verify(KafkaClusterTestKit cluster, Properties client,
             AsyncOxiaClient control,
             KafkaObjectWalAdapterRealTest.Provisioned fixture, Uuid topicId,
-            KafkaObjectWalAuthorizationRealTest.AuthorizationCut authorizationCut) throws Exception {
+            KafkaObjectWalAuthorizationRealTest.AuthorizationCut authorizationCut,
+            Consumer<KafkaObjectWalAdapterRealTest.NativeTerminal> dropSelectedVersion) throws Exception {
         try (var producer = new KafkaProducer<String, String>(client)) {
             assertEquals(2, producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "after-recovery"))
                     .get(30, TimeUnit.SECONDS).offset());
@@ -90,6 +92,7 @@ final class KafkaObjectCheckpointHeadRealScenario implements NereusKafkaOwnedPro
             selected.deliverRead().complete(null);
             shutdown.get(30, TimeUnit.SECONDS);
             missing.remove(control);
+            dropSelectedVersion.accept(run);
             missing.dispatch().complete(null);
             assertEquals(1, terminalWrites.get());
             assertEquals(exact, run.metadata().getVersioned(relative).orElseThrow());

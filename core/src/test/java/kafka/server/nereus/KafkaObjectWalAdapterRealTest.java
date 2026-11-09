@@ -207,6 +207,26 @@ public class KafkaObjectWalAdapterRealTest {
                     minio.headObject(request -> request.bucket(bucket).key(head.checkpointObjectKey())).contentLength());
             return head.checkpointObjectKey();
         }
+
+        RemovedProtocolObject removeSelectedVersion(S3Client minio, String bucket, long end) {
+            String key = requireSealedByOriginalWriter(minio, bucket, end);
+            var selected = minio.getObjectAsBytes(request -> request.bucket(bucket).key(key));
+            String version = selected.response().versionId();
+            assertTrue(version != null && !version.isBlank());
+            minio.deleteObject(request -> request.bucket(bucket).key(key).versionId(version));
+            var remaining = minio.listObjectVersions(request -> request.bucket(bucket).prefix(key));
+            assertFalse(remaining.isTruncated());
+            assertTrue(remaining.versions().stream().noneMatch(candidate -> candidate.key().equals(key)));
+            return new RemovedProtocolObject(key, version, CanonicalBytes.copyOf(selected.asByteArray()));
+        }
+    }
+
+    record RemovedProtocolObject(String key, String version, CanonicalBytes body) {
+        void requireExactRecreation(S3Client minio, String bucket) {
+            var current = minio.getObjectAsBytes(request -> request.bucket(bucket).key(key));
+            assertTrue(current.response().versionId() != null && !version.equals(current.response().versionId()));
+            assertEquals(body, CanonicalBytes.copyOf(current.asByteArray()));
+        }
     }
 
     static Provisioned provision(Path work, S3Client client, AsyncOxiaClient control, URI endpoint,
