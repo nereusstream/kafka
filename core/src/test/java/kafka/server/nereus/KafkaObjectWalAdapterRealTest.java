@@ -137,15 +137,16 @@ public class KafkaObjectWalAdapterRealTest {
             var roots = new NereusKafkaObjectWalRoot(config, profile);
             var authority = new KafkaObjectAuthorizationV1(metadata, shard.id(),
                     new KafkaObjectAuthorizationV1.Bounds(64, 16, 16L << 20, 32));
+            CanonicalBytes sourceVersion;
             try (var provider = NereusKafkaObjectProvider.open(config, cell, namespace);
                  var kms = NereusKafkaObjectWalKms.open(config, profile)) {
                 var runs = new NereusKafkaObjectWalRuns(shard, metadata, exact, provider, kms, roots,
                         Duration.ofSeconds(10));
-                verifyWrite(runs, metadata, authority, fence);
+                sourceVersion = verifyWrite(runs, metadata, authority, fence, provider);
                 var previous = runs.current().orElseThrow().root().predecessor().orElseThrow().root();
                 var oldKey = new RunKeyCacheIdentity(previous.shardId(), previous.shardRunEpoch());
                 assertThrows(IllegalStateException.class, () -> kms.session().beginNewRunKey(oldKey));
-                verifyColdRead(runs, metadata, authority, fence);
+                verifyColdRead(runs, metadata, authority, fence, sourceVersion, provider);
                 assertThrows(IllegalStateException.class, () -> kms.session().beginNewRunKey(oldKey));
                 var otherFence = new KafkaPartitionFenceV1(binding, topic, 1, 1, epoch, 1, 0);
                 KafkaObjectRevokedAppendRealScenario.verify(otherFence, fixture, control, exact, provider, kms);
@@ -155,7 +156,7 @@ public class KafkaObjectWalAdapterRealTest {
                  var kms = NereusKafkaObjectWalKms.open(config, profile)) {
                 var runs = new NereusKafkaObjectWalRuns(shard, metadata, exact, provider, kms, roots,
                         Duration.ofSeconds(10));
-                verifyColdRead(runs, metadata, authority, fence);
+                verifyColdRead(runs, metadata, authority, fence, sourceVersion, provider);
                 assertEquals(1, kms.session().unwrapCalls());
                 verifyArmedLatePut(runs, exact, shard);
                 verifyRecoveredPhysicalSeal(runs, metadata, authority, fence, kms);
@@ -274,13 +275,15 @@ public class KafkaObjectWalAdapterRealTest {
         return new Provisioned(Map.copyOf(props), config, profile, namespace);
     }
 
-    private static void verifyWrite(NereusKafkaObjectWalRuns runs, OxiaCanonicalControlMetadataStore metadata,
-            KafkaObjectAuthorizationV1 authority, KafkaPartitionFenceV1 fence) throws Exception {
+    private static CanonicalBytes verifyWrite(NereusKafkaObjectWalRuns runs, OxiaCanonicalControlMetadataStore metadata,
+            KafkaObjectAuthorizationV1 authority, KafkaPartitionFenceV1 fence, NereusKafkaObjectProvider provider)
+            throws Exception {
         var nativeOwner = election(fence);
         runs.admitNativeOwner(nativeOwner);
         var selected = runs.selectOrCreateGenesis(System.currentTimeMillis(), false, nativeOwner);
         assertEquals(nativeOwner, runs.creator(selected.root()));
         NereusKafkaObjectWalRuns.Selected successor;
+        CanonicalBytes sourceVersion;
         try (var session = selected.freshSession().orElseThrow()) {
             var coordinator = KafkaCoherentCommitCoordinatorV1.bootstrapObject(fence, 0, ignored -> { });
             authority.open(fence, 0, Optional.empty());
@@ -311,22 +314,39 @@ public class KafkaObjectWalAdapterRealTest {
                         payload.get(actual);
                         assertEquals(canonical, CanonicalBytes.copyOf(actual));
                     });
+            var verification = KafkaObjectNativeVerificationV1.context(selected.root(), fence);
+            var original = provider.readOriginal(grant.object(), Optional.empty());
+            assertThrows(IllegalStateException.class, () ->
+                    KafkaObjectNativeExtentV1.capture(session, verification, grant, original.value(), (frame, payload) -> {
+                        throw new AssertionError("open Object WAL source exposed a materialization frame");
+                    }));
             var sealed = writer.sealDrained();
             assertEquals(selected.reference(), sealed.predecessor().root());
             assertTrue(sealed.predecessor().terminalProtocolCheckpoint().isPresent());
             assertTrue(sealed.history().head().closed());
             assertEquals(1, authority.checkpoint(sealed.history()).orElseThrow()
                     .vector().recoveryCoveredThrough());
+            byte[] altered = original.value().toByteArray();
+            altered[altered.length - 1] ^= 1;
+            assertThrows(IOException.class, () -> KafkaObjectNativeExtentV1.capture(session, verification, grant,
+                    CanonicalBytes.copyOf(altered), (frame, payload) -> {
+                        throw new AssertionError("altered Object WAL source exposed a materialization frame");
+                    }));
+            KafkaObjectNativeExtentV1.capture(session, verification, grant, original.value(),
+                    (frame, payload) -> assertEquals(canonical, copyFrame(payload)));
+            sourceVersion = original.immutableVersionToken().orElseThrow();
             successor = verifySuccessor(runs, metadata, authority, fence, session, sealed);
         }
         var discovered = runs.current().orElseThrow();
         assertEquals(successor.reference(), discovered.reference());
         assertEquals(successor.root(), discovered.root());
         assertTrue(discovered.freshSession().isEmpty());
+        return sourceVersion;
     }
 
     private static void verifyColdRead(NereusKafkaObjectWalRuns runs, OxiaCanonicalControlMetadataStore metadata,
-            KafkaObjectAuthorizationV1 authority, KafkaPartitionFenceV1 fence) throws Exception {
+            KafkaObjectAuthorizationV1 authority, KafkaPartitionFenceV1 fence, CanonicalBytes sourceVersion,
+            NereusKafkaObjectProvider provider) throws Exception {
         var successor = runs.current().orElseThrow();
         var previous = successor.root().predecessor().orElseThrow().root();
         var root = runs.read(previous).root();
@@ -345,7 +365,18 @@ public class KafkaObjectWalAdapterRealTest {
                         payload.get(actual);
                         assertEquals(nativeBytes(), CanonicalBytes.copyOf(actual));
                     });
+            var original = provider.readVersion(grant.object(), sourceVersion);
+            KafkaObjectNativeExtentV1.capture(historical,
+                    KafkaObjectNativeVerificationV1.context(root, fence), grant, original.value(),
+                    (frame, payload) -> assertEquals(nativeBytes(), copyFrame(payload)));
+            assertEquals(Optional.of(sourceVersion), original.immutableVersionToken());
         }
+    }
+
+    private static CanonicalBytes copyFrame(ByteBuffer payload) {
+        byte[] actual = new byte[payload.remaining()];
+        payload.get(actual);
+        return CanonicalBytes.copyOf(actual);
     }
 
     static CanonicalBytes nativeBytes() {

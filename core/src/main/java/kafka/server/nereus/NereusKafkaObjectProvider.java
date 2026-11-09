@@ -237,9 +237,14 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
 
     VerifiedObjectConsumption<CanonicalBytes> readVersion(ObjectIdentity identity, CanonicalBytes version)
             throws IOException {
+        return readOriginal(identity, Optional.of(version));
+    }
+
+    VerifiedObjectConsumption<CanonicalBytes> readOriginal(ObjectIdentity identity, Optional<CanonicalBytes> version)
+            throws IOException {
         int length = Math.toIntExact(identity.bodyLength());
         try {
-            return session.consumeVerifiedObject(identity, Optional.of(version),
+            return session.consumeVerifiedObject(identity, version,
                     input -> CanonicalBytes.copyOf(input.readNBytes(length)));
         } catch (VerifiedReadCleanupException failure) {
             var drain = new CompletableFuture<Void>();
