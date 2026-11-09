@@ -154,11 +154,7 @@ public class KafkaObjectWalProcessRealTest {
                 KafkaObjectNativeCompactionRealScenario.seed(admin, client);
                 cold.start();
                 KafkaBookKeeperProcessRealTest.waitForBroker(admin, 1);
-                var destination = Optional.of(new NewPartitionReassignment(List.of(1)));
-                admin.alterPartitionReassignments(Map.of(OBJECT, destination, BK, destination,
-                                OFFSETS, destination, TRANSACTIONS, destination,
-                                KafkaObjectNativeCompactionRealScenario.COMPACT, destination))
-                        .all().get(30, TimeUnit.SECONDS);
+                reassignForColdRecovery(admin);
                 assertEquals(1, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 0));
                 awaitBookKeeperOwners(admin);
                 original.stop();
@@ -231,6 +227,14 @@ public class KafkaObjectWalProcessRealTest {
                         (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG));
             }
         }
+    }
+
+    private static void reassignForColdRecovery(Admin admin) throws Exception {
+        var destination = Optional.of(new NewPartitionReassignment(List.of(1)));
+        admin.alterPartitionReassignments(Map.of(OBJECT, destination, BK, destination,
+                        OFFSETS, destination, TRANSACTIONS, destination,
+                        KafkaObjectNativeCompactionRealScenario.COMPACT, destination))
+                .all().get(30, TimeUnit.SECONDS);
     }
 
     private static void verifyWireExits(Properties client, Admin finalAdmin, int port, Uuid topicId,
