@@ -115,7 +115,9 @@ public class KafkaObjectWalAuthorizationRealTest {
                 client.setProperty("bootstrap.servers", cluster.bootstrapServers());
                 var topicId = verifyAuthorizationCut(client, control, fixture, cut);
                 verifyRevocationAfterExactAuthorization(cluster, client, control, fixture, topicId, cut);
-                terminal.verify(cluster, client, minio, control, fixture, topicId);
+                var closed = terminal.verify(cluster, client, control, fixture, topicId);
+                var bucket = (String) fixture.settings().get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
+                closed.requireSealedByOriginalWriter(minio, bucket, 3);
                 cluster.fatalFaultHandler().maybeRethrowFirstException();
                 cluster.nonFatalFaultHandler().maybeRethrowFirstException();
             }

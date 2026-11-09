@@ -24,12 +24,10 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
-import org.apache.kafka.server.config.NereusKafkaConfigs;
 
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaProtocolCheckpointHeadCodecV1;
 import com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaProtocolCheckpointHeadStateV1;
-import com.nereusstream.storage.object.control.WalRunControlKeys;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
@@ -44,7 +42,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
-import software.amazon.awssdk.services.s3.S3Client;
 
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.OBJECT;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.assertOffsets;
@@ -64,15 +61,15 @@ final class KafkaObjectCheckpointHeadRealScenario implements NereusKafkaOwnedPro
                        CompletableFuture<Observation> applied, CompletableFuture<Observation> reread,
                        CompletableFuture<Void> loseReply, CompletableFuture<Void> deliverRead) { }
 
-    void verify(KafkaClusterTestKit cluster, Properties client, S3Client minio, AsyncOxiaClient control,
+    KafkaObjectWalAdapterRealTest.NativeTerminal verify(KafkaClusterTestKit cluster, Properties client,
+            AsyncOxiaClient control,
             KafkaObjectWalAdapterRealTest.Provisioned fixture, Uuid topicId) throws Exception {
         try (var producer = new KafkaProducer<String, String>(client)) {
             assertEquals(2, producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "after-recovery"))
                     .get(30, TimeUnit.SECONDS).offset());
         }
         var run = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 1);
-        var ref = run.ref();
-        String relative = WalRunControlKeys.kafkaProtocolCheckpointHeadKey(ref.shardId(), ref.shardRunEpoch());
+        String relative = run.checkpointHeadKey();
         String key = "/nereus-kafka-object-wal/" + fixture.profile().protocolCellSha256().toHex() + "/" + relative;
         assertTrue(run.metadata().get(relative).isEmpty());
         var selected = new Cut(run, key, new CompletableFuture<>(), new CompletableFuture<>(),
@@ -91,13 +88,12 @@ final class KafkaObjectCheckpointHeadRealScenario implements NereusKafkaOwnedPro
             shutdown.get(30, TimeUnit.SECONDS);
             assertEquals(1, terminalWrites.get());
             assertEquals(exact, run.metadata().getVersioned(relative).orElseThrow());
-            var bucket = (String) fixture.settings().get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
-            run.requireSealedByOriginalWriter(minio, bucket, 3);
             assertEquals(0, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 1));
             assertEquals(List.of("authorized", "authorized-before-revocation", "after-recovery"),
                     readUncommitted(client, OBJECT, 3));
             assertOffsets(admin, 3, 3);
             assertEquals(exact, run.metadata().getVersioned(relative).orElseThrow());
+            return run;
         } finally {
             selected.loseReply().complete(null);
             selected.deliverRead().complete(null);

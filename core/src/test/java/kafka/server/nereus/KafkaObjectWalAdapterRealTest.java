@@ -186,8 +186,12 @@ public class KafkaObjectWalAdapterRealTest {
             return KafkaObjectNativeAppendV1.checkpointPrefix(root);
         }
 
+        String checkpointHeadKey() {
+            return WalRunControlKeys.kafkaProtocolCheckpointHeadKey(ref.shardId(), ref.shardRunEpoch());
+        }
+
         String requireSealedByOriginalWriter(S3Client minio, String bucket, long end) {
-            var key = WalRunControlKeys.kafkaProtocolCheckpointHeadKey(ref.shardId(), ref.shardRunEpoch());
+            var key = checkpointHeadKey();
             var head = KafkaProtocolCheckpointHeadCodecV1.decode(checkpointPrefix(),
                     ref.rootSha256(), metadata.get(key).orElseThrow());
             assertEquals(KafkaProtocolCheckpointHeadStateV1.TERMINAL, head.state());
