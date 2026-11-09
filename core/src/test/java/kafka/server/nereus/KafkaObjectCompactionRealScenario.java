@@ -178,7 +178,7 @@ final class KafkaObjectCompactionRealScenario {
         try (var wire = new NativeKafkaRequest(route.port(), request)) {
             var response = (ProduceResponse) wire.receive(30_000);
             var data = response.data().responses().iterator().next().partitionResponses().get(0);
-            assertEquals(Errors.NONE, Errors.forCode(data.errorCode()));
+            assertEquals(Errors.NONE, Errors.forCode(data.errorCode()), data.errorMessage());
             assertEquals(offset, data.baseOffset());
         }
     }

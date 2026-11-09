@@ -19,6 +19,7 @@ package kafka.server.nereus;
 import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
 
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -84,6 +85,8 @@ public final class KafkaBookKeeperInternalCompactionRealScenario {
                             .configs(Map.of("cleanup.policy", "compact", "min.cleanable.dirty.ratio", "0.0"))).toList());
                     created.all().get(30, TimeUnit.SECONDS);
                     var userTopicId = created.topicId(USER).get(30, TimeUnit.SECONDS);
+                    assertEquals(0L, admin.listOffsets(Map.of(USER_PARTITION, OffsetSpec.latest()))
+                            .partitionResult(USER_PARTITION).get(30, TimeUnit.SECONDS).offset());
                     var original = KafkaObjectCompactionRealScenario.seedExistingTransactions(
                             brokerPort(cluster, 0), USER_PARTITION, userTopicId, client);
                     produceUser(client, state.opened(USER, 0));
