@@ -17,6 +17,8 @@
 
 package kafka.server.nereus;
 
+import org.apache.kafka.common.errors.FencedLeaderEpochException;
+
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1;
 import com.nereusstream.metadata.spi.retention.ExactMetadataTransactionStoreV1.MutationOutcome;
@@ -65,9 +67,9 @@ final class NereusKafkaObjectWalOwners {
 
     void requireCurrent(KafkaOwnerIdentityV1 owner) throws Exception {
         var actual = await(metadata.read(shard.cellRoot() + "/native-owner/" + shard.id()))
-                .map(value -> value.canonicalStoredBytes());
-        if (!actual.equals(Optional.of(encode(owner)))) {
-            throw new IllegalStateException("native Object WAL election has been superseded");
+                .orElseThrow(() -> new IllegalStateException("native Object WAL election is absent"));
+        if (!actual.canonicalStoredBytes().equals(encode(owner))) {
+            throw new FencedLeaderEpochException("native Object WAL election has been superseded");
         }
     }
 

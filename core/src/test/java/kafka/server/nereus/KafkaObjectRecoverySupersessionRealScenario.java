@@ -98,11 +98,15 @@ final class KafkaObjectRecoverySupersessionRealScenario implements NereusKafkaOw
                 var successor = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(
                         fixture, control, topicId, PARTITION.topic(), 0);
                 assertEquals(root.ref(), successor.root().predecessor().orElseThrow().root());
+                var exactPhysical = root.metadata().getVersioned(root.physicalCheckpointHeadKey()).orElseThrow();
+                var exactProtocol = root.metadata().getVersioned(root.checkpointHeadKey()).orElseThrow();
                 held.release().complete(null);
                 waitForCondition(() -> cluster.brokers().get(1).metadataCache().getImage().topics()
                         .getTopic(topicId).partitions().get(0).leader == 0,
                         "The superseded Broker did not process the newer Controller assignment");
                 assertFalse(writable(cluster, 1, oldEpoch));
+                assertEquals(Optional.of(exactPhysical), root.metadata().getVersioned(root.physicalCheckpointHeadKey()));
+                assertEquals(Optional.of(exactProtocol), root.metadata().getVersioned(root.checkpointHeadKey()));
                 assertEquals(List.of("before", "after"), readUncommitted(client, PARTITION, 2));
                 cluster.nonFatalFaultHandler().maybeRethrowFirstException();
                 admin.deleteTopics(List.of(PARTITION.topic())).all().get(30, TimeUnit.SECONDS);

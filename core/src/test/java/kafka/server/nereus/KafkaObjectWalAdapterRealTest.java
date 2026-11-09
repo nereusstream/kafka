@@ -197,8 +197,12 @@ public class KafkaObjectWalAdapterRealTest {
         }
 
         Optional<String> physicalPageKey() {
-            return metadata.get(WalRunControlKeys.checkpointHeadKey(ref.shardId(), ref.shardRunEpoch()))
+            return metadata.get(physicalCheckpointHeadKey())
                     .flatMap(value -> WalRunControlCodec.decodeCheckpointHead(value).pageKey());
+        }
+
+        String physicalCheckpointHeadKey() {
+            return WalRunControlKeys.checkpointHeadKey(ref.shardId(), ref.shardRunEpoch());
         }
 
         String requireSealedByOriginalWriter(S3Client minio, String bucket, long end) {

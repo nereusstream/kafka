@@ -279,13 +279,18 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
             var execution = KafkaNativePartitionOwnerAuthorityV1.protocolOwnerFenceExecutor(
                     (actual, callback) -> {
                         if (!actual.equals(fence)) throw new FencedLeaderEpochException("wrong Object WAL election");
-                        return whileCurrentIo(callback::execute);
+                        return whileCurrentIo(() -> {
+                            runs.requireNativeOwner(owner);
+                            return callback.execute();
+                        });
                     }, fence, KafkaObjectNativeAppendV1.runBinding(root, origin), root.protocolCellIdentity(),
                     selected.reference(), verification);
             var restored = OwnerOpenRecoveryCoordinator.recoverUnderDurableFence(execution, root.protocolCellIdentity(),
                     selected.reference(), root, metadata, runs.openProvider(root), kms.session(), lineage, protocol);
             ownLive(restored, origin);
+            runs.requireNativeOwner(owner);
             var head = restored.checkpointRecoveredPhysicalRows(metadata, owner.ownerEpoch());
+            runs.requireNativeOwner(owner);
             var sealed = KafkaObjectRecoveredProtocolClosureV1.seal(
                     restored, metadata, head, protocol.result(), owner.ownerEpoch());
             var recovered = protocol.result();
@@ -402,7 +407,7 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
         private <T> T whileCurrentIo(Callable<T> callback) throws IOException {
             try {
                 return assignment.whileCurrent(callback);
-            } catch (IOException failure) {
+            } catch (IOException | FencedLeaderEpochException failure) {
                 throw failure;
             } catch (Exception failure) {
                 throw new IOException("native Object WAL election changed during recovery", failure);

@@ -81,6 +81,10 @@ final class NereusKafkaObjectWalRuns {
         owners.admit(owner);
     }
 
+    void requireNativeOwner(KafkaOwnerIdentityV1 owner) throws Exception {
+        owners.requireCurrent(owner);
+    }
+
     KafkaOwnerIdentityV1 creator(WalRunRootRecord root) throws Exception {
         return owners.creator(root);
     }
