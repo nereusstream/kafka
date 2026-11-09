@@ -188,7 +188,9 @@ public final class NereusKafkaObjectWalPartition {
     }
 
     synchronized boolean compactionReady() {
-        return !fenced && nativeReady && compaction != null && !compaction.settled();
+        if (fenced || !nativeReady || compaction == null || compaction.settled()) return false;
+        var locators = coordinator.captureObject().activeTail().locators();
+        return !locators.isEmpty() && requireSource(locators.get(0)).sealed().getAsBoolean();
     }
 
     CompletionStage<Void> advanceCompaction(Executor executor) {

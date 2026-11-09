@@ -27,6 +27,7 @@ import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.Bindi
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
 
@@ -65,7 +66,7 @@ record NereusKafkaObjectReadAdmissionV1(Sha256Digest receipt, Sha256Digest input
         requireText(summary, "schema", SCHEMA);
         requireBoolean(summary, "promotionEligible", false);
         verifySources(summary);
-        var output = file.getParent();
+        var output = Objects.requireNonNull(file.getParent(), "Object WAL qualification directory");
         var suite = qualifiedFile(output, summary, "TEST-" + SUITE + ".xml");
         NereusKafkaM6ReadQualification.verifySingleCase(suite, SUITE, CASE);
         var runtime = qualifiedFile(output, summary, "nereusKafkaObjectWalReadDrainRealTest-runtime.json");

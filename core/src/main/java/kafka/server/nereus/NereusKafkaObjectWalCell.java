@@ -191,6 +191,7 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
         if (!activeCompaction.isDone()) return;
         var candidate = closed ? Optional.<NereusKafkaObjectWalPartition>empty()
                 : owned.stream().filter(NereusKafkaObjectWalPartition::compactionReady).findFirst();
+        if (candidate.isEmpty() && !provider.hasPendingOriginalReads()) return;
         candidate.ifPresent(partition -> {
             owned.remove(partition);
             owned.add(partition);
@@ -445,6 +446,7 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
             requireCompactionOwner();
             var selector = admission.provision(route, previous, previous.map(value -> value.selectedViewSha256()).orElse(rawView),
                     owner.ownerEpoch());
+            requireCompactionOwner();
             var worker = new NereusKafkaObjectWalCompaction(context, identity, partition, authority, route, provider,
                     this::requireCompactionOwner, owner.ownerEpoch(), storageFence, NereusKafkaNativeInputV2.nativeWorkerFence(owner), rawView);
             worker.recover(selector);

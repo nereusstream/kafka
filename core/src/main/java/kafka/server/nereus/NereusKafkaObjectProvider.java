@@ -308,6 +308,10 @@ final class NereusKafkaObjectProvider implements AutoCloseable {
     }
 
     /** Reconcile only the original SDK response; no subsequent GET can prove the former one closed. */
+    synchronized boolean hasPendingOriginalReads() {
+        return !readCleanup.isEmpty();
+    }
+
     synchronized void reconcileOriginalReads() {
         while (!readCleanup.isEmpty()) {
             var pending = readCleanup.getFirst();

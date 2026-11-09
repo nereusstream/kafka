@@ -133,6 +133,7 @@ final class NereusKafkaObjectWalCompaction {
                 .anyMatch(row -> tasks.readPlan(row.taskIdSha256()).isPresent())) return Optional.empty();
         var caps = inputs.orElseThrow().caps();
         var limits = context.config().nereusKafkaStorageConfig().retentionCompaction();
+        if (!limits.compactionEnabled()) return Optional.empty();
         int records = (int) Math.min(Math.min(limits.compactionTaskMaxRecords(), caps.maximumRecords()), KafkaCompactionRecordsV1.MAX_RECORDS);
         long decoded = limits.compactionDecodeMaxUncompressedBytes();
         var allowance = new NereusKafkaNativeInputV2.CaptureAllowance(new Caps(
