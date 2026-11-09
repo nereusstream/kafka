@@ -69,6 +69,8 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import io.oxia.client.api.AsyncOxiaClient;
 
@@ -261,10 +263,18 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
                 closed = authority.closeAbsentGenesis(origin);
             }
             ensurePhysicalHead(root, selected.reference().rootSha256(), origin.ownerEpoch());
-            var lineage = new WalRunLineageRecovery(metadata, terminalVerifier(), runs::terminalReader)
+            var predecessor = root.predecessor().map(link -> link.root());
+            var predecessorCheckpoint =
+                    new AtomicReference<ObjectKafkaProtocolCheckpointStoreV1.VerifiedTerminalCheckpoint>();
+            var lineage = new WalRunLineageRecovery(metadata, terminalVerifier(checkpoint -> {
+                if (predecessor.equals(Optional.of(checkpoint.root()))) {
+                    predecessorCheckpoint.set(checkpoint);
+                }
+            }), runs::terminalReader)
                     .recover(WalRunControlKeys.pointerKey(root.shardId()), root.protocolCellIdentity(),
                             root.providerScopeId(), Optional.empty(), System::nanoTime);
-            var protocol = new KafkaObjectAuthorizedOwnerOpenV1(root, authority, closed, origin);
+            var protocol = new KafkaObjectAuthorizedOwnerOpenV1(root, authority, closed, origin,
+                    Optional.ofNullable(predecessorCheckpoint.get()));
             var verification = KafkaObjectNativeVerificationV1.context(root, origin);
             var execution = KafkaNativePartitionOwnerAuthorityV1.protocolOwnerFenceExecutor(
                     (actual, callback) -> {
@@ -276,12 +286,12 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
                     selected.reference(), root, metadata, runs.openProvider(root), kms.session(), lineage, protocol);
             ownLive(restored, origin);
             var head = restored.checkpointRecoveredPhysicalRows(metadata, owner.ownerEpoch());
-            var predecessor = KafkaObjectRecoveredProtocolClosureV1.seal(
+            var sealed = KafkaObjectRecoveredProtocolClosureV1.seal(
                     restored, metadata, head, protocol.result(), owner.ownerEpoch());
             var recovered = protocol.result();
             openRetainedSources(lineage, closed);
             var lifecycle = new WalRunLifecycleManager(metadata, terminalVerifier(), runs::terminalReader);
-            var successor = runs.advance(predecessor, lifecycle, context.time().milliseconds(), owner);
+            var successor = runs.advance(sealed, lifecycle, context.time().milliseconds(), owner);
             var fresh = successor.freshSession().orElseThrow(
                     () -> new FencedLeaderEpochException("Object WAL successor must reenter through owner recovery"));
             ownLive(fresh, fence);
@@ -312,11 +322,16 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
         }
 
         private TerminalProtocolCheckpointVerifierV1 terminalVerifier() {
+            return terminalVerifier(ignored -> { });
+        }
+
+        private TerminalProtocolCheckpointVerifierV1 terminalVerifier(
+                Consumer<ObjectKafkaProtocolCheckpointStoreV1.VerifiedTerminalCheckpoint> verified) {
             return (root, seal, binding, value, budget) -> {
                 try {
                     ObjectKafkaProtocolCheckpointStoreV1.terminalVerifier(
                             root, KafkaObjectNativeAppendV1.checkpointPrefix(root),
-                            KafkaObjectNativeAppendV1.runBinding(root, origin(root)))
+                            KafkaObjectNativeAppendV1.runBinding(root, origin(root)), verified)
                             .verifyTerminal(root, seal, binding, value, budget);
                 } catch (RuntimeException failure) {
                     throw failure;
