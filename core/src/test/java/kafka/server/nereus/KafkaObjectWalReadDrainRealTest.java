@@ -19,6 +19,7 @@ package kafka.server.nereus;
 
 import kafka.server.nsip.KafkaBookKeeperProcessRealTest;
 import kafka.server.nsip.KafkaBookKeeperProcessRealTest.NativeNode;
+import kafka.server.nsip.NativeKafkaRequest;
 
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -95,7 +96,8 @@ public class KafkaObjectWalReadDrainRealTest {
                         .get(30, TimeUnit.SECONDS).offset());
                 var terminal = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
                 var head = authorization(terminal.metadata(), terminal.ref().shardId()).read(scope(fixture, topicId)).orElseThrow();
-                var key = head.grants().getFirst().object().key();
+                assertEquals(1, head.grants().size());
+                var key = head.grants().get(0).object().key();
                 try (var relay = new KafkaObjectFaultRelay(bucket, key, "*")) {
                     relay.arm("held-unversioned");
                     verifyShutdownWaits(work, broker, ports[0], topicId, terminal, relay);
