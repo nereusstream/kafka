@@ -250,6 +250,7 @@
       <file name="KafkaObjectWalAdapterRealTest(\.java)?" regex="true">
         <allow class="software.amazon.awssdk.services.s3.S3Client" />
         <allow class="com.nereusstream.storage.object.control.CanonicalControlMetadataStore" />
+        <allow class="com.nereusstream.storage.object.kms.RunKeyCacheIdentity" />
         <allow class="com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaProtocolCheckpointHeadCodecV1" />
         <allow class="com.nereusstream.kafka.bookkeeper.object.nwkcp1.KafkaProtocolCheckpointHeadStateV1" />
         <allow class="com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeAppendV1" />

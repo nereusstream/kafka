@@ -61,6 +61,7 @@ import com.nereusstream.storage.object.control.WalRunObjectSession;
 import com.nereusstream.storage.object.control.WalRunReference;
 import com.nereusstream.storage.object.control.WalRunRootRecord;
 import com.nereusstream.storage.object.control.WalRunRuntime;
+import com.nereusstream.storage.object.kms.RunKeyCacheIdentity;
 import com.nereusstream.storage.object.materialization.M5CellProviderProfileV2;
 import com.nereusstream.storage.object.provider.ObjectIdentity;
 import com.nereusstream.storage.object.provider.ProviderObjectOutcome;
@@ -141,6 +142,11 @@ public class KafkaObjectWalAdapterRealTest {
                 var runs = new NereusKafkaObjectWalRuns(shard, metadata, exact, provider, kms, roots,
                         Duration.ofSeconds(10));
                 verifyWrite(runs, metadata, authority, fence);
+                var previous = runs.current().orElseThrow().root().predecessor().orElseThrow().root();
+                var oldKey = new RunKeyCacheIdentity(previous.shardId(), previous.shardRunEpoch());
+                assertThrows(IllegalStateException.class, () -> kms.session().beginNewRunKey(oldKey));
+                verifyColdRead(runs, metadata, authority, fence);
+                assertThrows(IllegalStateException.class, () -> kms.session().beginNewRunKey(oldKey));
                 var otherFence = new KafkaPartitionFenceV1(binding, topic, 1, 1, epoch, 1, 0);
                 KafkaObjectRevokedAppendRealScenario.verify(otherFence, fixture, control, exact, provider, kms);
                 provider.beginDrain();
