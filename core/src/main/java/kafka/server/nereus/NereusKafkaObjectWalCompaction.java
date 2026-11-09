@@ -28,11 +28,13 @@ import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Cap
 import com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectAuthorizationV1;
 import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1.UnresolvedRead;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
+import com.nereusstream.storage.object.control.CanonicalControlMetadataStore;
 import com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceKind;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.SelectorMode;
+import com.nereusstream.storage.object.retention.M5MaterializationWorkerCoordinatorV1;
 import com.nereusstream.storage.object.retention.M5MaterializationWorkerCoordinatorV1.Proposal;
 
 import java.time.Duration;
@@ -58,6 +60,8 @@ final class NereusKafkaObjectWalCompaction {
     private final Sha256Digest rawView;
     private final KafkaCompactionAdmissionV1 inputAdmission;
     private final M5MaterializationAdmissionV1 outputAdmission;
+    private final CanonicalControlMetadataStore metadata;
+    private final M5MaterializationWorkerCoordinatorV1 workers;
     private final Duration timeout;
     private Job job;
     private volatile boolean settled;
@@ -65,7 +69,7 @@ final class NereusKafkaObjectWalCompaction {
     NereusKafkaObjectWalCompaction(BrokerStorageRuntimeContext context, TopicIdPartition identity,
             NereusKafkaObjectWalPartition partition, KafkaObjectAuthorizationV1 authorization,
             OxiaKafkaBookKeeperM4ReadRouteV2 route, NereusKafkaObjectProvider provider, Runnable requireOwner,
-            long ownerEpoch, long storageFence, Sha256Digest workerFence, Sha256Digest rawView) {
+            BindingReadSelector initial, long storageFence, Sha256Digest workerFence, Sha256Digest rawView) {
         this.context = context;
         this.identity = identity;
         this.partition = partition;
@@ -73,7 +77,7 @@ final class NereusKafkaObjectWalCompaction {
         this.route = route;
         this.provider = provider;
         this.requireOwner = requireOwner;
-        this.ownerEpoch = ownerEpoch;
+        ownerEpoch = initial.ownerEpoch();
         this.storageFence = storageFence;
         this.workerFence = workerFence;
         this.rawView = rawView;
@@ -81,7 +85,9 @@ final class NereusKafkaObjectWalCompaction {
         namespace = Sha256Digest.hash(profile.physicalBinding().encode());
         cell = profile.protocolCellSha256();
         inputAdmission = new KafkaCompactionAdmissionV1(route.compactionAdmissionMetadata(cell), cell);
-        outputAdmission = new M5MaterializationAdmissionV1(route.materializationMetadata(cell), cell);
+        metadata = route.materializationMetadata(cell);
+        outputAdmission = new M5MaterializationAdmissionV1(metadata, cell);
+        workers = new M5MaterializationWorkerCoordinatorV1(metadata, identity.partition(), initial.binding());
         timeout = context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout();
     }
 
@@ -127,7 +133,6 @@ final class NereusKafkaObjectWalCompaction {
         var inputs = inputAdmission.read();
         var outputs = outputAdmission.read();
         if (!policy.config().compact || inputs.isEmpty() || outputs.isEmpty()) return Optional.empty();
-        var metadata = route.materializationMetadata(cell);
         var tasks = new M5MaterializationCoordinatorV1(metadata, identity.partition(), selector.binding());
         if (outputs.orElseThrow().reservations().stream()
                 .anyMatch(row -> tasks.readPlan(row.taskIdSha256()).isPresent())) return Optional.empty();
@@ -155,7 +160,7 @@ final class NereusKafkaObjectWalCompaction {
             var captured = partition.captureForCompaction(authorization, policy, selector, rawView, provider,
                     allowance.planCaps(), decoded);
             if (captured.isEmpty()) return Optional.empty();
-            if (!route.workers().migrateLegacyAuthority()) {
+            if (!workers.migrateLegacyAuthority()) {
                 throw new IllegalStateException("native Object WAL worker authority is unresolved");
             }
             var proposal = proposal(selector);
@@ -173,7 +178,7 @@ final class NereusKafkaObjectWalCompaction {
     }
 
     private Proposal proposal(BindingReadSelector selector) {
-        return route.workers().propose(selector, cell, provider.profile().scopeId().digest(), storageFence,
+        return workers.propose(selector, cell, provider.profile().scopeId().digest(), storageFence,
                 workerFence, namespace).orElseThrow(() -> new IllegalStateException("native Object WAL worker predecessor changed"));
     }
 
@@ -193,6 +198,7 @@ final class NereusKafkaObjectWalCompaction {
         private final NereusKafkaNativeInputV2.TopicPolicy policy;
         private final BindingReadSelector predecessor;
         private NereusKafkaObjectMaterialization.Registered registered;
+        private boolean pendingReconciled;
         private NereusKafkaObjectMaterialization.Stored stored;
         private NereusKafkaObjectMaterialization.Verified verified;
 
@@ -215,9 +221,13 @@ final class NereusKafkaObjectWalCompaction {
             if (registered == null) {
                 var plan = prepared.plan();
                 registered = NereusKafkaObjectMaterialization.register(prepared, provider.profile(), identity.partition(),
-                        route.materializationMetadata(cell), this::requireCurrent,
-                        () -> route.workers().resumePlan(plan, workerFence, namespace)
+                        metadata, this::requireCurrent,
+                        () -> workers.resumePlan(plan, workerFence, namespace)
                                 .or(() -> proposal(predecessor).admitPlan(plan)).orElseThrow());
+            }
+            if (!pendingReconciled) {
+                route.reconcileMaterializationPendingOutput(cell, registered.pending()).toCompletableFuture().join();
+                pendingReconciled = true;
             }
             if (stored == null) stored = NereusKafkaObjectMaterialization.store(registered, provider, this::requireCurrent, timeout);
             if (verified == null) verified = NereusKafkaObjectMaterialization.protectAndVerify(stored, provider, this::requireCurrent, timeout);

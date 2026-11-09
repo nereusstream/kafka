@@ -448,7 +448,7 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
                     owner.ownerEpoch());
             requireCompactionOwner();
             var worker = new NereusKafkaObjectWalCompaction(context, identity, partition, authority, route, provider,
-                    this::requireCompactionOwner, owner.ownerEpoch(), storageFence, NereusKafkaNativeInputV2.nativeWorkerFence(owner), rawView);
+                    this::requireCompactionOwner, selector, storageFence, NereusKafkaNativeInputV2.nativeWorkerFence(owner), rawView);
             worker.recover(selector);
             partition.attachCompaction(worker);
         }

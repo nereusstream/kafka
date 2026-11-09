@@ -242,6 +242,7 @@
         <allow class="com.nereusstream.storage.object.nwg1.Nwg1VerificationContextV1" />
       </file>
       <file name="NereusKafkaObjectWalCompaction(\.java)?" regex="true">
+        <allow class="com.nereusstream.storage.object.control.CanonicalControlMetadataStore" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1" />
         <allow class="com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1" />
         <allow class="com.nereusstream.storage.object.retention.M5MaterializationWorkerCoordinatorV1.Proposal" />
