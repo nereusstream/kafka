@@ -112,7 +112,7 @@ public class KafkaObjectWalReadDrainRealTest {
 
     private static void verifyShutdownWaits(Path work, NativeNode broker, int port, Uuid topicId,
             KafkaObjectWalAdapterRealTest.NativeTerminal terminal, KafkaObjectFaultRelay relay) throws Exception {
-        var original = terminal.metadata().getVersioned(terminal.checkpointHeadKey()).orElseThrow();
+        var original = terminal.metadata().getVersioned(terminal.checkpointHeadKey());
         short version = 16;
         var fetch = FetchRequest.Builder.forConsumer(version, 0, 1,
                         Map.of(OBJECT, new FetchRequest.PartitionData(topicId, 0,
@@ -133,7 +133,7 @@ public class KafkaObjectWalReadDrainRealTest {
             TestUtils.waitForCondition(() -> Files.readString(work.resolve("node-0/server.log"))
                     .contains("[BrokerServer id=0] shutting down"), 5_000, "Broker did not enter native shutdown");
             assertThrows(TimeoutException.class, () -> shutdown.get(200, TimeUnit.MILLISECONDS));
-            assertEquals(Optional.of(original), terminal.metadata().getVersioned(terminal.checkpointHeadKey()));
+            assertEquals(original, terminal.metadata().getVersioned(terminal.checkpointHeadKey()));
         } finally {
             relay.release();
         }
