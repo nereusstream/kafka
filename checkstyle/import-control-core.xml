@@ -243,6 +243,9 @@
       <file name="KafkaObjectWalProcessRealTest(\.java)?" regex="true">
         <allow class="software.amazon.awssdk.services.s3.S3Client" />
       </file>
+      <file name="KafkaObjectWalReadDrainRealTest(\.java)?" regex="true">
+        <allow class="software.amazon.awssdk.services.s3.S3Client" />
+      </file>
       <file name="KafkaObjectWalAuthorizationRealTest(\.java)?" regex="true">
         <allow class="com.nereusstream.storage.object.control.WalRunControlCodec" />
         <allow class="com.nereusstream.storage.object.control.WalRunControlKeys" />

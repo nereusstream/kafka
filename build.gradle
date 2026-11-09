@@ -1179,26 +1179,31 @@ project(':core') {
         systemProperty 'nereus.nsip.vaultTokenFile', providers.gradleProperty('v2M6VaultTokenFile').get()
       }
     }
-    tasks.register('nereusKafkaObjectWalProcessRealTest', Test) {
-      group = 'verification'
-      description = 'Runs Kafka Object WAL with separate Controller and Broker processes.'
-      testClassesDirs = sourceSets.test.output.classesDirs
-      classpath = sourceSets.test.runtimeClasspath
-      useJUnitPlatform()
-      filter { includeTestsMatching 'kafka.server.nereus.KafkaObjectWalProcessRealTest' }
-      dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain'
-      outputs.upToDateWhen { false }
-      doFirst {
-        systemProperty 'nereus.nsip.bkUri', providers.gradleProperty('v2M2BookKeeperMetadataServiceUri').get()
-        systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
-        systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
-        systemProperty 'nereus.nsip.vaultEndpoint', providers.gradleProperty('v2M6VaultEndpoint').get()
-        systemProperty 'nereus.nsip.vaultTokenFile', providers.gradleProperty('v2M6VaultTokenFile').get()
-        systemProperty 'nereus.nsip.processClasspath', (sourceSets.main.runtimeClasspath + configurations.releaseOnly).asPath
-        systemProperty 'nereus.nsip.processLogConfig', rootProject.file('config/log4j2.yaml').absolutePath
-        def directory = providers.gradleProperty('v2M6ObjectWalProcessEvidenceDir').getOrNull()
-        if (directory != null) {
-          systemProperty 'nereus.nsip.processEvidenceDir', directory
+    [
+      nereusKafkaObjectWalReadDrainRealTest: 'KafkaObjectWalReadDrainRealTest',
+      nereusKafkaObjectWalProcessRealTest: 'KafkaObjectWalProcessRealTest'
+    ].each { taskName, testClass ->
+      tasks.register(taskName, Test) {
+        group = 'verification'
+        description = 'Runs Kafka Object WAL with separate Controller and Broker processes.'
+        testClassesDirs = sourceSets.test.output.classesDirs
+        classpath = sourceSets.test.runtimeClasspath
+        useJUnitPlatform()
+        filter { includeTestsMatching "kafka.server.nereus.${testClass}" }
+        dependsOn 'checkstyleMain', 'checkstyleTest', 'spotbugsMain'
+        outputs.upToDateWhen { false }
+        doFirst {
+          systemProperty 'nereus.nsip.bkUri', providers.gradleProperty('v2M2BookKeeperMetadataServiceUri').get()
+          systemProperty 'nereus.nsip.oxia', providers.gradleProperty('v2M5RetentionOxiaServiceAddress').get()
+          systemProperty 'nereus.nsip.s3Endpoint', providers.gradleProperty('v2M6MinioEndpoint').get()
+          systemProperty 'nereus.nsip.vaultEndpoint', providers.gradleProperty('v2M6VaultEndpoint').get()
+          systemProperty 'nereus.nsip.vaultTokenFile', providers.gradleProperty('v2M6VaultTokenFile').get()
+          systemProperty 'nereus.nsip.processClasspath', (sourceSets.main.runtimeClasspath + configurations.releaseOnly).asPath
+          systemProperty 'nereus.nsip.processLogConfig', rootProject.file('config/log4j2.yaml').absolutePath
+          def directory = providers.gradleProperty('v2M6ObjectWalProcessEvidenceDir').getOrNull()
+          if (directory != null) {
+            systemProperty 'nereus.nsip.processEvidenceDir', directory
+          }
         }
       }
     }
