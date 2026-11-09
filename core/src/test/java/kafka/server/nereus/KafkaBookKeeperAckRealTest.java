@@ -23,6 +23,7 @@ import kafka.server.nsip.NativeKafkaRequest;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.IsolationLevel;
@@ -262,6 +263,9 @@ public class KafkaBookKeeperAckRealTest {
                     .topicId(TOPIC).get(30, TimeUnit.SECONDS);
             var partition = new TopicPartition(TOPIC, 0);
             var old = observer.storage.get(30, TimeUnit.SECONDS);
+            // The provider callback precedes Controller RECOVERED and M5 writer enrollment.
+            assertEquals(0L, admin.listOffsets(Map.of(partition, OffsetSpec.latest()))
+                    .partitionResult(partition).get(30, TimeUnit.SECONDS).offset());
             assertAckAfterPublication(client, observer, old, "all", 0);
             int acknowledged = 1;
             if (bothAckModes) {
