@@ -151,11 +151,13 @@ public class KafkaObjectWalProcessRealTest {
                 assertEquals(List.of("before-0", "before-1", "committed", "aborted"), readUncommitted(client, OBJECT, 4));
                 assertOffsets(admin, 5, 4);
                 storeGroupOffset(client);
+                KafkaObjectNativeCompactionRealScenario.seed(admin, client);
                 cold.start();
                 KafkaBookKeeperProcessRealTest.waitForBroker(admin, 1);
                 var destination = Optional.of(new NewPartitionReassignment(List.of(1)));
                 admin.alterPartitionReassignments(Map.of(OBJECT, destination, BK, destination,
-                                OFFSETS, destination, TRANSACTIONS, destination))
+                                OFFSETS, destination, TRANSACTIONS, destination,
+                                KafkaObjectNativeCompactionRealScenario.COMPACT, destination))
                         .all().get(30, TimeUnit.SECONDS);
                 assertEquals(1, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 0));
                 awaitBookKeeperOwners(admin);
@@ -183,6 +185,7 @@ public class KafkaObjectWalProcessRealTest {
                     awaitTransactionMarker(coldAdmin, 8);
                     assertOffsets(coldAdmin, 8, 8);
                     assertGroupOffset(after, TXN_GROUP, 8);
+                    KafkaObjectNativeCompactionRealScenario.awaitSelected(coldAdmin, after);
                 }
             }
             assertEquals(List.of("before-0", "before-1", "committed", "after"),
@@ -204,6 +207,7 @@ public class KafkaObjectWalProcessRealTest {
                 assertEquals(List.of("before-0", "before-1", "committed", "after"),
                         KafkaBookKeeperOwnerRelocationRealTest.consume(client, 4));
                 assertGroupOffset(client, TXN_GROUP, 8);
+                KafkaObjectNativeCompactionRealScenario.requireSelected(finalAdmin, client);
                 append(client, OBJECT, 8, "after-terminal");
                 assertOffsets(finalAdmin, 9, 9);
                 var oldRun = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
