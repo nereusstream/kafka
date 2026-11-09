@@ -51,7 +51,8 @@ final class KafkaObjectFetchExitRealScenario {
 
     private KafkaObjectFetchExitRealScenario() { }
 
-    static void verify(int port, Uuid original, Properties client, Admin admin, long end) throws Exception {
+    static void verify(int port, Uuid original, Properties client, Admin admin, long end, String bucket)
+            throws Exception {
         var created = admin.createTopics(List.of(topic(PEER, "OBJECT_WAL")));
         var peer = created.topicId(PEER.topic()).get(30, TimeUnit.SECONDS);
         awaitInitialOwner(admin, PEER);
@@ -71,18 +72,22 @@ final class KafkaObjectFetchExitRealScenario {
                 assertFetchedValues(response.get(PEER), List.of("short"));
             }
         }
-        try (var wire = new NativeKafkaRequest(port, fetch(original, end, peer, 1, 15_000, 1))) {
-            assertThrows(SocketTimeoutException.class, () -> wire.receive(250),
-                    "The multi-partition Fetch completed before deletion");
-            admin.deleteTopics(List.of(PEER.topic())).all().get(5, TimeUnit.SECONDS);
-            var response = ((FetchResponse) wire.receive(5_000)).responseData(names, VERSION);
-            assertEquals(2, response.size());
-            assertEquals(end, response.get(OBJECT).highWatermark());
-            assertFetchedValues(response.get(OBJECT), List.of());
-            var error = Errors.forCode(response.get(PEER).errorCode());
-            assertTrue(error == Errors.UNKNOWN_TOPIC_OR_PARTITION || error == Errors.UNKNOWN_TOPIC_ID
-                            || error == Errors.NOT_LEADER_OR_FOLLOWER,
-                    "Deleted Object Fetch partition returned " + error);
+        try (var provider = KafkaObjectFaultRelay.wholeBucket(bucket)) {
+            provider.arm("bucket-unavailable");
+            try (var wire = new NativeKafkaRequest(port, fetch(original, end, peer, 1, 15_000, 1))) {
+                assertThrows(SocketTimeoutException.class, () -> wire.receive(250),
+                        "The multi-partition Fetch completed before deletion");
+                admin.deleteTopics(List.of(PEER.topic())).all().get(5, TimeUnit.SECONDS);
+                var response = ((FetchResponse) wire.receive(5_000)).responseData(names, VERSION);
+                assertEquals(2, response.size());
+                assertEquals(end, response.get(OBJECT).highWatermark());
+                assertFetchedValues(response.get(OBJECT), List.of());
+                var error = Errors.forCode(response.get(PEER).errorCode());
+                assertTrue(error == Errors.UNKNOWN_TOPIC_OR_PARTITION || error == Errors.UNKNOWN_TOPIC_ID
+                                || error == Errors.NOT_LEADER_OR_FOLLOWER,
+                        "Deleted Object Fetch partition returned " + error);
+                assertEquals(0, provider.hits(), "The end-of-log delayed Fetch contacted the Object Provider");
+            }
         }
     }
 

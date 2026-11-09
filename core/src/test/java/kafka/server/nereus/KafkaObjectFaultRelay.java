@@ -61,11 +61,13 @@ final class KafkaObjectFaultRelay implements AutoCloseable {
     }
 
     void awaitRequest() throws Exception {
-        TestUtils.waitForCondition(() -> {
-            var response = send(request().GET().build());
-            var state = Json.parseBytesAs(response, Map.class);
-            return ((Number) state.get("hits")).intValue() > 0;
-        }, 30_000, "the exact Object version was not requested through the fault relay");
+        TestUtils.waitForCondition(() -> hits() > 0, 30_000,
+                "the exact Object version was not requested through the fault relay");
+    }
+
+    int hits() throws Exception {
+        var state = Json.parseBytesAs(send(request().GET().build()), Map.class);
+        return ((Number) state.get("hits")).intValue();
     }
 
     void awaitAppliedRange() throws Exception {

@@ -223,18 +223,19 @@ public class KafkaObjectWalProcessRealTest {
                         readFrom(client, OBJECT, boundary - 1, 2));
                 assertEquals(List.of("before-0", "before-1", "committed", "aborted", "after", "after-terminal"),
                         readUncommitted(client, OBJECT, 6));
-                verifyWireExits(client, finalAdmin, ports[0], topicId, boundary);
+                verifyWireExits(client, finalAdmin, ports[0], topicId, boundary,
+                        (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG));
             }
         }
     }
 
     private static void verifyWireExits(Properties client, Admin finalAdmin, int port, Uuid topicId,
-            long boundary) throws Exception {
+            long boundary, String bucket) throws Exception {
         KafkaObjectProtocolRealScenario.assertAckZero(port, finalAdmin, boundary + 2);
         KafkaObjectProtocolRealScenario.verifyNonIdempotentRetry(port, finalAdmin, boundary + 2);
         assertEquals(List.of("non-idempotent-retry", "non-idempotent-retry"),
                 readFrom(client, OBJECT, boundary + 2, 2));
-        KafkaObjectFetchExitRealScenario.verify(port, topicId, client, finalAdmin, boundary + 4);
+        KafkaObjectFetchExitRealScenario.verify(port, topicId, client, finalAdmin, boundary + 4, bucket);
         KafkaObjectProtocolRealScenario.verifyCompressedWireBatches(port, topicId, boundary + 4);
     }
 
