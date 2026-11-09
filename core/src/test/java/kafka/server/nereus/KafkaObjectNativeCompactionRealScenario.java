@@ -28,7 +28,10 @@ import org.apache.kafka.server.config.NereusKafkaConfigs;
 import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.domain.codec.TopicIncarnationIdentityCodecV1;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
+import com.nereusstream.storage.object.gc.M5GcQuotaRecordsV2.Layout;
+import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IndexKind;
 import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingIdentity;
+import com.nereusstream.storage.object.s3.S3M5PhysicalNamespaceAuthorityV2;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -40,12 +43,14 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 
 import io.oxia.client.api.AsyncOxiaClient;
+import software.amazon.awssdk.services.s3.S3Client;
 
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.awaitInitialOwner;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.readUncommitted;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.topic;
 import static org.apache.kafka.test.TestUtils.waitForCondition;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Uses a small, complete Object WAL key domain sealed by the real Controller handoff. */
 final class KafkaObjectNativeCompactionRealScenario {
@@ -73,6 +78,37 @@ final class KafkaObjectNativeCompactionRealScenario {
         var route = OxiaKafkaBookKeeperM4ReadRouteV2.forObjectWal(control, fixture.namespace().identity(),
                 scope.partitionId(), binding);
         KafkaBookKeeperObjectMaterializationRealTest.ScheduledLimits.install(route, fixture.profile().protocolCellSha256());
+    }
+
+    static void admitCompleteOutput(KafkaObjectWalAdapterRealTest.Provisioned fixture,
+            S3Client minio, Properties client) throws Exception {
+        var profile = fixture.profile();
+        var binding = profile.physicalBinding();
+        var bucket = (String) fixture.settings().get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
+        var physical = S3M5PhysicalNamespaceAuthorityV2.connect(minio, bucket, binding.physicalNamespace());
+        var quota = fixture.namespace().openAuthorityRoute(physical).toCompletableFuture()
+                .get(10, TimeUnit.SECONDS).quota();
+        var layout = Layout.withPhysicalMembers(binding.authorityRoot(), binding.physicalNamespace());
+        long slotCharge = Math.addExact(layout.reservationCharge(), layout.birthRecordCharge());
+        int outputs = 1 + IndexKind.values().length;
+        waitForCondition(() -> {
+            var snapshot = quota.snapshot().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            return snapshot.head().births().isPresent() && snapshot.availableCanonicalBytes() < slotCharge;
+        }, 30_000, "The actual Object WAL output did not reach the original metadata quota");
+        var blocked = quota.snapshot().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        assertEquals(8L << 20, blocked.head().capacityBytes());
+        var births = blocked.head().births().orElseThrow();
+        assertEquals(births.issued(), births.unassigned());
+        assertTrue(births.unassigned() > 0 && births.unassigned() < outputs);
+        var beforeWrite = minio.listObjectVersions(request -> request.bucket(bucket)
+                .prefix(profile.exclusiveNamespacePrefix() + "/m5/materialization/"));
+        assertTrue(beforeWrite.versions().isEmpty(), "An incomplete Object WAL output reservation wrote data");
+        assertEquals(List.of("old", "kept", "latest"), readUncommitted(client, COMPACT, 3));
+        long exactCapacity = Math.addExact(blocked.chargedCanonicalBytes(),
+                Math.multiplyExact(outputs - births.unassigned(), slotCharge));
+        assertTrue(quota.expand(exactCapacity).toCompletableFuture().get(5, TimeUnit.SECONDS));
+        System.out.printf("Native Object WAL compact output admission reserved %d of %d original slots before explicit quota expansion to %d bytes%n",
+                births.unassigned(), outputs, exactCapacity);
     }
 
     static void seed(Admin admin, Properties client) throws Exception {

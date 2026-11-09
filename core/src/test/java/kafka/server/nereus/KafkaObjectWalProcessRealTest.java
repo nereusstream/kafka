@@ -180,7 +180,7 @@ public class KafkaObjectWalProcessRealTest {
                     awaitTransactionMarker(coldAdmin, 8);
                     assertOffsets(coldAdmin, 8, 8);
                     assertGroupOffset(after, TXN_GROUP, 8);
-                    KafkaObjectNativeCompactionRealScenario.awaitSelected(coldAdmin, after);
+                    verifyNativeCompaction(fixture, minio, coldAdmin, after);
                 }
             }
             assertEquals(List.of("before-0", "before-1", "committed", "after"),
@@ -240,6 +240,12 @@ public class KafkaObjectWalProcessRealTest {
         broker.assertRejectsForeignObjectBucket(foreignBucket);
         var rejectedToken = Files.writeString(work.resolve("unauthorized-vault-token"), "unissued-token");
         broker.assertRejectsUnqualifiedObjectWalToken(rejectedToken);
+    }
+
+    private static void verifyNativeCompaction(KafkaObjectWalAdapterRealTest.Provisioned fixture, S3Client minio,
+            Admin admin, Properties client) throws Exception {
+        KafkaObjectNativeCompactionRealScenario.admitCompleteOutput(fixture, minio, client);
+        KafkaObjectNativeCompactionRealScenario.awaitSelected(admin, client);
     }
 
     private static void verifyWireExits(Properties client, Admin finalAdmin, int port, Uuid topicId,

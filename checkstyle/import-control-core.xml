@@ -253,6 +253,11 @@
       <file name="KafkaObjectWalProcessRealTest(\.java)?" regex="true">
         <allow class="software.amazon.awssdk.services.s3.S3Client" />
       </file>
+      <file name="KafkaObjectNativeCompactionRealScenario(\.java)?" regex="true">
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IndexKind" />
+        <allow class="com.nereusstream.storage.object.s3.S3M5PhysicalNamespaceAuthorityV2" />
+        <allow class="software.amazon.awssdk.services.s3.S3Client" />
+      </file>
       <file name="KafkaObjectWalReadDrainRealTest(\.java)?" regex="true">
         <allow class="software.amazon.awssdk.services.s3.S3Client" />
       </file>
