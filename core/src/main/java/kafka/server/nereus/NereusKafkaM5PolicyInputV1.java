@@ -47,6 +47,7 @@ import kafka.server.storage.BrokerStorageRuntimeContext;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.FencedLeaderEpochException;
+import org.apache.kafka.image.MetadataImage;
 import java.util.function.BooleanSupplier;
 import java.util.concurrent.CompletionException;
 
@@ -231,18 +232,32 @@ final class NereusKafkaM5PolicyInputV1 {
         }
     }
 
-    private static boolean samePolicyInputs(BrokerStorageRuntimeContext context, TopicIdPartition identity,
+    static NereusKafkaNativeInputV2.TopicPolicy captureObjectWalPolicy(
+            BrokerStorageRuntimeContext context, TopicIdPartition identity) {
+        var image = context.metadataCache().getImage();
+        var topic = image.topics().getTopic(identity.topic());
+        if (topic == null || !identity.topicId().equals(topic.id())) {
+            throw new FencedLeaderEpochException("native Object WAL compaction topic incarnation changed");
+        }
+        return new NereusKafkaNativeInputV2.TopicPolicy(effectiveLogConfig(context, image, topic.name()),
+                image.provenance().lastContainedOffset(), image.features().metadataVersionOrThrow().featureLevel());
+    }
+
+    static boolean samePolicyInputs(BrokerStorageRuntimeContext context, TopicIdPartition identity,
             LogConfig expected, short feature) {
         var current = context.metadataCache().getImage();
         var topic = current.topics().getTopic(identity.topic());
         if (topic == null || !identity.topicId().equals(topic.id())
                 || current.features().metadataVersionOrThrow().featureLevel() != feature) return false;
-        var props = current.configs().configProperties(new ConfigResource(ConfigResource.Type.TOPIC, topic.name()));
-        var defaults = current.configs().configProperties(new ConfigResource(ConfigResource.Type.BROKER, ""));
-        var broker = current.configs().configProperties(new ConfigResource(ConfigResource.Type.BROKER,
+        return effectiveLogConfig(context, current, topic.name()).values().equals(expected.values());
+    }
+
+    private static LogConfig effectiveLogConfig(BrokerStorageRuntimeContext context, MetadataImage image, String topic) {
+        var props = image.configs().configProperties(new ConfigResource(ConfigResource.Type.TOPIC, topic));
+        var defaults = image.configs().configProperties(new ConfigResource(ConfigResource.Type.BROKER, ""));
+        var broker = image.configs().configProperties(new ConfigResource(ConfigResource.Type.BROKER,
                 Integer.toString(context.config().brokerId())));
-        var actual = LogConfig.fromProps(context.config().dynamicConfig().logDefaultsAtMetadataImage(defaults, broker), props);
-        return actual.values().equals(expected.values());
+        return LogConfig.fromProps(context.config().dynamicConfig().logDefaultsAtMetadataImage(defaults, broker), props);
     }
 
     M5KafkaBindingPolicyV1 firstPolicy(PhysicalNamespaceAuthorityBindingV2 namespace,

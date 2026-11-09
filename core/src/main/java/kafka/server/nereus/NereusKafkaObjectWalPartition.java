@@ -21,24 +21,33 @@ import org.apache.kafka.common.errors.FencedLeaderEpochException;
 import org.apache.kafka.common.errors.KafkaStorageException;
 import org.apache.kafka.common.errors.ThrottlingQuotaExceededException;
 
+import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.kafka.bookkeeper.adapter.KafkaNativeAssignedRecordBatchV1;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeAppendV1;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeExtentV1;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaObjectNativeFetchV1;
 import com.nereusstream.kafka.bookkeeper.commit.KafkaCoherentCommitCoordinatorV1;
+import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
+import com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectAuthorizationV1;
+import com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectAuthorizationV1.Grant;
 import com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectCoherentProtocolSnapshotV1;
 import com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectExtentLocatorV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaReadIsolationV1;
+import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1;
+import com.nereusstream.kafka.bookkeeper.read.KafkaObjectMaterializedPrefixV1.UnresolvedRead;
 import com.nereusstream.storage.object.control.WalRunHistoricalObjectReaderV1;
 import com.nereusstream.storage.object.control.WalRunObjectSession;
+import com.nereusstream.storage.object.control.WalRunRuntime;
 import com.nereusstream.storage.object.nwg1.Nwg1ObjectReaderV1;
 import com.nereusstream.storage.object.nwg1.Nwg1VerificationContextV1;
+import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionException;
@@ -47,6 +56,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
@@ -65,20 +75,29 @@ public final class NereusKafkaObjectWalPartition {
     }
 
     @FunctionalInterface
+    interface CaptureExtent {
+        void capture(Grant grant, CanonicalBytes canonicalBody, Nwg1ObjectReaderV1.VerifiedFrameConsumer consume)
+                throws IOException;
+    }
+
+    @FunctionalInterface
     interface Rollover {
         RolledRun advance(KafkaObjectNativeAppendV1 predecessor) throws Exception;
     }
 
     record RolledRun(KafkaObjectNativeAppendV1 writer, Sha256Digest root, Source source) { }
 
-    record Source(ReadExtent read, Runnable close) {
+    record Source(ReadExtent read, CaptureExtent capture, BooleanSupplier sealed, Runnable close) {
         static Source live(WalRunObjectSession run, Nwg1VerificationContextV1 verification) {
             return new Source((locator, consume) -> KafkaObjectNativeExtentV1.read(run, verification, locator, consume),
+                    (grant, body, consume) -> KafkaObjectNativeExtentV1.capture(run, verification, grant, body, consume),
+                    () -> run.runtimeState() == WalRunRuntime.State.SEALED,
                     run::close);
         }
 
         static Source historical(WalRunHistoricalObjectReaderV1 run, Nwg1VerificationContextV1 verification) {
             return new Source((locator, consume) -> KafkaObjectNativeExtentV1.read(run, verification, locator, consume),
+                    (grant, body, consume) -> KafkaObjectNativeExtentV1.capture(run, verification, grant, body, consume), () -> true,
                     run::close);
         }
     }
@@ -99,6 +118,10 @@ public final class NereusKafkaObjectWalPartition {
     private boolean rolloverRequested;
     private Throwable rolloverFailure;
     private int actualOperations;
+    private Optional<KafkaObjectMaterializedPrefixV1> selectedPrefix = Optional.empty();
+    private Sha256Digest pendingSelection;
+    private NereusKafkaObjectWalCompaction compaction;
+    private boolean nativeReady;
 
     NereusKafkaObjectWalPartition(KafkaCoherentCommitCoordinatorV1 coordinator, KafkaObjectNativeAppendV1 writer,
             Map<Sha256Digest, Source> sources, Executor reads, Executor recovery, NativeAssignment assignment,
@@ -115,6 +138,85 @@ public final class NereusKafkaObjectWalPartition {
 
     public KafkaObjectCoherentProtocolSnapshotV1 capture() {
         return coordinator.captureObject();
+    }
+
+    public record ReadView(KafkaObjectCoherentProtocolSnapshotV1 snapshot,
+                           Optional<KafkaObjectMaterializedPrefixV1> selectedPrefix) { }
+
+    public synchronized ReadView captureReadView() {
+        requireCurrent();
+        if (pendingSelection != null) throw new KafkaStorageException("native Object WAL read selection is unresolved");
+        return new ReadView(coordinator.captureObject(), selectedPrefix);
+    }
+
+    synchronized void beginSelectedPrefix(KafkaObjectMaterializedPrefixV1 selected) {
+        requireCurrent();
+        requirePrefixCut(selected);
+        if (pendingSelection != null && !pendingSelection.equals(selected.manifestSha256())) {
+            throw new IllegalStateException("native Object WAL has another unresolved read selection");
+        }
+        pendingSelection = selected.manifestSha256();
+    }
+
+    synchronized void installSelectedPrefix(KafkaObjectMaterializedPrefixV1 selected) {
+        requireCurrent();
+        requirePrefixCut(selected);
+        if (pendingSelection != null && !pendingSelection.equals(selected.manifestSha256())) {
+            throw new IllegalStateException("native Object WAL selection did not converge to the original manifest");
+        }
+        selectedPrefix = Optional.of(selected);
+        pendingSelection = null;
+        nextFetchCursor.set(null);
+    }
+
+    private void requirePrefixCut(KafkaObjectMaterializedPrefixV1 prefix) {
+        var frontiers = coordinator.captureObject().root().frontiers();
+        if (prefix.rawFallbackEquivalent()
+                || prefix.coverage().inclusiveStart() != frontiers.trimStartOffset()
+                || prefix.coverage().exclusiveEnd() > frontiers.lastStableOffset()) {
+            throw new IllegalStateException("native Object WAL selected prefix differs from its actual stable cut");
+        }
+    }
+
+    synchronized void attachCompaction(NereusKafkaObjectWalCompaction worker) {
+        compaction = Objects.requireNonNull(worker, "worker");
+    }
+
+    public synchronized void nativeReady() {
+        requireCurrent();
+        nativeReady = true;
+    }
+
+    synchronized boolean compactionReady() {
+        return !fenced && nativeReady && compaction != null && !compaction.settled();
+    }
+
+    CompletionStage<Void> advanceCompaction(Executor executor) {
+        begin();
+        try {
+            return compaction.advance(executor).whenComplete((value, failure) -> finished());
+        } catch (UnresolvedRead failure) {
+            finishAfterOriginalRead(failure);
+            return CompletableFuture.failedFuture(failure);
+        } catch (Exception | Error failure) {
+            finished();
+            return CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    Optional<NereusKafkaObjectWalCompactionInput> captureForCompaction(
+            KafkaObjectAuthorizationV1 authority, NereusKafkaNativeInputV2.TopicPolicy policy,
+            BindingReadSelector selector, Sha256Digest rawView, NereusKafkaObjectProvider provider,
+            Caps caps, long maximumDecodedBytes) throws IOException {
+        var snapshot = coordinator.captureObject();
+        var locators = snapshot.activeTail().locators();
+        if (locators.isEmpty() || !requireSource(locators.get(0)).sealed().getAsBoolean()) {
+            return Optional.empty();
+        }
+        var checkpoint = coordinator.captureRecoveryCheckpoint(snapshot);
+        var selected = authority.read(snapshot.root().fence()).orElseThrow();
+        return NereusKafkaObjectWalCompactionInput.capture(snapshot, checkpoint, selected, sources,
+                policy, selector, rawView, provider, caps, maximumDecodedBytes);
     }
 
     public int maximumFrameBytes() {
@@ -160,7 +262,7 @@ public final class NereusKafkaObjectWalPartition {
     }
 
     public CompletionStage<KafkaObjectNativeFetchV1.Result> read(
-            KafkaObjectCoherentProtocolSnapshotV1 snapshot, long offset, int maximumBytes, int hardMaximumBytes,
+            ReadView view, long offset, int maximumBytes, int hardMaximumBytes,
             boolean minOneMessage, KafkaReadIsolationV1 isolation) {
         synchronized (this) {
             if (rolloverRequested) {
@@ -173,17 +275,25 @@ public final class NereusKafkaObjectWalPartition {
         var result = new CompletableFuture<KafkaObjectNativeFetchV1.Result>();
         try {
             reads.execute(() -> {
+                boolean ownsCleanup = true;
                 try {
-                    var fetched = KafkaObjectNativeFetchV1.readPositioned(snapshot, this::pinExtent,
-                            offset, maximumBytes, hardMaximumBytes, minOneMessage, isolation, cursor);
+                    var fetched = view.selectedPrefix().isPresent()
+                            ? KafkaObjectNativeFetchV1.readMaterialized(view.snapshot(), view.selectedPrefix().orElseThrow(),
+                                    this::pinExtent, offset, maximumBytes, hardMaximumBytes, minOneMessage, isolation, cursor)
+                            : KafkaObjectNativeFetchV1.readPositioned(view.snapshot(), this::pinExtent,
+                                    offset, maximumBytes, hardMaximumBytes, minOneMessage, isolation, cursor);
                     fetched.nextCursor().ifPresent(nextFetchCursor::set);
                     result.complete(fetched.result());
+                } catch (UnresolvedRead failure) {
+                    ownsCleanup = false;
+                    finishAfterOriginalRead(failure);
+                    result.completeExceptionally(new KafkaStorageException("native Object WAL Fetch retained its original GET", failure));
                 } catch (IOException failure) {
                     result.completeExceptionally(new KafkaStorageException("native Object WAL Fetch failed", failure));
                 } catch (RuntimeException | Error failure) {
                     result.completeExceptionally(failure);
                 } finally {
-                    finished();
+                    if (ownsCleanup) finished();
                 }
             });
         } catch (RejectedExecutionException exhausted) {
@@ -193,9 +303,12 @@ public final class NereusKafkaObjectWalPartition {
         return result.copy();
     }
 
+    private void finishAfterOriginalRead(UnresolvedRead failure) {
+        failure.originalDrain().thenRun(this::finished);
+    }
+
     private KafkaObjectNativeFetchV1.PinnedExtent pinExtent(KafkaObjectExtentLocatorV1 locator) {
-        var source = sources.get(locator.extent().walRunRootSha());
-        if (source == null) throw new KafkaStorageException("native Object WAL extent has no retained Root source");
+        var source = requireSource(locator);
         // A plan already holds the complete source set until actual task termination. This per-extent reference
         // cannot escape its synchronous read callback or close the backing session underneath another plan.
         return new KafkaObjectNativeFetchV1.PinnedExtent() {
@@ -212,6 +325,12 @@ public final class NereusKafkaObjectWalPartition {
                 closed = true;
             }
         };
+    }
+
+    private Source requireSource(KafkaObjectExtentLocatorV1 locator) {
+        var source = sources.get(locator.extent().walRunRootSha());
+        if (source == null) throw new KafkaStorageException("native Object WAL extent has no retained Root source");
+        return source;
     }
 
     public void fence() {

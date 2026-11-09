@@ -237,8 +237,17 @@
         <allow class="com.nereusstream.kafka.bookkeeper.object.publication.KafkaObjectExtentLocatorV1" />
         <allow class="com.nereusstream.storage.object.control.WalRunHistoricalObjectReaderV1" />
         <allow class="com.nereusstream.storage.object.control.WalRunObjectSession" />
+        <allow class="com.nereusstream.storage.object.control.WalRunRuntime" />
         <allow class="com.nereusstream.storage.object.nwg1.Nwg1ObjectReaderV1" />
         <allow class="com.nereusstream.storage.object.nwg1.Nwg1VerificationContextV1" />
+      </file>
+      <file name="NereusKafkaObjectWalCompaction(\.java)?" regex="true">
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationAdmissionV1" />
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationCoordinatorV1" />
+        <allow class="com.nereusstream.storage.object.retention.M5MaterializationWorkerCoordinatorV1.Proposal" />
+      </file>
+      <file name="NereusKafkaObjectWalCompactionInput(\.java)?" regex="true">
+        <allow class="com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1" />
       </file>
       <file name="KafkaObjectWalProcessRealTest(\.java)?" regex="true">
         <allow class="software.amazon.awssdk.services.s3.S3Client" />

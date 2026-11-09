@@ -22,11 +22,24 @@ import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.server.config.NereusKafkaConfigs;
 
+import com.nereusstream.domain.bytes.Sha256Digest;
+import com.nereusstream.domain.codec.TopicIncarnationIdentityCodecV1;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
+import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingIdentity;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
+
+import io.oxia.client.api.AsyncOxiaClient;
 
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.awaitInitialOwner;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.readUncommitted;
@@ -40,6 +53,27 @@ final class KafkaObjectNativeCompactionRealScenario {
     private static final List<String> SELECTED = List.of("kept", "latest");
 
     private KafkaObjectNativeCompactionRealScenario() { }
+
+    static Map<String, Object> configureReadQualification(Path work, KafkaObjectWalAdapterRealTest.Provisioned fixture)
+            throws Exception {
+        var receipt = Path.of(System.getProperty("nereus.nsip.objectWalReadAdmissionFile")).toRealPath();
+        var digest = NereusKafkaM4AdmissionV2.sha(Files.readAllBytes(receipt));
+        Files.writeString(work.resolve("capability.properties"), "\nobjectWalReadAdmission.receiptFile=" + receipt
+                + "\nobjectWalReadAdmission.receiptSha256=" + digest.toHex() + "\n", StandardOpenOption.APPEND);
+        var settings = new HashMap<>(fixture.settings());
+        settings.put(NereusKafkaConfigs.RETENTION_CHECK_INTERVAL_MS_CONFIG, "500");
+        return settings;
+    }
+
+    static void installCapacity(KafkaObjectWalAdapterRealTest.Provisioned fixture, AsyncOxiaClient control, Uuid topicId) {
+        var scope = KafkaObjectWalProcessRealTest.scope(fixture, topicId);
+        var binding = new BindingIdentity(scope.bindingId(),
+                Sha256Digest.hash(TopicIncarnationIdentityCodecV1.encode(scope.topicIncarnation())),
+                scope.storageEpochId().digest());
+        var route = OxiaKafkaBookKeeperM4ReadRouteV2.forObjectWal(control, fixture.namespace().identity(),
+                scope.partitionId(), binding);
+        KafkaBookKeeperObjectMaterializationRealTest.ScheduledLimits.install(route, fixture.profile().protocolCellSha256());
+    }
 
     static void seed(Admin admin, Properties client) throws Exception {
         var topic = topic(COMPACT, "OBJECT_WAL").configs(Map.of(

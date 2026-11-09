@@ -339,7 +339,7 @@ final class NereusKafkaM4AdmissionV2 {
         }
     }
 
-    private static Sha256Digest digest(String... fields) {
+    static Sha256Digest digest(String... fields) {
         return sha(String.join("|", fields).getBytes(StandardCharsets.UTF_8));
     }
 
@@ -354,7 +354,7 @@ final class NereusKafkaM4AdmissionV2 {
         return Files.readAllBytes(file);
     }
 
-    private static Map<?, ?> object(byte[] bytes) throws Exception {
+    static Map<?, ?> object(byte[] bytes) throws Exception {
         Object parsed = Json.parseBytesAs(bytes, Map.class);
         if (!(parsed instanceof Map<?, ?> value)) {
             throw new IllegalArgumentException("M4 receipt JSON is not an object");

@@ -46,6 +46,7 @@ import com.nereusstream.storage.object.materialization.M5MaterializationObjectSe
 import com.nereusstream.storage.object.materialization.M5MaterializationPlannerV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IndexKind;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.GenerationObject;
+import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IdentityEnvelope;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationPlan;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PayloadKind;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain;
@@ -110,10 +111,7 @@ final class NereusKafkaObjectMaterialization {
     static Prepared prepare(NereusKafkaNativeInputV2.Captured capture, Proposal proposal,
             M5CellProviderProfileV2 provider, Caps caps, long decodedBytes) {
         var worker = proposal.identity();
-        if (!worker.protocolCellSha256().equals(provider.protocolCellSha256())
-                || !worker.providerScopeSha256().equals(provider.scopeId().digest())) {
-            throw new IllegalArgumentException("Kafka materialization worker belongs to another Object Cell or scope");
-        }
+        requireWorkerProfile(worker, provider);
         if (capture.predecessorSelector().fallbackSetSha256().isPresent()) {
             throw new IllegalStateException("first Kafka Object generation requires the raw BK predecessor");
         }
@@ -140,6 +138,17 @@ final class NereusKafkaObjectMaterialization {
         var prepared = semantic
                 ? prepareSemantic(capture, worker, provider, reader, caps, decodedBytes)
                 : preparePreserving(capture, worker, provider, reader);
+        return requireOutputBound(prepared, provider);
+    }
+
+    private static void requireWorkerProfile(IdentityEnvelope worker, M5CellProviderProfileV2 provider) {
+        if (!worker.protocolCellSha256().equals(provider.protocolCellSha256())
+                || !worker.providerScopeSha256().equals(provider.scopeId().digest())) {
+            throw new IllegalArgumentException("Kafka materialization worker belongs to another Object Cell or scope");
+        }
+    }
+
+    private static Prepared requireOutputBound(Prepared prepared, M5CellProviderProfileV2 provider) {
         if (prepared.candidates().stream().anyMatch(candidate ->
                 candidate.descriptor().identity().bodyLength() > provider.maximumObjectBytes())) {
             throw new IllegalStateException("Kafka materialized Object exceeds the admitted provider limit");
@@ -148,7 +157,7 @@ final class NereusKafkaObjectMaterialization {
     }
 
     private static Prepared preparePreserving(NereusKafkaNativeInputV2.Captured capture,
-            com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IdentityEnvelope worker,
+            IdentityEnvelope worker,
             M5CellProviderProfileV2 provider, M5BytePreservingMaterializerV1.SourceReader reader) {
         var cut = NereusKafkaCompactionPlanV2.sourceCut(capture, worker, provider.scopeId().digest());
         var plan = new M5MaterializationPlannerV1().plan(cut, new M5MaterializationPlannerV1.PlanningPolicy(
@@ -165,8 +174,28 @@ final class NereusKafkaObjectMaterialization {
         }
     }
 
-    private static Prepared prepareSemantic(NereusKafkaNativeInputV2.Captured capture,
-            com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IdentityEnvelope worker,
+    static Prepared prepare(NereusKafkaObjectWalCompactionInput capture, Proposal proposal,
+            NereusKafkaObjectProvider provider, Caps caps, long decodedBytes) {
+        var worker = proposal.identity();
+        var profile = provider.profile();
+        requireWorkerProfile(worker, profile);
+        if (capture.predecessorSelector().fallbackSetSha256().isPresent()) {
+            throw new IllegalStateException("first Kafka Object WAL generation requires its raw predecessor");
+        }
+        var sources = capture.extents().stream().collect(Collectors.toUnmodifiableMap(
+                SourceExtent::sourceIdentitySha256, Function.identity()));
+        M5BytePreservingMaterializerV1.SourceReader reader = source -> {
+            if (!source.equals(sources.get(source.sourceIdentitySha256()))) {
+                throw new IOException("Kafka Object WAL validation received another sealed source");
+            }
+            var identity = new ObjectIdentity(source.physicalKey(), source.canonicalLength(), source.bodySha256());
+            return provider.readVersion(identity, source.immutableProviderVersionToken().orElseThrow()).value();
+        };
+        return requireOutputBound(prepareSemantic(capture, worker, profile, reader, caps, decodedBytes), profile);
+    }
+
+    private static Prepared prepareSemantic(NereusKafkaCompactionPlanV2.Input capture,
+            IdentityEnvelope worker,
             M5CellProviderProfileV2 provider, M5BytePreservingMaterializerV1.SourceReader reader, Caps caps, long decodedBytes) {
         var plan = NereusKafkaCompactionPlanV2.buildForTask(capture, worker, caps, decodedBytes);
         capture.recoveryState().requirePlan(plan);

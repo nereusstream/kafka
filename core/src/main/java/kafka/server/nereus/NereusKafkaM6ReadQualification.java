@@ -104,6 +104,10 @@ final class NereusKafkaM6ReadQualification {
         verifyCases(root, suite);
     }
 
+    static void verifySingleCase(byte[] bytes, String className, String caseName) throws Exception {
+        verifyXml(bytes, new Suite(className, 1, caseName));
+    }
+
     private static void verifyCases(Element root, Suite suite) {
         var cases = root.getElementsByTagName("testcase");
         require(cases.getLength() == suite.count(), "wrong executed test count");

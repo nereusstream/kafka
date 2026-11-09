@@ -99,7 +99,7 @@ public class KafkaObjectWalProcessRealTest {
 
     private static void run(Path work, KafkaObjectWalAdapterRealTest.Provisioned fixture, AsyncOxiaClient control,
             S3Client minio, String foreignBucket) throws Exception {
-        var settings = fixture.settings();
+        var settings = KafkaObjectNativeCompactionRealScenario.configureReadQualification(work, fixture);
         int[] ports = KafkaBookKeeperProcessRealTest.allocatePorts();
         String voters = "2@127.0.0.1:" + ports[2];
         String cluster = Uuid.randomUuid().toString();
@@ -108,9 +108,7 @@ public class KafkaObjectWalProcessRealTest {
                  var cold = new NativeNode(work, settings, 1, ports[1], voters, false)) {
             for (var node : List.of(controller, original, cold)) node.format(cluster);
             controller.start();
-            cold.assertRejectsForeignObjectBucket(foreignBucket);
-            var rejectedToken = Files.writeString(work.resolve("unauthorized-vault-token"), "unissued-token");
-            cold.assertRejectsUnqualifiedObjectWalToken(rejectedToken);
+            assertRejectsUnqualifiedSources(work, cold, foreignBucket);
             original.start();
             var client = KafkaBookKeeperProcessRealTest.client(ports[0]);
             var producerClient = new Properties();
@@ -131,6 +129,7 @@ public class KafkaObjectWalProcessRealTest {
                 var created = admin.createTopics(List.of(topic(OBJECT, "OBJECT_WAL"), topic(BK, "BOOKKEEPER_WAL_ONLY")));
                 created.all().get(30, TimeUnit.SECONDS);
                 topicId = created.topicId(OBJECT.topic()).get(30, TimeUnit.SECONDS);
+                KafkaObjectNativeCompactionRealScenario.installCapacity(fixture, control, topicId);
                 appendWithLostPut(client, admin, minio, (String) settings.get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG),
                         fixture, control, topicId);
                 firstKafkaEpoch = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(
@@ -235,6 +234,12 @@ public class KafkaObjectWalProcessRealTest {
                         OFFSETS, destination, TRANSACTIONS, destination,
                         KafkaObjectNativeCompactionRealScenario.COMPACT, destination))
                 .all().get(30, TimeUnit.SECONDS);
+    }
+
+    private static void assertRejectsUnqualifiedSources(Path work, NativeNode broker, String foreignBucket) throws Exception {
+        broker.assertRejectsForeignObjectBucket(foreignBucket);
+        var rejectedToken = Files.writeString(work.resolve("unauthorized-vault-token"), "unissued-token");
+        broker.assertRejectsUnqualifiedObjectWalToken(rejectedToken);
     }
 
     private static void verifyWireExits(Properties client, Admin finalAdmin, int port, Uuid topicId,

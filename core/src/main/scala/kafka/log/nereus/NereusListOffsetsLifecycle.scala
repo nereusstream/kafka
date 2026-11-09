@@ -144,6 +144,7 @@ final class NereusListOffsetsLifecycle(context: BrokerStorageRuntimeContext, pro
                 if (recoveryFailure == null && current(attempt)) {
                   try {
                     attempt.partition.installLeaderEpochAwareOffsetLookup(attempt.epoch, lookup)
+                    opened.nativeReady()
                     attempt.result.complete(null)
                     signal(attempt.identity)
                   } catch {

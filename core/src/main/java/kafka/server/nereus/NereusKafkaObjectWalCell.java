@@ -25,6 +25,7 @@ import org.apache.kafka.common.metadata.TopicBindingAggregateRecord;
 
 import com.nereusstream.domain.aggregate.StorageProfileV1;
 import com.nereusstream.domain.bytes.Sha256Digest;
+import com.nereusstream.domain.codec.TopicIncarnationIdentityCodecV1;
 import com.nereusstream.domain.identity.Id128;
 import com.nereusstream.domain.identity.KafkaTopicId;
 import com.nereusstream.domain.identity.StorageEpochId;
@@ -44,6 +45,7 @@ import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionFenceV1;
 import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionPublicationObserver;
 import com.nereusstream.metadata.oxia.v2.objectwal.OxiaCanonicalControlMetadataStore;
 import com.nereusstream.metadata.oxia.v2.retention.Oxia09ExactMetadataTransactionStoreV1;
+import com.nereusstream.metadata.oxia.v2.retention.OxiaKafkaBookKeeperM4ReadRouteV2;
 import com.nereusstream.metadata.oxia.v2.retention.OxiaPhysicalMetadataNamespaceV2;
 import com.nereusstream.storage.api.kafka.KafkaOwnerIdentityV1;
 import com.nereusstream.storage.object.control.ControlMutationOutcome;
@@ -54,30 +56,36 @@ import com.nereusstream.storage.object.control.WalRunControlKeys;
 import com.nereusstream.storage.object.control.WalRunLifecycleManager;
 import com.nereusstream.storage.object.control.WalRunObjectSession;
 import com.nereusstream.storage.object.control.WalRunRootRecord;
+import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingIdentity;
 import com.nereusstream.storage.object.recovery.OwnerOpenRecoveryCoordinator;
 import com.nereusstream.storage.object.recovery.WalRunLineageRecovery;
 
 import java.io.IOException;
 import java.time.Duration;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import io.oxia.client.api.AsyncOxiaClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1.fromRecord;
 
 /** Native Object WAL opens one exact KRaft partition assignment and its retained source set. */
 final class NereusKafkaObjectWalCell implements AutoCloseable {
+    private static final Logger LOG = LoggerFactory.getLogger(NereusKafkaObjectWalCell.class);
     private final BrokerStorageRuntimeContext context;
     private final OxiaPhysicalMetadataNamespaceV2 namespace;
     private final AsyncOxiaClient control;
@@ -86,20 +94,27 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
     private final NereusKafkaObjectWalRoot roots;
     private final Executor recoveryExecutor;
     private final Duration timeout;
-    private final Set<NereusKafkaObjectWalPartition> owned = new HashSet<>();
+    private final Optional<NereusKafkaObjectReadAdmissionV1> readAdmission;
+    private final Set<NereusKafkaObjectWalPartition> owned = new LinkedHashSet<>();
+    private final ScheduledFuture<?> compactionSchedule;
+    private CompletableFuture<Void> activeCompaction = CompletableFuture.completedFuture(null);
     private boolean closed;
 
     NereusKafkaObjectWalCell(BrokerStorageRuntimeContext context, OxiaPhysicalMetadataNamespaceV2 namespace,
             AsyncOxiaClient control, NereusKafkaObjectProvider provider, NereusKafkaObjectWalKms kms,
-            Executor recoveryExecutor) {
+            Executor recoveryExecutor, Optional<NereusKafkaObjectReadAdmissionV1> readAdmission) {
         this.context = context;
         this.namespace = namespace;
         this.control = control;
         this.provider = provider;
         this.kms = kms;
         this.recoveryExecutor = recoveryExecutor;
+        this.readAdmission = readAdmission;
         this.roots = new NereusKafkaObjectWalRoot(context.config(), provider.profile());
         timeout = context.config().nereusKafkaStorageConfig().lifecycle().recoveryTimeout();
+        long period = context.config().nereusKafkaStorageConfig().retentionCompaction().retentionCheckInterval().toMillis();
+        compactionSchedule = readAdmission.isEmpty() ? null
+                : context.scheduler().schedule("nereus-kafka-object-wal-compaction", this::compact, period, period);
     }
 
     static NereusKafkaObjectWalCell start(BrokerStorageRuntimeContext context,
@@ -109,7 +124,8 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
         NereusKafkaObjectWalKms kms = null;
         try {
             kms = NereusKafkaObjectWalKms.open(context.config(), provider.profile());
-            return new NereusKafkaObjectWalCell(context, namespace, control, provider, kms, recoveryExecutor);
+            return new NereusKafkaObjectWalCell(context, namespace, control, provider, kms, recoveryExecutor,
+                    NereusKafkaObjectReadAdmissionV1.load(context.config(), provider));
         } catch (Exception | Error failure) {
             if (kms != null) {
                 try {
@@ -148,7 +164,8 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
             var runs = new NereusKafkaObjectWalRuns(shard, metadata, exact, provider, kms, roots, timeout);
             var authority = new KafkaObjectAuthorizationV1(metadata, shard.id(),
                     new KafkaObjectAuthorizationV1.Bounds(2048, 1024, 1024L * 64 * 1024 * 1024, 1024));
-            var attempt = new Open(runs, metadata, authority, fence, owner, assignment, observer);
+            var attempt = new Open(runs, metadata, authority, fence, owner, assignment, observer,
+                    identity, Math.addExact(aggregate.epochOrdinal(), 1));
             var opened = attempt.open();
             synchronized (this) {
                 if (closed) {
@@ -170,6 +187,24 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
         List.copyOf(owned).forEach(NereusKafkaObjectWalPartition::fence);
     }
 
+    private synchronized void compact() {
+        if (!activeCompaction.isDone()) return;
+        var candidate = closed ? Optional.<NereusKafkaObjectWalPartition>empty()
+                : owned.stream().filter(NereusKafkaObjectWalPartition::compactionReady).findFirst();
+        candidate.ifPresent(partition -> {
+            owned.remove(partition);
+            owned.add(partition);
+        });
+        activeCompaction = CompletableFuture.completedFuture(null).thenComposeAsync(ignored -> {
+            provider.reconcileOriginalReads();
+            return candidate.map(partition -> partition.advanceCompaction(recoveryExecutor))
+                    .orElseGet(() -> CompletableFuture.completedFuture(null));
+        }, recoveryExecutor).exceptionally(failure -> {
+            LOG.warn("Native Kafka Object WAL maintenance retains its current operation", failure);
+            return null;
+        });
+    }
+
     @Override
     public void close() throws Exception {
         fence();
@@ -177,9 +212,13 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
         synchronized (this) {
             closing = List.copyOf(owned);
         }
-        CompletableFuture.allOf(closing.stream().map(NereusKafkaObjectWalPartition::closeAsync)
-                .toArray(CompletableFuture[]::new)).get(context.config().nereusKafkaStorageConfig().rollout()
-                        .shutdownDrainTimeout().toNanos(), TimeUnit.NANOSECONDS);
+        try {
+            CompletableFuture.allOf(closing.stream().map(NereusKafkaObjectWalPartition::closeAsync)
+                    .toArray(CompletableFuture[]::new)).get(context.config().nereusKafkaStorageConfig().rollout()
+                            .shutdownDrainTimeout().toNanos(), TimeUnit.NANOSECONDS);
+        } finally {
+            if (compactionSchedule != null) compactionSchedule.cancel(false);
+        }
         provider.drainFetches();
         kms.close();
         provider.close();
@@ -207,11 +246,14 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
         private final KafkaOwnerIdentityV1 owner;
         private final NereusKafkaObjectWalPartition.NativeAssignment assignment;
         private final KafkaPartitionPublicationObserver observer;
+        private final TopicIdPartition identity;
+        private final long storageFence;
         private final Map<Sha256Digest, NereusKafkaObjectWalPartition.Source> sources = new HashMap<>();
 
         private Open(NereusKafkaObjectWalRuns runs, OxiaCanonicalControlMetadataStore metadata,
                 KafkaObjectAuthorizationV1 authority, KafkaPartitionFenceV1 fence, KafkaOwnerIdentityV1 owner,
-                NereusKafkaObjectWalPartition.NativeAssignment assignment, KafkaPartitionPublicationObserver observer) {
+                NereusKafkaObjectWalPartition.NativeAssignment assignment, KafkaPartitionPublicationObserver observer,
+                TopicIdPartition identity, long storageFence) {
             this.runs = runs;
             this.metadata = metadata;
             this.authority = authority;
@@ -219,6 +261,8 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
             this.owner = owner;
             this.assignment = assignment;
             this.observer = observer;
+            this.identity = identity;
+            this.storageFence = storageFence;
         }
 
         private NereusKafkaObjectWalPartition open() throws Exception {
@@ -376,11 +420,46 @@ final class NereusKafkaObjectWalCell implements AutoCloseable {
         }
 
         private NereusKafkaObjectWalPartition arm(WalRunObjectSession fresh, KafkaCoherentCommitCoordinatorV1 coordinator,
-                Optional<KafkaObjectRecoveredTailV1> tail) {
+                Optional<KafkaObjectRecoveredTailV1> tail) throws Exception {
             var writer = KafkaObjectNativeAppendV1.open(fresh, metadata, authority, coordinator, tail, assignment::current);
             if (!assignment.current()) throw new FencedLeaderEpochException("Object WAL election changed before ready");
-            return new NereusKafkaObjectWalPartition(coordinator, writer, sources, provider.fetchExecutor(),
+            var partition = new NereusKafkaObjectWalPartition(coordinator, writer, sources, provider.fetchExecutor(),
                     recoveryExecutor, assignment, () -> context.time().milliseconds(), this::rollover);
+            installCompaction(partition);
+            return partition;
+        }
+
+        private void installCompaction(NereusKafkaObjectWalPartition partition) throws Exception {
+            var binding = new BindingIdentity(fence.bindingId(),
+                    Sha256Digest.hash(TopicIncarnationIdentityCodecV1.encode(fence.topicIncarnation())),
+                    fence.storageEpochId().digest());
+            var route = OxiaKafkaBookKeeperM4ReadRouteV2.forObjectWal(control, namespace.identity(), identity.partition(), binding);
+            var previous = route.readSelector();
+            if (previous.isEmpty() && (readAdmission.isEmpty()
+                    || !NereusKafkaM5PolicyInputV1.captureObjectWalPolicy(context, identity).config().compact)) return;
+            var admission = readAdmission.orElseThrow(() ->
+                    new IllegalStateException("native Object WAL selection requires its exact read qualification"));
+            var rawView = NereusKafkaM4AdmissionV2.digest("NEREUS_KAFKA_OBJECT_WAL_RAW_BINDING_VIEW_V1",
+                    binding.bindingId().digest().toHex(), binding.incarnationSha256().toHex(),
+                    binding.storageEpochSha256().toHex(), Integer.toString(identity.partition()));
+            requireCompactionOwner();
+            var selector = admission.provision(route, previous, previous.map(value -> value.selectedViewSha256()).orElse(rawView),
+                    owner.ownerEpoch());
+            var worker = new NereusKafkaObjectWalCompaction(context, identity, partition, authority, route, provider,
+                    this::requireCompactionOwner, owner.ownerEpoch(), storageFence, NereusKafkaNativeInputV2.nativeWorkerFence(owner), rawView);
+            worker.recover(selector);
+            partition.attachCompaction(worker);
+        }
+
+        private void requireCompactionOwner() {
+            if (!assignment.current()) throw new FencedLeaderEpochException("native Object WAL compaction owner changed");
+            try {
+                runs.requireNativeOwner(owner);
+            } catch (RuntimeException failure) {
+                throw failure;
+            } catch (Exception failure) {
+                throw new CompletionException(failure);
+            }
         }
 
         private NereusKafkaObjectWalPartition.RolledRun rollover(KafkaObjectNativeAppendV1 writer) throws Exception {

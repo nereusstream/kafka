@@ -129,6 +129,62 @@ final class NereusKafkaObjectPublication {
         }, control);
     }
 
+    /** Raw NWG1 remains under its original WAL authority. Every new output retains its M5 writer ticket. */
+    static CompletionStage<Void> publishNativeWal(NereusKafkaObjectMaterialization.Verified verified,
+            NereusKafkaObjectProvider provider, NereusKafkaObjectWalPartition partition,
+            Runnable requireCurrent, Executor control, Duration timeout) {
+        var task = verified.stored().task();
+        var plan = task.prepared().plan();
+        var profile = provider.profile();
+        var prefix = new KafkaObjectMaterializedPrefixV1(plan, verified.generation(), provider::readForFetch);
+        if (!prefix.originalFallbackSources().equals(verified.protections())
+                || prefix.rawFallbackEquivalent()
+                || plan.sourceCut().sources().stream().anyMatch(source -> source.kind() != SourceKind.OBJECT_WAL_NWG1)) {
+            throw new IllegalArgumentException("Kafka Object WAL publication differs from its verified sealed source");
+        }
+        var versions = verified.stored().credits().stream().map(credit -> credit.resource().orElseThrow()).toList();
+        var participants = objectParticipants(prefix, provider, versions);
+        var tickets = tickets(prefix, participants, task.worker().worker().nativeWorkerIdentitySha256());
+        var coordinator = new M5MaterializationCoordinatorV1(task.metadata(), task.partition(), plan.sourceCut().identity().binding());
+        return tickets.guard().executeWithContexts(tickets.contexts(), () -> CompletableFuture.supplyAsync(() -> {
+            boolean dispatched = false;
+            try {
+                NereusKafkaObjectMaterialization.requireWriteAuthority(task, provider, requireCurrent, timeout);
+                verifyMembers(participants, profile.protocolCellSha256(), timeout);
+                requireCurrent.run();
+                partition.beginSelectedPrefix(prefix);
+                dispatched = true;
+                var outcome = coordinator.publish(plan, verified.generation(), verified.protections());
+                if (!exact(outcome)) return new Completion<>(new Attempt(outcome, null), Optional.empty());
+                partition.installSelectedPrefix(prefix);
+                return new Completion<>(new Attempt(outcome, null), Optional.of(tickets.terminalRoot()));
+            } catch (Exception failure) {
+                return new Completion<>(new Attempt(PublicationOutcome.CONFLICT, failure),
+                        dispatched ? Optional.empty() : Optional.of(tickets.terminalRoot()));
+            }
+        }, control)).thenAcceptAsync(result -> finishPublication(task, profile.protocolCellSha256(), result), control);
+    }
+
+    static void reconcileNativeWal(NereusKafkaObjectRecovery.Selected selected, BindingReadSelector selector,
+            NereusKafkaObjectProvider provider, OxiaKafkaBookKeeperM4ReadRouteV2 binding, int partition,
+            Duration timeout) throws Exception {
+        var plan = selected.plan();
+        var taskId = plan.taskIdSha256();
+        var cell = plan.sourceCut().identity().protocolCellSha256();
+        var metadata = binding.materializationMetadata(cell);
+        var admission = new M5MaterializationAdmissionV1(metadata, cell);
+        if (admission.read().orElseThrow().reservations().stream().noneMatch(value -> value.taskIdSha256().equals(taskId))) return;
+        var prefix = selected.prefix();
+        var coordinator = new M5MaterializationCoordinatorV1(metadata, partition, selector.binding());
+        var outcome = coordinator.finishSelectedTask(plan, selected.validated(), prefix.originalFallbackSources(), selector);
+        if (!exact(outcome)) {
+            throw new IllegalStateException("Kafka Object WAL selected Task remains unresolved: " + outcome);
+        }
+        var participants = objectParticipants(prefix, provider, selected.versions());
+        tickets(prefix, participants, selected.inventory().worker().nativeWorkerIdentitySha256()).reconcile(timeout);
+        releaseAdmission(admission, taskId);
+    }
+
     /** Only an already selected original manifest can settle its Task and physical writer tickets. */
     static void reconcileSelected(NereusKafkaObjectRecovery.Selected selected, BindingReadSelector selector,
             NereusKafkaObjectProvider provider, KafkaBookKeeperPartitionV1.NativeReadSources raw,
@@ -232,17 +288,27 @@ final class NereusKafkaObjectPublication {
             KafkaObjectMaterializedPrefixV1 prefix, NereusKafkaObjectProvider provider,
             KafkaBookKeeperPartitionV1.NativeReadSources raw, OxiaQuotaTargetDeleteStoreV2 bookKeeper,
             List<? extends PhysicalResourceIdV2> sources, List<PhysicalResourceIdV2.ObjectVersion> versions) {
-        var profile = provider.profile();
         var cut = prefix.sourceCut();
         var bkMember = new Member(PositionDomain.KAFKA_OFFSET,
                 raw.activeRoot().providerScopeId().digest(), cut.identity().binding());
-        var objectMember = new Member(PositionDomain.KAFKA_OFFSET, profile.scopeId().digest(), cut.identity().binding());
-        var result = new TreeMap<PhysicalResourceIdV2, Participant>();
+        var result = objectParticipants(prefix, provider, versions);
         for (var ledger : sources) {
             if (result.putIfAbsent(ledger, new Participant(bookKeeper, raw.configurationSha256(), bkMember)) != null) {
                 throw new IllegalStateException("Kafka Object publication has another original BK source membership");
             }
         }
+        if (result.size() > M5TargetDeleteMultiWriterGuardV2.MAX_TARGETS) {
+            throw new IllegalStateException("Kafka Object publication physical members exceed their bounded scope");
+        }
+        return result;
+    }
+
+    private static Map<PhysicalResourceIdV2, Participant> objectParticipants(
+            KafkaObjectMaterializedPrefixV1 prefix, NereusKafkaObjectProvider provider,
+            List<PhysicalResourceIdV2.ObjectVersion> versions) {
+        var profile = provider.profile();
+        var objectMember = new Member(PositionDomain.KAFKA_OFFSET, profile.scopeId().digest(), prefix.sourceCut().identity().binding());
+        var result = new TreeMap<PhysicalResourceIdV2, Participant>();
         for (var object : versions) {
             if (!object.namespace().equals(profile.physicalBinding().physicalNamespace())
                     || result.putIfAbsent(object,

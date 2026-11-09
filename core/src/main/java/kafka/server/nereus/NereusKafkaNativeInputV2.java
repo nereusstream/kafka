@@ -21,6 +21,9 @@ import org.apache.kafka.storage.internals.log.LogConfig;
 import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.domain.codec.TopicIncarnationIdentityCodecV1;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1.NativeInputSources;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaLeaderEpochIndexV1;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaTransactionStateV1;
+import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionProtocolStateV1;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1.NativePreferredActivation;
 import com.nereusstream.kafka.bookkeeper.broker.KafkaBookKeeperPartitionV1.NativeSelectedInputSources;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaBookKeeperPublicationTicketsV2;
@@ -111,6 +114,14 @@ public final class NereusKafkaNativeInputV2 {
 
     record NativeCut(NativeInputSources inputs, TopicPolicy policy) { }
 
+    static Sha256Digest nativeWorkerFence(KafkaOwnerIdentityV1 owner) {
+        byte[] domain = "NEREUS_M5_KAFKA_NATIVE_WORKER_OWNER_V1".getBytes(StandardCharsets.US_ASCII);
+        var bytes = ByteBuffer.allocate(domain.length + 3 * Long.BYTES + 2 * Integer.BYTES)
+                .put(domain).putLong(owner.ownerEpoch()).putInt(owner.kafkaLeaderEpoch())
+                .putInt(owner.brokerId()).putLong(owner.brokerEpoch()).putLong(owner.metadataOffset());
+        return Sha256Digest.hash(CanonicalBytes.copyOf(bytes.array()));
+    }
+
     /** Failed preparation whose actual reads, tickets and persisted capacity have all terminated. */
     public static final class CaptureReleasedException extends IllegalStateException {
         private static final long serialVersionUID = 1L;
@@ -142,7 +153,7 @@ public final class NereusKafkaNativeInputV2 {
                 throw new IllegalArgumentException("native M5 capture resource allowance is invalid");
         }
 
-        private Reservation reservation(Sha256Digest attempt) {
+        Reservation reservation(Sha256Digest attempt) {
             return new Reservation(attempt, planCaps.maximumDirtyBytes(), planCaps.maximumInputBatches(),
                     planCaps.maximumRecords(), planCaps.maximumDistinctKeys(), planCaps.maximumKeyBytes(),
                     planCaps.maximumOutputBytes(), planCaps.maximumIndexBytes(), planCaps.maximumTransactions(),
@@ -790,7 +801,8 @@ public final class NereusKafkaNativeInputV2 {
     }
 
     /** Constructed only from this Broker's admitted native catalog and bytes; callers cannot import a capture. */
-    public final class Captured implements KafkaBookKeeperPublicationTicketsV2.InputMembership {
+    public final class Captured implements KafkaBookKeeperPublicationTicketsV2.InputMembership,
+            NereusKafkaCompactionPlanV2.Input {
         private final Scan snapshot;
         private final List<SourceExtent> extents;
         private final List<InputBatch> batches;
@@ -828,6 +840,26 @@ public final class NereusKafkaNativeInputV2 {
             return nativeCut;
         }
 
+        @Override
+        public KafkaPartitionProtocolStateV1 protocolRoot() {
+            return nativeSources().protocol().root();
+        }
+
+        @Override
+        public KafkaTransactionStateV1 transactionState() {
+            return nativeSources().protocol().transactionState();
+        }
+
+        @Override
+        public KafkaLeaderEpochIndexV1 leaderEpochIndex() {
+            return nativeSources().protocol().leaderEpochIndex();
+        }
+
+        @Override
+        public Sha256Digest rawViewSha256() {
+            return nativeSources().sources().selectedViewSha256();
+        }
+
         public KafkaCompactionRecoveryStateV1 recoveryState() {
             requireOpen();
             return recoveryState;
@@ -848,7 +880,8 @@ public final class NereusKafkaNativeInputV2 {
             return frontiers;
         }
 
-        boolean dirtyInput(InputBatch batch) {
+        @Override
+        public boolean dirtyInput(InputBatch batch) {
             return extents.stream().anyMatch(extent -> extent.kind() == SourceKind.BOOKKEEPER_LEDGER
                     && extent.sourceIdentitySha256().equals(batch.sourceIdentitySha256()));
         }
@@ -1032,7 +1065,7 @@ public final class NereusKafkaNativeInputV2 {
                         }, () -> {
                             var namespace = Sha256Digest.hash(profile.physicalBinding().encode());
                             var plan = prepared.plan();
-                            return workers.resumePlan(plan, nativeWorkerFence(), namespace).orElseGet(() -> {
+                            return workers.resumePlan(plan, nativeWorkerFence(owner), namespace).orElseGet(() -> {
                                 var proposal = proposeCurrentWorker(workers, profile.scopeId().digest(), namespace);
                                 if (!proposal.identity().equals(plan.sourceCut().identity())) {
                                     throw new IllegalStateException("Kafka Object worker identity changed during registration");
@@ -1090,7 +1123,7 @@ public final class NereusKafkaNativeInputV2 {
                             throw new IllegalStateException("native Kafka Object cancellation changed its original cut");
                         }
                         NereusKafkaObjectMaterialization.cancelUnstarted(task, provider.profile(),
-                                nativeCut.sources().activeRoot().partitionId(), m4, nativeWorkerFence(), () -> {
+                                nativeCut.sources().activeRoot().partitionId(), m4, nativeWorkerFence(owner), () -> {
                                     if (!originalRawObjectSourceAdvanced()) {
                                         throw new IllegalStateException("native Kafka Object cancellation lost its current raw Owner");
                                     }
@@ -1178,17 +1211,10 @@ public final class NereusKafkaNativeInputV2 {
                 M5MaterializationWorkerCoordinatorV1 workers, Sha256Digest outputProviderScope,
                 Sha256Digest outputNamespaceBinding) {
             return workers.propose(selector.get(), opened.nativeM5ProtocolCell(), outputProviderScope,
-                    opened.nativeM5StorageFence(), nativeWorkerFence(), outputNamespaceBinding)
+                    opened.nativeM5StorageFence(), nativeWorkerFence(owner), outputNamespaceBinding)
                     .orElseThrow(() -> new IllegalStateException("native M5 worker predecessor changed"));
         }
 
-        private Sha256Digest nativeWorkerFence() {
-            byte[] domain = "NEREUS_M5_KAFKA_NATIVE_WORKER_OWNER_V1".getBytes(StandardCharsets.US_ASCII);
-            var bytes = ByteBuffer.allocate(domain.length + 3 * Long.BYTES + 2 * Integer.BYTES)
-                    .put(domain).putLong(owner.ownerEpoch()).putInt(owner.kafkaLeaderEpoch())
-                    .putInt(owner.brokerId()).putLong(owner.brokerEpoch()).putLong(owner.metadataOffset());
-            return Sha256Digest.hash(CanonicalBytes.copyOf(bytes.array()));
-        }
 
         /** Exact native membership recheck, for use before the separately authorized publication CAS. */
         public CompletionStage<Map<Sha256Digest, List<PhysicalResourceIdV2>>> verifyInputs(

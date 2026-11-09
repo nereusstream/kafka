@@ -23,11 +23,16 @@ import org.apache.kafka.common.utils.Time;
 import com.nereusstream.domain.bytes.CanonicalBytes;
 import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.domain.codec.TopicIncarnationIdentityCodecV1;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaLeaderEpochIndexV1;
+import com.nereusstream.kafka.bookkeeper.commit.KafkaTransactionStateV1;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1;
+import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecoveryStateV1;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Caps;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.CleanupPolicy;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.CompactionPlan;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.ControlKind;
+import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Frontiers;
+import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.InputBatch;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.LatestKeyProof;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.LeaderEpochRange;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.ParsedBatch;
@@ -37,12 +42,15 @@ import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.Rec
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.TransactionOutcome;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaCompactionRecordsV1.TransactionRange;
 import com.nereusstream.kafka.bookkeeper.compaction.KafkaRecordBatchCodecV1;
+import com.nereusstream.kafka.bookkeeper.protocol.KafkaPartitionProtocolStateV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationCodecV1;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.IdentityEnvelope;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.MaterializationSourceCut;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.PositionDomain;
 import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.ProtocolCoverage;
+import com.nereusstream.storage.object.materialization.M5MaterializationRecordsV1.SourceExtent;
 import com.nereusstream.storage.object.read.control.M4ReadControlCodecV1;
+import com.nereusstream.storage.object.read.control.M4ReadControlRecordsV1.BindingReadSelector;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
@@ -57,17 +65,31 @@ import java.util.TreeMap;
 
 /** Derives semantic facts from the actual retained native input. No worker, output or publication is admitted here. */
 final class NereusKafkaCompactionPlanV2 {
+    interface Input {
+        NereusKafkaNativeInputV2.TopicPolicy topicPolicy();
+        BindingReadSelector predecessorSelector();
+        Frontiers frontiers();
+        KafkaPartitionProtocolStateV1 protocolRoot();
+        KafkaTransactionStateV1 transactionState();
+        KafkaLeaderEpochIndexV1 leaderEpochIndex();
+        KafkaCompactionRecoveryStateV1 recoveryState();
+        Sha256Digest rawViewSha256();
+        List<SourceExtent> extents();
+        List<InputBatch> batches();
+        boolean dirtyInput(InputBatch batch);
+    }
+
     private NereusKafkaCompactionPlanV2() { }
 
-    static CompactionPlan build(NereusKafkaNativeInputV2.Captured capture, IdentityEnvelope identity, Caps caps, long maximumDecodedBytes) {
+    static CompactionPlan build(Input capture, IdentityEnvelope identity, Caps caps, long maximumDecodedBytes) {
         return build(capture, identity, caps, maximumDecodedBytes, false);
     }
 
-    static CompactionPlan buildForTask(NereusKafkaNativeInputV2.Captured capture, IdentityEnvelope identity, Caps caps, long maximumDecodedBytes) {
+    static CompactionPlan buildForTask(Input capture, IdentityEnvelope identity, Caps caps, long maximumDecodedBytes) {
         return build(capture, identity, caps, maximumDecodedBytes, true);
     }
 
-    private static CompactionPlan build(NereusKafkaNativeInputV2.Captured capture, IdentityEnvelope identity, Caps caps,
+    private static CompactionPlan build(Input capture, IdentityEnvelope identity, Caps caps,
             long maximumDecodedBytes, boolean preparingTask) {
         var frontiers = capture.frontiers();
         var topic = capture.topicPolicy();
@@ -75,13 +97,13 @@ final class NereusKafkaCompactionPlanV2 {
         if (!config.compact) throw new IllegalStateException("native M5 topic does not enable compaction");
         if (frontiers.candidateStartOffset() != frontiers.logStartOffset())
             throw new IllegalStateException("native M5 complete key domain does not start at logical trim");
-        var protocol = capture.nativeSources().protocol();
+        var protocol = capture.protocolRoot();
         var transactions = transactions(capture, caps);
         var parsed = parse(capture, caps, maximumDecodedBytes);
         long nowMs = Time.SYSTEM.milliseconds();
         if (preparingTask) requireEligible(capture, parsed, nowMs);
         var keys = latestKeys(parsed, transactions, caps);
-        var references = protocol.root().references();
+        var references = protocol.references();
         var roots = new ProtocolRoots(references.committedProducerState().contentDigest(),
                 references.speculativeProducerQueue().contentDigest(), references.transactionIndex().contentDigest(),
                 hash("NEREUS_NATIVE_ABORTED_TRANSACTIONS_V1", out -> writeTransactions(out,
@@ -106,10 +128,10 @@ final class NereusKafkaCompactionPlanV2 {
                 leaderEpochs(capture), List.of(), List.of());
     }
 
-    static MaterializationSourceCut sourceCut(NereusKafkaNativeInputV2.Captured capture, IdentityEnvelope identity,
+    static MaterializationSourceCut sourceCut(Input capture, IdentityEnvelope identity,
             Sha256Digest outputPolicy) {
         var frontiers = capture.frontiers();
-        var checkpoint = capture.nativeSources().protocol().root().references().checkpointVector().contentDigest();
+        var checkpoint = capture.protocolRoot().references().checkpointVector().contentDigest();
         return new MaterializationSourceCut(identity, capture.predecessorSelector(),
                 Sha256Digest.hash(M4ReadControlCodecV1.encodeSelector(capture.predecessorSelector())),
                 capture.predecessorSelector().selectedViewSha256(), new ProtocolCoverage(PositionDomain.KAFKA_OFFSET,
@@ -121,7 +143,7 @@ final class NereusKafkaCompactionPlanV2 {
     }
 
     /** Only the sealed raw suffix is dirty when the complete key domain starts in a selected generation. */
-    private static void requireEligible(NereusKafkaNativeInputV2.Captured capture, List<ParsedBatch> batches, long nowMs) {
+    private static void requireEligible(Input capture, List<ParsedBatch> batches, long nowMs) {
         var config = capture.topicPolicy().config();
         long minLag = Math.max(config.compactionLagMs, 0L);
         long totalBytes = 0;
@@ -145,7 +167,7 @@ final class NereusKafkaCompactionPlanV2 {
             throw new IllegalStateException("native M5 sealed prefix does not exceed min.cleanable.dirty.ratio");
     }
 
-    private static List<ParsedBatch> parse(NereusKafkaNativeInputV2.Captured capture, Caps caps, long maximumDecodedBytes) {
+    private static List<ParsedBatch> parse(Input capture, Caps caps, long maximumDecodedBytes) {
         var result = new ArrayList<ParsedBatch>();
         int records = 0;
         long bytes = 0;
@@ -166,8 +188,8 @@ final class NereusKafkaCompactionPlanV2 {
         return List.copyOf(result);
     }
 
-    private static List<TransactionRange> transactions(NereusKafkaNativeInputV2.Captured capture, Caps caps) {
-        var state = capture.nativeSources().protocol().transactionState();
+    private static List<TransactionRange> transactions(Input capture, Caps caps) {
+        var state = capture.transactionState();
         var frontiers = capture.frontiers();
         var result = state.completedTransactions().stream()
                 .filter(tx -> tx.firstOffset() < frontiers.candidateEndOffsetExclusive()
@@ -219,8 +241,8 @@ final class NereusKafkaCompactionPlanV2 {
         return matching.get(0).outcome() == TransactionOutcome.COMMITTED;
     }
 
-    private static List<LeaderEpochRange> leaderEpochs(NereusKafkaNativeInputV2.Captured capture) {
-        var starts = capture.nativeSources().protocol().leaderEpochIndex().startOffsets();
+    private static List<LeaderEpochRange> leaderEpochs(Input capture) {
+        var starts = capture.leaderEpochIndex().startOffsets();
         long end = capture.frontiers().candidateEndOffsetExclusive();
         var result = new ArrayList<LeaderEpochRange>();
         for (var entry : starts.entrySet()) {
@@ -246,12 +268,12 @@ final class NereusKafkaCompactionPlanV2 {
         });
     }
 
-    private static Sha256Digest keyDomainRoot(NereusKafkaNativeInputV2.Captured capture, List<LatestKeyProof> keys,
+    private static Sha256Digest keyDomainRoot(Input capture, List<LatestKeyProof> keys,
             List<TransactionRange> transactions) {
         return hash("NEREUS_NATIVE_KAFKA_COMPLETE_KEY_DOMAIN_V1", out -> {
             out.writeLong(capture.frontiers().logStartOffset());
             out.writeLong(capture.frontiers().candidateEndOffsetExclusive());
-            writeDigest(out, capture.nativeSources().sources().selectedViewSha256());
+            writeDigest(out, capture.rawViewSha256());
             writeDigest(out, M5MaterializationCodecV1.calculateSourceSetSha256(capture.extents()));
             out.writeInt(capture.batches().size());
             for (var batch : capture.batches()) writeDigest(out, Sha256Digest.hash(batch.canonicalBody()));
@@ -267,9 +289,9 @@ final class NereusKafkaCompactionPlanV2 {
         });
     }
 
-    private static Sha256Digest protocolRoot(NereusKafkaNativeInputV2.Captured capture) {
+    private static Sha256Digest protocolRoot(Input capture) {
         return hash("NEREUS_NATIVE_KAFKA_COHERENT_CUT_V1", out -> {
-            var root = capture.nativeSources().protocol().root();
+            var root = capture.protocolRoot();
             var fence = root.fence();
             writeDigest(out, fence.bindingId().digest());
             var incarnation = TopicIncarnationIdentityCodecV1.encode(fence.topicIncarnation());

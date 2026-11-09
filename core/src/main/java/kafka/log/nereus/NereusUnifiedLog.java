@@ -515,12 +515,13 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
     private CompletionStage<FetchDataInfo> planObjectFetch(
             long offset, int maximumBytes, FetchIsolation isolation, boolean minOneMessage) {
         var exact = requireObjectStorage(publishedEpoch);
-        var snapshot = exact.capture();
+        var view = exact.captureReadView();
+        var snapshot = view.snapshot();
         if (offset < snapshot.root().frontiers().trimStartOffset()
                 || offset > snapshot.root().frontiers().readableEndOffset()) {
             throw new OffsetOutOfRangeException("Object WAL Fetch is outside its captured range");
         }
-        return exact.read(snapshot, offset, Math.max(0, maximumBytes), hardMaxFetchBytes, minOneMessage,
+        return exact.read(view, offset, Math.max(0, maximumBytes), hardMaxFetchBytes, minOneMessage,
                         readIsolation(isolation))
                 .thenApply(read -> {
                     var buffer = ByteBuffer.allocate(read.bytes());
@@ -629,7 +630,8 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
 
     private CompletionStage<Optional<FileRecords.TimestampAndOffset>> lookupObjectTimestamp(long timestamp, int epoch) {
         var exact = requireObjectStorage(epoch);
-        var snapshot = exact.capture();
+        var view = exact.captureReadView();
+        var snapshot = view.snapshot();
         var frontiers = snapshot.root().frontiers();
         if (timestamp == ListOffsetsRequest.EARLIEST_TIMESTAMP || timestamp == ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP) {
             return CompletableFuture.completedFuture(Optional.of(new FileRecords.TimestampAndOffset(
@@ -643,7 +645,7 @@ public final class NereusUnifiedLog extends UnifiedLog implements RequiredAcksAw
             return CompletableFuture.completedFuture(Optional.empty());
         }
         int limit = (int) Math.min(timestampScan.maxScanBytes(), Integer.MAX_VALUE);
-        return exact.read(snapshot, frontiers.trimStartOffset(), limit, limit, false, KafkaReadIsolationV1.READ_UNCOMMITTED)
+        return exact.read(view, frontiers.trimStartOffset(), limit, limit, false, KafkaReadIsolationV1.READ_UNCOMMITTED)
                 .toCompletableFuture().orTimeout(timestampScan.timeout().toMillis(), TimeUnit.MILLISECONDS)
                 .thenApply(result -> {
                     synchronized (guard) {

@@ -1204,6 +1204,10 @@ project(':core') {
           if (directory != null) {
             systemProperty 'nereus.nsip.processEvidenceDir', directory
           }
+          if (taskName == 'nereusKafkaObjectWalProcessRealTest') {
+            systemProperty 'nereus.nsip.objectWalReadAdmissionFile',
+                providers.gradleProperty('v2M6ObjectWalReadAdmissionFile').get()
+          }
         }
       }
     }
