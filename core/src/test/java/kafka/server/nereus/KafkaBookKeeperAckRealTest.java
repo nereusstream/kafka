@@ -228,47 +228,75 @@ public class KafkaBookKeeperAckRealTest {
     public void staleQuorumCallbackCannotPublishAfterNativeOwnerChange(@TempDir Path inputs) throws Exception {
         var observer = new HoldDurability();
         try (var cluster = nativeCluster(inputs, observer, 2)) {
-            cluster.format();
-            cluster.startup();
-            cluster.waitForReadyBrokers();
-            var client = new Properties();
-            client.setProperty("bootstrap.servers", cluster.bootstrapServers());
-            try (var admin = Admin.create(client)) {
-                var topicId = admin.createTopics(List.of(new NewTopic(TOPIC, Map.of(0, List.of(0)))))
-                        .topicId(TOPIC).get(30, TimeUnit.SECONDS);
-                var partition = new TopicPartition(TOPIC, 0);
-                var old = observer.storage.get(30, TimeUnit.SECONDS);
-                assertAckAfterPublication(client, observer, old, "all", 0);
-                var cut = new Cut(1, new CompletableFuture<>(), new CompletableFuture<>());
-                observer.armed.set(cut);
-                try (var wire = new NativeKafkaRequest(cluster, 0, produce((short) -1, "stale-owner"))) {
-                    assertEquals(2, cut.durable().get(20, TimeUnit.SECONDS).acknowledgedBookies());
-                    assertEquals(1, old.capture().root().frontiers().highWatermark());
-                    admin.alterPartitionReassignments(Map.of(partition,
-                                    Optional.of(new NewPartitionReassignment(List.of(1)))))
-                            .all().get(30, TimeUnit.SECONDS);
-                    TestUtils.waitForCondition(() -> {
-                        var image = cluster.brokers().get(0).metadataCache().getImage().topics().getTopic(topicId);
-                        return image != null && image.partitions().get(0).leader == 1;
-                    }, "Old Broker did not observe a newer native Owner");
-                    cut.release().complete(null);
-                    var response = (ProduceResponse) wire.receive(30_000);
-                    var result = response.data().responses().iterator().next().partitionResponses().get(0);
-                    var error = Errors.forCode(result.errorCode());
-                    assertTrue(error == Errors.NOT_LEADER_OR_FOLLOWER || error == Errors.KAFKA_STORAGE_ERROR,
-                            "Stale Owner replied with " + error);
-                    var after = old.capture().root().frontiers();
-                    assertEquals(1, after.highWatermark());
-                    assertEquals(1, after.readableEndOffset());
-                    assertEquals(1, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 0));
-                } finally {
-                    observer.armed.set(null);
-                    cut.release().complete(null);
-                }
-            }
-            cluster.fatalFaultHandler().maybeRethrowFirstException();
-            cluster.nonFatalFaultHandler().maybeRethrowFirstException();
+            verifyStaleQuorumCallback(cluster, observer, new NewTopic(TOPIC, Map.of(0, List.of(0))), false);
         }
+    }
+
+    static void verifyAsyncStaleQuorumCallback(Path inputs, Map<String, Object> settings) throws Exception {
+        var observer = new HoldDurability();
+        var bootstrap = BootstrapMetadata.fromVersion(MetadataVersion.latestTesting(), "nsip-async-ack")
+                .copyWithFeatureRecord("nereus.storage.version", (short) 2);
+        var nodes = new TestKitNodes.Builder(bootstrap).setNumBrokerNodes(2).setNumControllerNodes(1).build();
+        var builder = new KafkaClusterTestKit.Builder(nodes)
+                .setBrokerStorageRuntimeFactory(context -> context.config().brokerId() == 0
+                        ? new NereusBrokerStorageRuntime(context, new NereusKafkaOwnedProviderRuntime(context, observer))
+                        : NereusBrokerStorageRuntimeFactory.production().create(context))
+                .setControllerStorageRuntimeFactory(new NereusControllerStorageRuntimeFactory());
+        KafkaBookKeeperM5PolicyRealScenario.configure(builder, inputs, settings, true, "OBJECT_BYTES_DISABLED");
+        var topic = new NewTopic(TOPIC, Map.of(0, List.of(0)))
+                .configs(Map.of("nereus.storage.profile", "BOOKKEEPER_WAL_ASYNC_OBJECT"));
+        try (var cluster = builder.build()) {
+            verifyStaleQuorumCallback(cluster, observer, topic, true);
+        }
+    }
+
+    private static void verifyStaleQuorumCallback(KafkaClusterTestKit cluster, HoldDurability observer,
+            NewTopic topic, boolean bothAckModes) throws Exception {
+        cluster.format();
+        cluster.startup();
+        cluster.waitForReadyBrokers();
+        var client = new Properties();
+        client.setProperty("bootstrap.servers", cluster.bootstrapServers());
+        try (var admin = Admin.create(client)) {
+            var topicId = admin.createTopics(List.of(topic))
+                    .topicId(TOPIC).get(30, TimeUnit.SECONDS);
+            var partition = new TopicPartition(TOPIC, 0);
+            var old = observer.storage.get(30, TimeUnit.SECONDS);
+            assertAckAfterPublication(client, observer, old, "all", 0);
+            int acknowledged = 1;
+            if (bothAckModes) {
+                assertAckAfterPublication(client, observer, old, "1", acknowledged);
+                acknowledged++;
+            }
+            var cut = new Cut(acknowledged, new CompletableFuture<>(), new CompletableFuture<>());
+            observer.armed.set(cut);
+            try (var wire = new NativeKafkaRequest(cluster, 0, produce((short) -1, "stale-owner"))) {
+                assertEquals(2, cut.durable().get(20, TimeUnit.SECONDS).acknowledgedBookies());
+                assertEquals(acknowledged, old.capture().root().frontiers().highWatermark());
+                admin.alterPartitionReassignments(Map.of(partition,
+                                Optional.of(new NewPartitionReassignment(List.of(1)))))
+                        .all().get(30, TimeUnit.SECONDS);
+                TestUtils.waitForCondition(() -> {
+                    var image = cluster.brokers().get(0).metadataCache().getImage().topics().getTopic(topicId);
+                    return image != null && image.partitions().get(0).leader == 1;
+                }, "Old Broker did not observe a newer native Owner");
+                cut.release().complete(null);
+                var response = (ProduceResponse) wire.receive(30_000);
+                var result = response.data().responses().iterator().next().partitionResponses().get(0);
+                var error = Errors.forCode(result.errorCode());
+                assertTrue(error == Errors.NOT_LEADER_OR_FOLLOWER || error == Errors.KAFKA_STORAGE_ERROR,
+                        "Stale Owner replied with " + error);
+                var after = old.capture().root().frontiers();
+                assertEquals(acknowledged, after.highWatermark());
+                assertEquals(acknowledged, after.readableEndOffset());
+                assertEquals(1, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 0));
+            } finally {
+                observer.armed.set(null);
+                cut.release().complete(null);
+            }
+        }
+        cluster.fatalFaultHandler().maybeRethrowFirstException();
+        cluster.nonFatalFaultHandler().maybeRethrowFirstException();
     }
 
     @Test

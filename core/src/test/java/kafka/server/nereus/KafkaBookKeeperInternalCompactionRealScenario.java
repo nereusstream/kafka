@@ -80,9 +80,12 @@ public final class KafkaBookKeeperInternalCompactionRealScenario {
                 client.put("bootstrap.servers", cluster.bootstrapServers());
                 try (var admin = Admin.create(client)) {
                     var topics = List.of(USER, OFFSETS, TRANSACTIONS);
-                    admin.createTopics(topics.stream().map(name -> new NewTopic(name, Map.of(0, List.of(0)))
-                            .configs(Map.of("cleanup.policy", "compact", "min.cleanable.dirty.ratio", "0.0"))).toList())
-                            .all().get(30, TimeUnit.SECONDS);
+                    var created = admin.createTopics(topics.stream().map(name -> new NewTopic(name, Map.of(0, List.of(0)))
+                            .configs(Map.of("cleanup.policy", "compact", "min.cleanable.dirty.ratio", "0.0"))).toList());
+                    created.all().get(30, TimeUnit.SECONDS);
+                    var userTopicId = created.topicId(USER).get(30, TimeUnit.SECONDS);
+                    var original = KafkaObjectCompactionRealScenario.seedExistingTransactions(
+                            brokerPort(cluster, 0), USER_PARTITION, userTopicId, client);
                     produceUser(client, state.opened(USER, 0));
                     long committed = produceOffsets(client, state.opened(OFFSETS, 0));
                     produceTransactions(client, state.opened(TRANSACTIONS, 0));
@@ -109,8 +112,13 @@ public final class KafkaBookKeeperInternalCompactionRealScenario {
                         return frontiers.lastStableOffset() == frontiers.highWatermark();
                     }, 30_000, "transaction marker did not make the native user prefix stable");
                     var before = records(user);
+                    int end = Math.toIntExact(user.storage().capture().root().frontiers().highWatermark());
+                    KafkaObjectCompactionRealScenario.verifySelectedSemantics(
+                            brokerPort(cluster, 0), USER_PARTITION, userTopicId, end, client, original);
                     move(admin, USER);
                     assertEquals(before, records(state.opened(USER, 1)), "cold native recovery changed selected user bytes after GC");
+                    KafkaObjectCompactionRealScenario.verifySelectedSemantics(
+                            brokerPort(cluster, 1), USER_PARTITION, userTopicId, end, client, original);
                 }
             }
         } finally {
@@ -118,6 +126,10 @@ public final class KafkaBookKeeperInternalCompactionRealScenario {
                 for (var file : files.sorted(java.util.Comparator.reverseOrder()).toList()) Files.deleteIfExists(file);
             }
         }
+    }
+
+    private static int brokerPort(KafkaClusterTestKit cluster, int broker) {
+        return cluster.brokers().get(broker).socketServer().boundPort(cluster.nodes().brokerListenerName());
     }
 
     private static KafkaClusterTestKit cluster(Path inputs, State state) throws Exception {

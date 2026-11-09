@@ -144,7 +144,7 @@ final class KafkaObjectNativeCompactionRealScenario {
                 "nereus.storage.profile", "OBJECT_WAL", "cleanup.policy", "compact"));
         var topicId = admin.createTopics(List.of(topic)).topicId(COMPACT.topic()).get(30, TimeUnit.SECONDS);
         awaitInitialOwner(admin, COMPACT);
-        var original = KafkaObjectCompactionRealScenario.seedObjectWal(port, COMPACT, topicId, client);
+        var original = KafkaObjectCompactionRealScenario.seedExistingTransactions(port, COMPACT, topicId, client);
         assertEquals(ORIGINAL, readUncommitted(client, COMPACT, ORIGINAL.size()));
         return new Seed(topicId, original);
     }
@@ -199,7 +199,7 @@ final class KafkaObjectNativeCompactionRealScenario {
     static void requireSelected(Admin admin, Properties client, int port, Seed seed) throws Exception {
         assertEquals(SEALED_END + 1, admin.listOffsets(Map.of(COMPACT, OffsetSpec.latest())).partitionResult(COMPACT)
                 .get(5, TimeUnit.SECONDS).offset());
-        KafkaObjectCompactionRealScenario.verifyObjectWal(port, COMPACT, seed.topicId(), SEALED_END + 1, client, seed.original());
+        KafkaObjectCompactionRealScenario.verifySelectedSemantics(port, COMPACT, seed.topicId(), SEALED_END + 1, client, seed.original());
         var expected = new ArrayList<>(SELECTED);
         expected.add("after-selection");
         assertEquals(expected, readCommitted(client, COMPACT, expected.size()));

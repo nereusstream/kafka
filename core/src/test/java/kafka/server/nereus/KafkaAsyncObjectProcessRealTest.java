@@ -21,6 +21,7 @@ import kafka.server.nereus.KafkaBookKeeperObjectMaterializationRealTest.Schedule
 import kafka.server.nsip.KafkaBookKeeperOwnerRelocationRealTest;
 import kafka.server.nsip.KafkaBookKeeperProcessRealTest;
 import kafka.server.nsip.KafkaBookKeeperProcessRealTest.NativeNode;
+import kafka.server.nsip.NativeKafkaRequest;
 
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewPartitionReassignment;
@@ -28,9 +29,11 @@ import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1;
 import org.apache.kafka.test.TestUtils;
 
@@ -44,6 +47,7 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.net.URI;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -55,7 +59,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import static kafka.server.nereus.KafkaBookKeeperAckRealTest.assertFetchedValues;
+import static kafka.server.nereus.KafkaBookKeeperAckRealTest.delayedFetch;
 
 public class KafkaAsyncObjectProcessRealTest {
     private static final TopicPartition ASYNC = new TopicPartition("native-cold", 0);
@@ -112,7 +120,9 @@ public class KafkaAsyncObjectProcessRealTest {
                 assertEquals(1, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 0));
                 awaitLeader(admin, BK, 1);
                 original.stop();
-                verifyColdSelection(fixture, route, selected, KafkaBookKeeperProcessRealTest.client(ports[1]));
+                var after = KafkaBookKeeperProcessRealTest.client(ports[1]);
+                verifyColdSelection(fixture, route, selected, after);
+                verifyColdProtocol(fixture, after, ports[1], topic);
             }
         }
     }
@@ -189,6 +199,52 @@ public class KafkaAsyncObjectProcessRealTest {
             for (int offset = from; offset < to; offset++) {
                 assertEquals(offset, producer.send(new ProducerRecord<>(partition.topic(), partition.partition(), "key", "input-" + offset))
                         .get(30, TimeUnit.SECONDS).offset());
+            }
+        }
+    }
+
+    private static void verifyColdProtocol(Fixture fixture, Properties client, int port, Uuid topic) throws Exception {
+        int end = SEALED_INPUT_END + 2;
+        verifyTailWaitsLocally(fixture, client, port, topic, end);
+        try (var admin = Admin.create(client)) {
+            KafkaObjectProtocolRealScenario.recoverLostProduceResponse(port, admin, end + 1, "original-producer-retry");
+            KafkaObjectProtocolRealScenario.verifyNonIdempotentRetry(port, admin, end + 2);
+            var transactionState = new NewTopic("__transaction_state", Map.of(0, List.of(1)))
+                    .configs(Map.of("cleanup.policy", "compact", "nereus.storage.profile", "BOOKKEEPER_WAL_ONLY"));
+            admin.createTopics(List.of(transactionState)).all().get(30, TimeUnit.SECONDS);
+        }
+        var transactional = new Properties();
+        transactional.putAll(client);
+        transactional.put("transactional.id", "m6-async-cold-transaction");
+        try (var producer = new KafkaProducer<String, String>(transactional)) {
+            producer.initTransactions();
+            producer.beginTransaction();
+            long offset = end + 4;
+            assertEquals(offset, producer.send(new ProducerRecord<>(ASYNC.topic(), 0, "tx", "committed"))
+                    .get(30, TimeUnit.SECONDS).offset());
+            KafkaObjectProtocolRealScenario.commitAndWake(port, topic, producer, offset);
+        }
+    }
+
+    private static void verifyTailWaitsLocally(Fixture fixture, Properties client, int port, Uuid topic, int offset)
+            throws Exception {
+        try (var relay = KafkaObjectFaultRelay.wholeBucket(fixture.bucket())) {
+            relay.arm("bucket-unavailable");
+            var request = delayedFetch(ASYNC, topic, offset, IsolationLevel.READ_COMMITTED, 15_000);
+            try (var wire = new NativeKafkaRequest(port, request)) {
+                assertThrows(SocketTimeoutException.class, () -> wire.receive(250));
+                assertEquals(0, relay.hits(), "An end-of-log async Fetch polled the Object Provider");
+                var acksOne = new Properties();
+                acksOne.putAll(client);
+                acksOne.put("enable.idempotence", "false");
+                acksOne.put("acks", "1");
+                append(acksOne, ASYNC, offset, offset + 1);
+                var response = ((FetchResponse) wire.receive(5_000))
+                        .responseData(Map.of(topic, ASYNC.topic()), (short) 16).get(ASYNC);
+                assertEquals(offset + 1, response.highWatermark());
+                assertEquals(offset + 1, response.lastStableOffset());
+                assertFetchedValues(response, List.of("input-" + offset));
+                assertEquals(0, relay.hits(), "A shared BK commit or the resumed Fetch consulted the Object Provider");
             }
         }
     }

@@ -88,7 +88,7 @@ final class KafkaObjectCompactionRealScenario {
         return seed(route(cluster, 0), topic, client, true);
     }
 
-    static ErasedBatch seedObjectWal(int port, TopicPartition partition, Uuid topic, Properties client) throws Exception {
+    static ErasedBatch seedExistingTransactions(int port, TopicPartition partition, Uuid topic, Properties client) throws Exception {
         return seed(new Route(port, partition), topic, client, false);
     }
 
@@ -203,7 +203,7 @@ final class KafkaObjectCompactionRealScenario {
         assertEquals(visible, KafkaBookKeeperOwnerRelocationRealTest.consume(client, visible.size()));
     }
 
-    static void verifyObjectWal(int port, TopicPartition partition, Uuid topic, int end, Properties client,
+    static void verifySelectedSemantics(int port, TopicPartition partition, Uuid topic, int end, Properties client,
             ErasedBatch erased) throws Exception {
         verifyWireSemantics(new Route(port, partition), topic, end, client, erased);
     }

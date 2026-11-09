@@ -56,22 +56,26 @@ final class KafkaObjectProtocolRealScenario {
     private KafkaObjectProtocolRealScenario() { }
 
     static void commitAndWake(int port, Uuid topic, KafkaProducer<String, String> producer) throws Exception {
+        commitAndWake(port, topic, producer, 2);
+    }
+
+    static void commitAndWake(int port, Uuid topic, KafkaProducer<String, String> producer, long offset) throws Exception {
         var topicName = Map.of(topic, OBJECT.topic());
         try (var uncommitted = new NativeKafkaRequest(port,
-                    delayedFetch(OBJECT, topic, 2, IsolationLevel.READ_UNCOMMITTED, 0));
+                    delayedFetch(OBJECT, topic, offset, IsolationLevel.READ_UNCOMMITTED, 0));
                 var waiting = new NativeKafkaRequest(port,
-                    delayedFetch(OBJECT, topic, 2, IsolationLevel.READ_COMMITTED, 15_000))) {
+                    delayedFetch(OBJECT, topic, offset, IsolationLevel.READ_COMMITTED, 15_000))) {
             var visible = ((FetchResponse) uncommitted.receive(5_000)).responseData(topicName, (short) 16).get(OBJECT);
-            assertEquals(3, visible.highWatermark());
+            assertEquals(offset + 1, visible.highWatermark());
             assertFetchedValues(visible, List.of("committed"));
             assertThrows(SocketTimeoutException.class, () -> waiting.receive(250),
                     "Object WAL Fetch returned while its original transaction was open");
             producer.commitTransaction();
             var stable = ((FetchResponse) waiting.receive(5_000)).responseData(topicName, (short) 16).get(OBJECT);
-            assertEquals(4, stable.highWatermark());
-            assertEquals(4, stable.lastStableOffset());
+            assertEquals(offset + 2, stable.highWatermark());
+            assertEquals(offset + 2, stable.lastStableOffset());
             assertFetchedValues(stable, List.of("committed"));
-            System.out.println("Native Object WAL delayed Fetch woke at the original transaction marker");
+            System.out.println("Native delayed Fetch woke at the original transaction marker");
         }
     }
 
@@ -84,6 +88,10 @@ final class KafkaObjectProtocolRealScenario {
     }
 
     static ProduceRequest recoverLostProduceResponse(int port, Admin admin) throws Exception {
+        return recoverLostProduceResponse(port, admin, 1, "before-1");
+    }
+
+    static ProduceRequest recoverLostProduceResponse(int port, Admin admin, long offset, String value) throws Exception {
         var request = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
                 .setTransactionalId(null).setTransactionTimeoutMs(30_000)).build((short) 4);
         InitProducerIdResponse init;
@@ -93,11 +101,11 @@ final class KafkaObjectProtocolRealScenario {
         assertEquals(Errors.NONE.code(), init.data().errorCode());
         long pid = init.data().producerId();
         short epoch = init.data().producerEpoch();
-        new NativeKafkaRequest(port, withProducerIdentity(pid, epoch, "before-1")).close();
-        awaitEnd(admin, 2);
+        new NativeKafkaRequest(port, withProducerIdentity(pid, epoch, value)).close();
+        awaitEnd(admin, offset + 1);
         var changedPayload = withProducerIdentity(pid, epoch, "duplicate-must-not-appear");
-        assertProduceOffset(port, changedPayload, 1);
-        awaitEnd(admin, 2);
+        assertProduceOffset(port, changedPayload, offset);
+        awaitEnd(admin, offset + 1);
         return changedPayload;
     }
 

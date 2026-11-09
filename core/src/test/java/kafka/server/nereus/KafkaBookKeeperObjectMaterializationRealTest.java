@@ -687,6 +687,16 @@ public class KafkaBookKeeperObjectMaterializationRealTest {
         }
     }
 
+    @Test
+    @Timeout(180)
+    public void asyncBookKeeperAckModesAndRevocationUseCoherentCommit(@TempDir Path work) throws Exception {
+        writeM6Capability(work);
+        var settings = KafkaBookKeeperOwnerRelocationRealTest.nativeConfig(work,
+                System.getProperty("nereus.nsip.bkUri"), System.getProperty("nereus.nsip.oxia"));
+        withObjectFixture(work, settings, false,
+                fixture -> KafkaBookKeeperAckRealTest.verifyAsyncStaleQuorumCallback(work, fixture.settings()));
+    }
+
     static void writeM6Capability(Path work) throws Exception {
         var summary = Path.of(System.getProperty("nereus.nsip.m4RunSummary"));
         KafkaBookKeeperOwnerRelocationRealTest.writeCapability(work, Optional.of(summary), true);
