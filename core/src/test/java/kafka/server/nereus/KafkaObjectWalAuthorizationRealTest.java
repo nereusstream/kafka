@@ -94,6 +94,7 @@ public class KafkaObjectWalAuthorizationRealTest {
                     System.getProperty("nereus.nsip.bkUri"), oxia);
             var cut = new AuthorizationCut();
             var terminal = new KafkaObjectCheckpointHeadRealScenario();
+            var supersession = new KafkaObjectRecoverySupersessionRealScenario(terminal);
             var bootstrap = BootstrapMetadata.fromVersion(MetadataVersion.latestTesting(), "nsip-object-auth")
                     .copyWithFeatureRecord("nereus.storage.version", (short) 2);
             var nodes = new TestKitNodes.Builder(bootstrap).setNumBrokerNodes(2).setNumControllerNodes(1).build();
@@ -102,7 +103,7 @@ public class KafkaObjectWalAuthorizationRealTest {
                     .setBrokerStorageRuntimeFactory(context -> new NereusBrokerStorageRuntime(
                             context, context.config().brokerId() == 0
                                     ? new NereusKafkaOwnedProviderRuntime(context, cut)
-                                    : new NereusKafkaOwnedProviderRuntime(context, terminal)));
+                                    : new NereusKafkaOwnedProviderRuntime(context, supersession)));
             fixture.settings().forEach((key, value) -> {
                 if (!Set.of("node.id", "process.roles", "controller.quorum.voters", "log.dirs").contains(key)) {
                     builder.setConfigProp(key, value);
@@ -115,6 +116,7 @@ public class KafkaObjectWalAuthorizationRealTest {
                 cluster.waitForReadyBrokers();
                 var client = KafkaBookKeeperProcessRealTest.client(0);
                 client.setProperty("bootstrap.servers", cluster.bootstrapServers());
+                supersession.verify(cluster, client, control, fixture);
                 var topicId = verifyAuthorizationCut(client, control, fixture, cut);
                 verifyRevocationAfterExactAuthorization(cluster, client, control, fixture, topicId, cut);
                 var bucket = (String) fixture.settings().get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
