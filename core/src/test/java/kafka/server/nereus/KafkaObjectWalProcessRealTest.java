@@ -120,6 +120,7 @@ public class KafkaObjectWalProcessRealTest {
             var after = KafkaBookKeeperProcessRealTest.client(ports[1]);
             Uuid topicId;
             int firstKafkaEpoch;
+            KafkaObjectNativeCompactionRealScenario.Seed compaction;
             try (var admin = Admin.create(client);
                      var producer = new KafkaProducer<String, String>(producerClient);
                      var txnGroup = new KafkaConsumer<String, String>(txnConsumerClient)) {
@@ -150,7 +151,7 @@ public class KafkaObjectWalProcessRealTest {
                 assertEquals(List.of("before-0", "before-1", "committed", "aborted"), readUncommitted(client, OBJECT, 4));
                 assertOffsets(admin, 5, 4);
                 storeGroupOffset(client);
-                KafkaObjectNativeCompactionRealScenario.seed(admin, client);
+                compaction = KafkaObjectNativeCompactionRealScenario.seed(admin, client, ports[0]);
                 cold.start();
                 KafkaBookKeeperProcessRealTest.waitForBroker(admin, 1);
                 reassignForColdRecovery(admin);
@@ -180,7 +181,7 @@ public class KafkaObjectWalProcessRealTest {
                     awaitTransactionMarker(coldAdmin, 8);
                     assertOffsets(coldAdmin, 8, 8);
                     assertGroupOffset(after, TXN_GROUP, 8);
-                    verifyNativeCompaction(fixture, minio, coldAdmin, after);
+                    verifyNativeCompaction(fixture, control, minio, coldAdmin, after, ports[1], compaction);
                 }
             }
             assertEquals(List.of("before-0", "before-1", "committed", "after"),
@@ -202,7 +203,7 @@ public class KafkaObjectWalProcessRealTest {
                 assertEquals(List.of("before-0", "before-1", "committed", "after"),
                         KafkaBookKeeperOwnerRelocationRealTest.consume(client, 4));
                 assertGroupOffset(client, TXN_GROUP, 8);
-                KafkaObjectNativeCompactionRealScenario.requireSelected(finalAdmin, client);
+                KafkaObjectNativeCompactionRealScenario.requireSelected(finalAdmin, client, ports[0], compaction);
                 append(client, OBJECT, 8, "after-terminal");
                 assertOffsets(finalAdmin, 9, 9);
                 var oldRun = KafkaObjectWalAdapterRealTest.NativeTerminal.capture(fixture, control, topicId, OBJECT.topic(), 0);
@@ -242,10 +243,11 @@ public class KafkaObjectWalProcessRealTest {
         broker.assertRejectsUnqualifiedObjectWalToken(rejectedToken);
     }
 
-    private static void verifyNativeCompaction(KafkaObjectWalAdapterRealTest.Provisioned fixture, S3Client minio,
-            Admin admin, Properties client) throws Exception {
-        KafkaObjectNativeCompactionRealScenario.admitCompleteOutput(fixture, minio, client);
-        KafkaObjectNativeCompactionRealScenario.awaitSelected(admin, client);
+    private static void verifyNativeCompaction(KafkaObjectWalAdapterRealTest.Provisioned fixture,
+            AsyncOxiaClient control, S3Client minio, Admin admin, Properties client, int port,
+            KafkaObjectNativeCompactionRealScenario.Seed compaction) throws Exception {
+        KafkaObjectNativeCompactionRealScenario.selectWhileOriginalFetchIsHeld(fixture, control, minio, client, port, compaction);
+        KafkaObjectNativeCompactionRealScenario.requireSelected(admin, client, port, compaction);
     }
 
     private static void verifyWireExits(Properties client, Admin finalAdmin, int port, Uuid topicId,
@@ -326,10 +328,14 @@ public class KafkaObjectWalProcessRealTest {
     }
 
     static KafkaPartitionFenceV1 scope(KafkaObjectWalAdapterRealTest.Provisioned fixture, Uuid topicId) {
+        return scope(fixture, topicId, OBJECT);
+    }
+
+    static KafkaPartitionFenceV1 scope(KafkaObjectWalAdapterRealTest.Provisioned fixture, Uuid topicId, TopicPartition partition) {
         var incarnation = new KafkaTopicIncarnationIdentity(new KafkaTopicId(new Id128(
-                topicId.getMostSignificantBits(), topicId.getLeastSignificantBits())), new KafkaTopicName(OBJECT.topic()));
+                topicId.getMostSignificantBits(), topicId.getLeastSignificantBits())), new KafkaTopicName(partition.topic()));
         var binding = DeterministicTopicIdsV1.deriveBindingId(fixture.profile().protocolCell(), incarnation);
-        return new KafkaPartitionFenceV1(binding, incarnation, OBJECT.partition(), 1,
+        return new KafkaPartitionFenceV1(binding, incarnation, partition.partition(), 1,
                 DeterministicTopicIdsV1.deriveStorageEpochId(binding, 0), 1, 0);
     }
 
@@ -383,9 +389,17 @@ public class KafkaObjectWalProcessRealTest {
         return readFrom(client, partition, 0, count);
     }
 
+    static List<String> readCommitted(Properties client, TopicPartition partition, int count) {
+        return readFrom(client, partition, 0, count, "read_committed");
+    }
+
     private static List<String> readFrom(Properties client, TopicPartition partition, long offset, int count) {
+        return readFrom(client, partition, offset, count, "read_uncommitted");
+    }
+
+    private static List<String> readFrom(Properties client, TopicPartition partition, long offset, int count, String isolation) {
         var configuration = consumerProperties(client);
-        configuration.put("isolation.level", "read_uncommitted");
+        configuration.put("isolation.level", isolation);
         try (var consumer = new KafkaConsumer<String, String>(configuration)) {
             consumer.assign(List.of(partition));
             consumer.seek(partition, offset);

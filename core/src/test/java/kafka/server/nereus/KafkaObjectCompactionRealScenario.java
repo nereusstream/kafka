@@ -69,9 +69,15 @@ final class KafkaObjectCompactionRealScenario {
 
     private KafkaObjectCompactionRealScenario() { }
 
+    private record Route(int port, TopicPartition partition) { }
+
+    private static Route route(KafkaClusterTestKit cluster, int broker) {
+        return new Route(cluster.brokers().get(broker).socketServer().boundPort(cluster.nodes().brokerListenerName()), PARTITION);
+    }
+
     record ErasedBatch(MemoryRecords original, TransactionMarker commit, TransactionMarker abort) {
-        void verifyReplay(KafkaClusterTestKit cluster, int broker) throws Exception {
-            append(cluster, broker, 5, original);
+        private void verifyReplay(Route route) throws Exception {
+            append(route, 5, original);
         }
     }
 
@@ -79,30 +85,40 @@ final class KafkaObjectCompactionRealScenario {
                              long timestamp) { }
 
     static ErasedBatch seed(KafkaClusterTestKit cluster, Uuid topic, Properties client) throws Exception {
-        long now = System.currentTimeMillis();
-        IdempotentSample.seed(cluster, now);
-        append(cluster, 3, row(now + 1, "replace", "new-three"), row(now + 1, "replace-2", "new-four"));
-        var producer = IdempotentSample.initialize(cluster).data();
-        var erased = MemoryRecords.withIdempotentRecords(Compression.NONE, producer.producerId(),
-                producer.producerEpoch(), 0, row(now + 2, "gone", "old-five"));
-        append(cluster, 0, 5, erased);
-        append(cluster, 6, row(now + 3, "gone", null));
-        seedTransactions(client);
-        try (var admin = Admin.create(client)) {
-            TestUtils.waitForCondition(() -> admin.listOffsets(Map.of(PARTITION, OffsetSpec.latest()),
-                            new ListOffsetsOptions(IsolationLevel.READ_COMMITTED))
-                    .partitionResult(PARTITION).get(5, TimeUnit.SECONDS).offset() == SEALED_TRANSACTION_END,
-                    20_000, "Original transaction markers did not become visible");
-        }
-        return new ErasedBatch(erased, marker(cluster, topic, 0, 8, ControlRecordType.COMMIT),
-                marker(cluster, topic, 0, 10, ControlRecordType.ABORT));
+        return seed(route(cluster, 0), topic, client, true);
     }
 
-    private static void seedTransactions(Properties client) throws Exception {
+    static ErasedBatch seedObjectWal(int port, TopicPartition partition, Uuid topic, Properties client) throws Exception {
+        return seed(new Route(port, partition), topic, client, false);
+    }
+
+    private static ErasedBatch seed(Route route, Uuid topic, Properties client, boolean createTransactionState) throws Exception {
+        long now = System.currentTimeMillis();
+        IdempotentSample.seed(route, now);
+        append(route, 3, row(now + 1, "replace", "new-three"), row(now + 1, "replace-2", "new-four"));
+        var producer = IdempotentSample.initialize(route).data();
+        var erased = MemoryRecords.withIdempotentRecords(Compression.NONE, producer.producerId(),
+                producer.producerEpoch(), 0, row(now + 2, "gone", "old-five"));
+        append(route, 5, erased);
+        append(route, 6, row(now + 3, "gone", null));
+        seedTransactions(client, route.partition(), createTransactionState);
         try (var admin = Admin.create(client)) {
-            var transactionState = new NewTopic("__transaction_state", Map.of(0, List.of(0)))
-                    .configs(Map.of("cleanup.policy", "compact"));
-            admin.createTopics(List.of(transactionState)).all().get(30, TimeUnit.SECONDS);
+            TestUtils.waitForCondition(() -> admin.listOffsets(Map.of(route.partition(), OffsetSpec.latest()),
+                            new ListOffsetsOptions(IsolationLevel.READ_COMMITTED))
+                    .partitionResult(route.partition()).get(5, TimeUnit.SECONDS).offset() == SEALED_TRANSACTION_END,
+                    20_000, "Original transaction markers did not become visible");
+        }
+        return new ErasedBatch(erased, marker(route, topic, 8, ControlRecordType.COMMIT),
+                marker(route, topic, 10, ControlRecordType.ABORT));
+    }
+
+    private static void seedTransactions(Properties client, TopicPartition partition, boolean createTransactionState) throws Exception {
+        if (createTransactionState) {
+            try (var admin = Admin.create(client)) {
+                var transactionState = new NewTopic("__transaction_state", Map.of(0, List.of(0)))
+                        .configs(Map.of("cleanup.policy", "compact"));
+                admin.createTopics(List.of(transactionState)).all().get(30, TimeUnit.SECONDS);
+            }
         }
         var settings = new Properties();
         settings.putAll(client);
@@ -114,11 +130,11 @@ final class KafkaObjectCompactionRealScenario {
         try (var producer = new KafkaProducer<String, String>(settings)) {
             producer.initTransactions();
             producer.beginTransaction();
-            assertEquals(7L, producer.send(new ProducerRecord<>(TOPIC, 0, "committed-key", "committed-seven"))
+            assertEquals(7L, producer.send(new ProducerRecord<>(partition.topic(), partition.partition(), "committed-key", "committed-seven"))
                     .get(30, TimeUnit.SECONDS).offset());
             producer.commitTransaction();
             producer.beginTransaction();
-            assertEquals(9L, producer.send(new ProducerRecord<>(TOPIC, 0, "aborted-key", "aborted-nine"))
+            assertEquals(9L, producer.send(new ProducerRecord<>(partition.topic(), partition.partition(), "aborted-key", "aborted-nine"))
                     .get(30, TimeUnit.SECONDS).offset());
             producer.abortTransaction();
         }
@@ -130,35 +146,36 @@ final class KafkaObjectCompactionRealScenario {
     }
 
     static void appendReplacement(KafkaClusterTestKit cluster, long offset) throws Exception {
-        append(cluster, offset, row(System.currentTimeMillis(), "replace", "new-successor"));
+        append(route(cluster, 0), offset, row(System.currentTimeMillis(), "replace", "new-successor"));
     }
 
     static void verifyReplacement(KafkaClusterTestKit cluster, Uuid topic, int broker, long latest) throws Exception {
-        var fromOld = fetch(cluster, topic, broker, 3);
+        var fromOld = fetch(route(cluster, broker), topic, 3);
         assertEquals(Errors.NONE, Errors.forCode(fromOld.errorCode()));
         var offsets = new ArrayList<Long>();
         FetchResponse.recordsOrFail(fromOld).records().forEach(record -> offsets.add(record.offset()));
         assertTrue(offsets.contains(4L), "the successor discarded an unrelated record in the same batch");
         assertTrue(!offsets.contains(3L), "the successor exposed the old value for a superseded key");
-        var fromLatest = fetch(cluster, topic, broker, latest);
+        var fromLatest = fetch(route(cluster, broker), topic, latest);
         assertEquals(Errors.NONE, Errors.forCode(fromLatest.errorCode()));
         var record = FetchResponse.recordsOrFail(fromLatest).records().iterator().next();
         assertEquals(latest, record.offset());
         assertEquals("new-successor", StandardCharsets.UTF_8.decode(record.value()).toString());
     }
 
-    private static void append(KafkaClusterTestKit cluster, long offset, SimpleRecord... rows) throws Exception {
-        append(cluster, 0, offset, MemoryRecords.withRecords(Compression.NONE, rows));
+    private static void append(Route route, long offset, SimpleRecord... rows) throws Exception {
+        append(route, offset, MemoryRecords.withRecords(Compression.NONE, rows));
     }
 
-    private static void append(KafkaClusterTestKit cluster, int broker, long offset, MemoryRecords raw) throws Exception {
-        var topic = new ProduceRequestData.TopicProduceData().setName(TOPIC)
-                .setPartitionData(List.of(new ProduceRequestData.PartitionProduceData().setIndex(0).setRecords(raw)));
+    private static void append(Route route, long offset, MemoryRecords raw) throws Exception {
+        var topic = new ProduceRequestData.TopicProduceData().setName(route.partition().topic())
+                .setPartitionData(List.of(new ProduceRequestData.PartitionProduceData()
+                        .setIndex(route.partition().partition()).setRecords(raw)));
         var topics = new ProduceRequestData.TopicProduceDataCollection();
         topics.add(topic);
         var request = new ProduceRequest(new ProduceRequestData().setAcks((short) -1).setTimeoutMs(10_000).setTopicData(topics),
                 (short) 9);
-        try (var wire = new NativeKafkaRequest(cluster, broker, request)) {
+        try (var wire = new NativeKafkaRequest(route.port(), request)) {
             var response = (ProduceResponse) wire.receive(30_000);
             var data = response.data().responses().iterator().next().partitionResponses().get(0);
             assertEquals(Errors.NONE, Errors.forCode(data.errorCode()));
@@ -173,52 +190,8 @@ final class KafkaObjectCompactionRealScenario {
 
     static void verify(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client,
             ErasedBatch erased, long replacement, long compactedEnd) throws Exception {
-        // The provider can finish before the Controller acknowledges RECOVERED. The official Admin client
-        // retries the broker's recovery response; the wire Fetches below then inspect the exact ready owner.
-        try (var admin = Admin.create(client)) {
-            assertEquals(1, admin.listOffsets(Map.of(PARTITION, OffsetSpec.forTimestamp(0)))
-                    .partitionResult(PARTITION).get(30, TimeUnit.SECONDS).offset());
-        }
-
-        var first = fetch(cluster, topic, broker, 0);
-        assertEquals(Errors.NONE, Errors.forCode(first.errorCode()));
-        assertEquals(end, first.highWatermark());
-        assertEquals(end, first.lastStableOffset());
-        var batch = FetchResponse.recordsOrFail(first).batches().iterator().next();
-        assertEquals(0, batch.baseOffset());
-        assertEquals(2, batch.lastOffset());
-        var offsets = new ArrayList<Long>();
-        batch.forEach(record -> offsets.add(record.offset()));
-        assertEquals(List.of(1L), offsets, "the rewritten batch did not preserve its original sparse offsets");
-        IdempotentSample.verifyReplay(cluster, broker, batch);
-
-        // The selected payload has no records at offset 5, but its acknowledged producer batch still exists logically.
-        erased.verifyReplay(cluster, broker);
-        var gap = fetch(cluster, topic, broker, 5);
-        assertEquals(Errors.NONE, Errors.forCode(gap.errorCode()));
-        assertEquals(end, gap.highWatermark(), "retry of the original producer batch allocated another offset");
-        var tombstoneBatch = FetchResponse.recordsOrFail(gap).batches().iterator().next();
-        var tombstone = tombstoneBatch.iterator().next();
-        assertEquals(6, tombstone.offset(), "Fetch did not skip the fully compacted batch");
-        assertNull(tombstone.value(), "compaction discarded or rewrote the latest tombstone");
-        assertTrue(tombstoneBatch.deleteHorizonMs().orElseThrow() > tombstone.timestamp());
-
-        assertEquals(erased.commit(), marker(cluster, topic, broker, 8, ControlRecordType.COMMIT));
-        assertEquals(erased.abort(), marker(cluster, topic, broker, 10, ControlRecordType.ABORT));
-        verifyTransactions(cluster, topic, broker, end, client, replacement, compactedEnd);
-    }
-
-    private static void verifyTransactions(KafkaClusterTestKit cluster, Uuid topic, int broker, int end, Properties client,
-            long replacement, long compactedEnd)
-            throws Exception {
-        var aborted = fetch(cluster, topic, broker, 9);
-        assertEquals(Errors.NONE, Errors.forCode(aborted.errorCode()));
-        var data = FetchResponse.recordsOrFail(aborted).batches().iterator().next();
-        assertTrue(data.isTransactional());
-        assertEquals(9, data.baseOffset());
-        assertEquals(List.of(9L), aborted.abortedTransactions().stream().map(row -> row.firstOffset()).toList());
-        assertEquals(data.producerId(), aborted.abortedTransactions().get(0).producerId());
-
+        var route = route(cluster, broker);
+        verifyWireSemantics(route, topic, end, client, erased);
         var visible = new ArrayList<>(Arrays.asList("middle", "new-three", "new-four", null, "committed-seven"));
         if (replacement >= 0) visible.remove("new-three");
         // Each helper input has the same key; only the last one inside the sealed cut survives.
@@ -230,9 +203,61 @@ final class KafkaObjectCompactionRealScenario {
         assertEquals(visible, KafkaBookKeeperOwnerRelocationRealTest.consume(client, visible.size()));
     }
 
-    private static TransactionMarker marker(KafkaClusterTestKit cluster, Uuid topic, int broker, long offset,
+    static void verifyObjectWal(int port, TopicPartition partition, Uuid topic, int end, Properties client,
+            ErasedBatch erased) throws Exception {
+        verifyWireSemantics(new Route(port, partition), topic, end, client, erased);
+    }
+
+    private static void verifyWireSemantics(Route route, Uuid topic, int end, Properties client,
+            ErasedBatch erased) throws Exception {
+        // The provider can finish before the Controller acknowledges RECOVERED. The official Admin client
+        // retries the broker's recovery response; the wire Fetches below then inspect the exact ready owner.
+        try (var admin = Admin.create(client)) {
+            assertEquals(1, admin.listOffsets(Map.of(route.partition(), OffsetSpec.forTimestamp(0)))
+                    .partitionResult(route.partition()).get(30, TimeUnit.SECONDS).offset());
+        }
+
+        var first = fetch(route, topic, 0);
+        assertEquals(Errors.NONE, Errors.forCode(first.errorCode()));
+        assertEquals(end, first.highWatermark());
+        assertEquals(end, first.lastStableOffset());
+        var batch = FetchResponse.recordsOrFail(first).batches().iterator().next();
+        assertEquals(0, batch.baseOffset());
+        assertEquals(2, batch.lastOffset());
+        var offsets = new ArrayList<Long>();
+        batch.forEach(record -> offsets.add(record.offset()));
+        assertEquals(List.of(1L), offsets, "the rewritten batch did not preserve its original sparse offsets");
+        IdempotentSample.verifyReplay(route, batch);
+
+        // The selected payload has no records at offset 5, but its acknowledged producer batch still exists logically.
+        erased.verifyReplay(route);
+        var gap = fetch(route, topic, 5);
+        assertEquals(Errors.NONE, Errors.forCode(gap.errorCode()));
+        assertEquals(end, gap.highWatermark(), "retry of the original producer batch allocated another offset");
+        var tombstoneBatch = FetchResponse.recordsOrFail(gap).batches().iterator().next();
+        var tombstone = tombstoneBatch.iterator().next();
+        assertEquals(6, tombstone.offset(), "Fetch did not skip the fully compacted batch");
+        assertNull(tombstone.value(), "compaction discarded or rewrote the latest tombstone");
+        assertTrue(tombstoneBatch.deleteHorizonMs().orElseThrow() > tombstone.timestamp());
+
+        assertEquals(erased.commit(), marker(route, topic, 8, ControlRecordType.COMMIT));
+        assertEquals(erased.abort(), marker(route, topic, 10, ControlRecordType.ABORT));
+        verifyAbortedTransaction(route, topic);
+    }
+
+    private static void verifyAbortedTransaction(Route route, Uuid topic) throws Exception {
+        var aborted = fetch(route, topic, 9);
+        assertEquals(Errors.NONE, Errors.forCode(aborted.errorCode()));
+        var data = FetchResponse.recordsOrFail(aborted).batches().iterator().next();
+        assertTrue(data.isTransactional());
+        assertEquals(9, data.baseOffset());
+        assertEquals(List.of(9L), aborted.abortedTransactions().stream().map(row -> row.firstOffset()).toList());
+        assertEquals(data.producerId(), aborted.abortedTransactions().get(0).producerId());
+    }
+
+    private static TransactionMarker marker(Route route, Uuid topic, long offset,
             ControlRecordType kind) throws Exception {
-        var response = fetch(cluster, topic, broker, offset);
+        var response = fetch(route, topic, offset);
         assertEquals(Errors.NONE, Errors.forCode(response.errorCode()));
         var batch = FetchResponse.recordsOrFail(response).batches().iterator().next();
         assertTrue(batch.isControlBatch());
@@ -248,18 +273,18 @@ final class KafkaObjectCompactionRealScenario {
     }
 
     private static final class IdempotentSample {
-        private static void seed(KafkaClusterTestKit cluster, long timestamp) throws Exception {
-            var producer = initialize(cluster).data();
-            append(cluster, 0, 0, records(producer.producerId(), producer.producerEpoch(), timestamp));
+        private static void seed(Route route, long timestamp) throws Exception {
+            var producer = initialize(route).data();
+            append(route, 0, records(producer.producerId(), producer.producerEpoch(), timestamp));
         }
 
-        private static InitProducerIdResponse initialize(KafkaClusterTestKit cluster) throws Exception {
+        private static InitProducerIdResponse initialize(Route route) throws Exception {
             var request = new InitProducerIdRequest.Builder(new InitProducerIdRequestData()
                     .setTransactionalId(null).setTransactionTimeoutMs(30_000)).build((short) 4);
             var initialized = new AtomicReference<InitProducerIdResponse>();
             // The stock RPC allocator returns this retriable response until its first Controller ID block arrives.
             TestUtils.waitForCondition(() -> {
-                try (var wire = new NativeKafkaRequest(cluster, 0, request)) {
+                try (var wire = new NativeKafkaRequest(route.port(), request)) {
                     var result = (InitProducerIdResponse) wire.receive(30_000);
                     if (Errors.forCode(result.data().errorCode()) == Errors.COORDINATOR_LOAD_IN_PROGRESS) return false;
                     initialized.set(result);
@@ -271,12 +296,12 @@ final class KafkaObjectCompactionRealScenario {
             return result;
         }
 
-        private static void verifyReplay(KafkaClusterTestKit cluster, int broker, RecordBatch compacted) throws Exception {
+        private static void verifyReplay(Route route, RecordBatch compacted) throws Exception {
             assertTrue(compacted.hasProducerId());
             assertEquals(0, compacted.baseSequence());
             assertEquals(2, compacted.lastSequence());
             assertEquals(1, compacted.iterator().next().sequence());
-            append(cluster, broker, 0, records(compacted.producerId(), compacted.producerEpoch(),
+            append(route, 0, records(compacted.producerId(), compacted.producerEpoch(),
                     compacted.iterator().next().timestamp()));
         }
 
@@ -288,18 +313,19 @@ final class KafkaObjectCompactionRealScenario {
     }
 
     static void verifyMissingFailsClosed(KafkaClusterTestKit cluster, Uuid topic, int broker) throws Exception {
-        var missing = fetch(cluster, topic, broker, 0);
+        var missing = fetch(route(cluster, broker), topic, 0);
         assertEquals(Errors.KAFKA_STORAGE_ERROR, Errors.forCode(missing.errorCode()),
                 "an unfiltered BK replay exposed the compacted prefix");
     }
 
     private static org.apache.kafka.common.message.FetchResponseData.PartitionData fetch(
-            KafkaClusterTestKit cluster, Uuid topic, int broker, long offset) throws Exception {
-        var request = FetchRequest.Builder.forConsumer(FETCH_VERSION, 0, 0, Map.of(PARTITION,
+            Route route, Uuid topic, long offset) throws Exception {
+        var request = FetchRequest.Builder.forConsumer(FETCH_VERSION, 0, 0, Map.of(route.partition(),
                 new FetchRequest.PartitionData(topic, offset, FetchRequest.INVALID_LOG_START_OFFSET, 1, Optional.empty())))
                 .setMaxBytes(1).isolationLevel(IsolationLevel.READ_COMMITTED).build(FETCH_VERSION);
-        try (var wire = new NativeKafkaRequest(cluster, broker, request)) {
-            return ((FetchResponse) wire.receive(30_000)).responseData(Map.of(topic, TOPIC), FETCH_VERSION).get(PARTITION);
+        try (var wire = new NativeKafkaRequest(route.port(), request)) {
+            return ((FetchResponse) wire.receive(30_000)).responseData(Map.of(topic, route.partition().topic()), FETCH_VERSION)
+                    .get(route.partition());
         }
     }
 }
