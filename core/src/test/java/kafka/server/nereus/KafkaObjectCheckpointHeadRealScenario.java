@@ -63,7 +63,8 @@ final class KafkaObjectCheckpointHeadRealScenario implements NereusKafkaOwnedPro
 
     KafkaObjectWalAdapterRealTest.NativeTerminal verify(KafkaClusterTestKit cluster, Properties client,
             AsyncOxiaClient control,
-            KafkaObjectWalAdapterRealTest.Provisioned fixture, Uuid topicId) throws Exception {
+            KafkaObjectWalAdapterRealTest.Provisioned fixture, Uuid topicId,
+            KafkaObjectWalAuthorizationRealTest.AuthorizationCut authorizationCut) throws Exception {
         try (var producer = new KafkaProducer<String, String>(client)) {
             assertEquals(2, producer.send(new ProducerRecord<>(OBJECT.topic(), 0, "key", "after-recovery"))
                     .get(30, TimeUnit.SECONDS).offset());
@@ -76,6 +77,7 @@ final class KafkaObjectCheckpointHeadRealScenario implements NereusKafkaOwnedPro
                 new CompletableFuture<>(), new CompletableFuture<>());
         cut = selected;
         var shutdown = CompletableFuture.runAsync(cluster.brokers().get(1)::shutdown);
+        KafkaObjectWalAuthorizationRealTest.CommonCheckpointCut missing = null;
         try (var admin = Admin.create(client)) {
             var terminal = selected.applied().get(30, TimeUnit.SECONDS);
             var exact = run.metadata().getVersioned(relative).orElseThrow();
@@ -84,8 +86,11 @@ final class KafkaObjectCheckpointHeadRealScenario implements NereusKafkaOwnedPro
             selected.loseReply().complete(null);
             assertEquals(terminal, selected.reread().get(30, TimeUnit.SECONDS));
             assertFalse(shutdown.isDone(), "The Broker shut down before the terminal Head reread returned");
+            missing = authorizationCut.holdSelectedCommonCheckpoint(run, fixture, topicId, control);
             selected.deliverRead().complete(null);
             shutdown.get(30, TimeUnit.SECONDS);
+            missing.remove(control);
+            missing.dispatch().complete(null);
             assertEquals(1, terminalWrites.get());
             assertEquals(exact, run.metadata().getVersioned(relative).orElseThrow());
             assertEquals(0, KafkaBookKeeperOwnerRelocationRealTest.awaitLeader(admin, 1));
@@ -95,6 +100,7 @@ final class KafkaObjectCheckpointHeadRealScenario implements NereusKafkaOwnedPro
             assertEquals(exact, run.metadata().getVersioned(relative).orElseThrow());
             return run;
         } finally {
+            if (missing != null) missing.dispatch().complete(null);
             selected.loseReply().complete(null);
             selected.deliverRead().complete(null);
         }

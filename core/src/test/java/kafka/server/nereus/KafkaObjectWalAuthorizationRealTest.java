@@ -37,6 +37,7 @@ import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.server.config.NereusKafkaConfigs;
 
 import com.nereusstream.domain.bytes.CanonicalBytes;
+import com.nereusstream.domain.bytes.Sha256Digest;
 import com.nereusstream.storage.object.control.WalRunControlCodec;
 import com.nereusstream.storage.object.control.WalRunControlKeys;
 
@@ -65,6 +66,7 @@ import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.OxiaClientBuilder;
 import io.oxia.client.api.PutResult;
+import io.oxia.client.api.options.DeleteOption;
 
 import static org.apache.kafka.test.TestUtils.waitForCondition;
 import static kafka.server.nereus.KafkaObjectWalProcessRealTest.OBJECT;
@@ -115,7 +117,7 @@ public class KafkaObjectWalAuthorizationRealTest {
                 client.setProperty("bootstrap.servers", cluster.bootstrapServers());
                 var topicId = verifyAuthorizationCut(client, control, fixture, cut);
                 verifyRevocationAfterExactAuthorization(cluster, client, control, fixture, topicId, cut);
-                var closed = terminal.verify(cluster, client, control, fixture, topicId);
+                var closed = terminal.verify(cluster, client, control, fixture, topicId, cut);
                 var bucket = (String) fixture.settings().get(NereusKafkaConfigs.OBJECT_BUCKET_CONFIG);
                 closed.requireSealedByOriginalWriter(minio, bucket, 3);
                 cluster.fatalFaultHandler().maybeRethrowFirstException();
@@ -238,9 +240,20 @@ public class KafkaObjectWalAuthorizationRealTest {
 
     private record Keys(String authorization, String checkpointPagePrefix) { }
 
-    private static final class AuthorizationCut implements NereusKafkaOwnedProviderRuntime.NativeRunResponseObserver {
+    record CommonCheckpointCut(KafkaObjectWalAdapterRealTest.NativeTerminal run, String relative, String key,
+                               long version, CompletableFuture<Void> requested,
+                               CompletableFuture<Void> dispatch) {
+        void remove(AsyncOxiaClient control) throws Exception {
+            requested.get(30, TimeUnit.SECONDS);
+            control.delete(key, Set.of(DeleteOption.IfVersionIdEquals(version))).get(30, TimeUnit.SECONDS);
+            assertTrue(run.metadata().get(relative).isEmpty(), "The selected common checkpoint still exists in Oxia");
+        }
+    }
+
+    static final class AuthorizationCut implements NereusKafkaOwnedProviderRuntime.NativeRunResponseObserver {
         private final AtomicReference<Keys> keys = new AtomicReference<>();
         private final AtomicReference<RevocationCut> revoked = new AtomicReference<>();
+        private final AtomicReference<CommonCheckpointCut> commonCheckpoint = new AtomicReference<>();
         private final AtomicInteger casAttempts = new AtomicInteger();
         private final AtomicInteger readsBeforeCas = new AtomicInteger();
         private final AtomicInteger reconciliationReads = new AtomicInteger();
@@ -262,10 +275,42 @@ public class KafkaObjectWalAuthorizationRealTest {
             return cut;
         }
 
+        CommonCheckpointCut holdSelectedCommonCheckpoint(KafkaObjectWalAdapterRealTest.NativeTerminal run,
+                KafkaObjectWalAdapterRealTest.Provisioned fixture, Uuid topicId, AsyncOxiaClient control)
+                throws Exception {
+            var fence = scope(fixture, topicId);
+            var authority = authorization(run.metadata(), run.ref().shardId());
+            var selected = authority.read(fence).orElseThrow();
+            var digest = selected.checkpoint().orElseThrow();
+            assertEquals(3, selected.checkpointEnd());
+            var relative = authority.headKey(fence).replaceFirst("/head$", "/records/") + digest.toHex();
+            var key = "/nereus-kafka-object-wal/" + fixture.profile().protocolCellSha256().toHex() + "/" + relative;
+            var stored = control.get(key).get(30, TimeUnit.SECONDS);
+            assertEquals(digest, Sha256Digest.hash(CanonicalBytes.copyOf(stored.value())));
+            var cut = new CommonCheckpointCut(run, relative, key, stored.version().versionId(),
+                    new CompletableFuture<>(), new CompletableFuture<>());
+            assertTrue(commonCheckpoint.compareAndSet(null, cut));
+            return cut;
+        }
+
         @Override
         public AsyncOxiaClient controlClient(AsyncOxiaClient client) {
             return (AsyncOxiaClient) Proxy.newProxyInstance(AsyncOxiaClient.class.getClassLoader(),
                     new Class<?>[]{AsyncOxiaClient.class}, (proxy, method, args) -> {
+                        var checkpoint = commonCheckpoint.get();
+                        if (checkpoint != null && method.getName().equals("get") && args != null
+                                && args.length > 0 && checkpoint.key().equals(args[0])) {
+                            checkpoint.requested().complete(null);
+                            return checkpoint.dispatch().thenCompose(ignored -> {
+                                try {
+                                    return (CompletableFuture<?>) method.invoke(client, args);
+                                } catch (InvocationTargetException failure) {
+                                    return CompletableFuture.failedFuture(failure.getCause());
+                                } catch (IllegalAccessException failure) {
+                                    return CompletableFuture.failedFuture(failure);
+                                }
+                            });
+                        }
                         Object response;
                         try {
                             response = method.invoke(client, args);
