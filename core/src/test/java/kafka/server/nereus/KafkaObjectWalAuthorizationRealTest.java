@@ -91,6 +91,7 @@ public class KafkaObjectWalAuthorizationRealTest {
             var fixture = KafkaObjectWalAdapterRealTest.provision(work, minio, control, endpoint,
                     System.getProperty("nereus.nsip.bkUri"), oxia);
             var cut = new AuthorizationCut();
+            var terminal = new KafkaObjectCheckpointHeadRealScenario();
             var bootstrap = BootstrapMetadata.fromVersion(MetadataVersion.latestTesting(), "nsip-object-auth")
                     .copyWithFeatureRecord("nereus.storage.version", (short) 2);
             var nodes = new TestKitNodes.Builder(bootstrap).setNumBrokerNodes(2).setNumControllerNodes(1).build();
@@ -99,7 +100,7 @@ public class KafkaObjectWalAuthorizationRealTest {
                     .setBrokerStorageRuntimeFactory(context -> new NereusBrokerStorageRuntime(
                             context, context.config().brokerId() == 0
                                     ? new NereusKafkaOwnedProviderRuntime(context, cut)
-                                    : new NereusKafkaOwnedProviderRuntime(context)));
+                                    : new NereusKafkaOwnedProviderRuntime(context, terminal)));
             fixture.settings().forEach((key, value) -> {
                 if (!Set.of("node.id", "process.roles", "controller.quorum.voters", "log.dirs").contains(key)) {
                     builder.setConfigProp(key, value);
@@ -114,6 +115,7 @@ public class KafkaObjectWalAuthorizationRealTest {
                 client.setProperty("bootstrap.servers", cluster.bootstrapServers());
                 var topicId = verifyAuthorizationCut(client, control, fixture, cut);
                 verifyRevocationAfterExactAuthorization(cluster, client, control, fixture, topicId, cut);
+                terminal.verify(cluster, client, minio, control, fixture, topicId);
                 cluster.fatalFaultHandler().maybeRethrowFirstException();
                 cluster.nonFatalFaultHandler().maybeRethrowFirstException();
             }
@@ -198,6 +200,7 @@ public class KafkaObjectWalAuthorizationRealTest {
             var before = authority.read(fence).orElseThrow();
             assertEquals(2, before.endOffset());
             assertEquals(2, before.grants().size());
+            assertTrue(before.checkpoint().isEmpty(), "Takeover must replay the original authorized suffix");
             assertThrows(SocketTimeoutException.class, () -> produce.receive(250));
             assertThrows(SocketTimeoutException.class, () -> waiting.receive(250));
             admin.alterPartitionReassignments(Map.of(OBJECT, Optional.of(new NewPartitionReassignment(List.of(1)))))
