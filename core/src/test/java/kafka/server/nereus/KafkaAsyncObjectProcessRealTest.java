@@ -33,6 +33,7 @@ import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.metadata.nereus.KafkaTopicBindingAggregateMapperV1;
 import org.apache.kafka.test.TestUtils;
@@ -209,8 +210,11 @@ public class KafkaAsyncObjectProcessRealTest {
         try (var admin = Admin.create(client)) {
             KafkaObjectProtocolRealScenario.recoverLostProduceResponse(port, admin, end + 1, "original-producer-retry");
             KafkaObjectProtocolRealScenario.verifyNonIdempotentRetry(port, admin, end + 2);
+            KafkaBookKeeperProcessRealTest.assertRejectedTopic(admin,
+                    new NewTopic("__transaction_state", Map.of(0, List.of(1)))
+                            .configs(Map.of("nereus.storage.profile", "BOOKKEEPER_WAL_ONLY")), Errors.INVALID_CONFIG);
             var transactionState = new NewTopic("__transaction_state", Map.of(0, List.of(1)))
-                    .configs(Map.of("cleanup.policy", "compact", "nereus.storage.profile", "BOOKKEEPER_WAL_ONLY"));
+                    .configs(Map.of("cleanup.policy", "compact"));
             admin.createTopics(List.of(transactionState)).all().get(30, TimeUnit.SECONDS);
         }
         var transactional = new Properties();
