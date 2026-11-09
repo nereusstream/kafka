@@ -61,7 +61,7 @@ final class KafkaObjectNativeCompactionRealScenario {
         Files.writeString(work.resolve("capability.properties"), "\nobjectWalReadAdmission.receiptFile=" + receipt
                 + "\nobjectWalReadAdmission.receiptSha256=" + digest.toHex() + "\n", StandardOpenOption.APPEND);
         var settings = new HashMap<>(fixture.settings());
-        settings.put(NereusKafkaConfigs.RETENTION_CHECK_INTERVAL_MS_CONFIG, "500");
+        settings.put(NereusKafkaConfigs.RETENTION_CHECK_INTERVAL_MS_CONFIG, "1000");
         return settings;
     }
 
